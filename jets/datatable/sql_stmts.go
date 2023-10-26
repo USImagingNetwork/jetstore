@@ -173,6 +173,14 @@ var sqlInsertStmts = map[string]*SqlInsertDefinition {
 		AdminOnly: true,
 	},
 
+	// User Git Profile
+	"update/user_git_profile": {
+		Stmt: `UPDATE jetsapi.users SET
+			(git_name, git_email, git_handle, git_token, last_update) 
+			= ($1, $2, $3, $4, DEFAULT) WHERE user_email = $5`,
+		ColumnKeys: []string{"git_name", "git_email", "git_handle", "git_token", "user_email"},
+	},
+
 	// Statements for Rule Workspace Administration (tables part of jetsapi schema)
 	// ----------------------------------------------------------------------------------------------
 	// source config
@@ -231,6 +239,13 @@ var sqlInsertStmts = map[string]*SqlInsertDefinition {
 	},
 	// execute git commands workspace (insert into workspace_registry and push to repository - w/o compiling)
 	"git_command_workspace": {
+		Stmt: `UPDATE jetsapi.workspace_registry SET
+			(last_git_log, status, user_email, last_update) 
+			= ($1, $2, $3, DEFAULT) WHERE key = $4`,
+		ColumnKeys: []string{"last_git_log", "status", "user_email", "key"},
+	},
+	// execute git commands workspace (insert into workspace_registry and push to repository - w/o compiling)
+	"git_status_workspace": {
 		Stmt: `UPDATE jetsapi.workspace_registry SET
 			(last_git_log, status, user_email, last_update) 
 			= ($1, $2, $3, DEFAULT) WHERE key = $4`,
