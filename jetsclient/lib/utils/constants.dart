@@ -127,6 +127,7 @@ class FormKeys {
   static const register = "register";
   static const userAdmin = "userAdmin";
   static const userGitProfile = "userGitProfile";
+  static const editUserProfile = "editUserProfile";
 
   // Workspace IDE forms
   static const workspaceRegistry = "workspaceRegistry";
@@ -164,6 +165,8 @@ class FSK {
 
   static const userEmail = "user_email";
   static const userName = "name";
+  static const userRoles = "roles";
+  static const userCapabilities = "capabilities";
   static const userPassword = "password";
   static const userPasswordConfirm = "passwordConfirm";
   static const sessionId = "session_id";
@@ -337,7 +340,7 @@ class ActionKeys {
   static const login = "loginAction";
   static const register = "registerAction";
   static const dialogCancel = "dialog.cancelAction";
-  static const toggleUserActive = "toggleUserActive";
+  static const editUserProfileOk = "editUserProfile.ok";
   static const deleteUser = "deleteUser";
   static const submitGitProfileOk = "submitGitProfileOk";
 
@@ -351,6 +354,7 @@ class ActionKeys {
   // for Source Config dialog
   static const addSourceConfigOk = "addSourceConfig.ok";
   static const dropTable = "dropTable";
+  static const deleteSourceConfig = "deleteSourceConfig";
 
   // for load file
   static const loaderOk = "loader.ok";
@@ -377,10 +381,12 @@ class ActionKeys {
   static const ruleConfigOk = "ruleConfig.ok";
   static const ruleConfigv2Ok = "ruleConfigv2.ok";
   static const ruleConfigAdd = "ruleConfig.add";
-  static const ruleConfigDelete = "ruleConfig.delete";
+  static const ruleConfigDelete = "ruleConfig.delete"; // Used in Edit Rule Config Dialog v1 - delete a triple
+  static const deleteRuleConfigv2 = "deleteRuleConfigv2";  // Action to Delete a Rule Config in DB
 
   // for add / edit pipeline config dialog
   static const pipelineConfigOk = "pipelineConfig.ok";
+  static const deletePipelineConfig = "deletePipelineConfig";
 
   // for pipeline execution dialogs
   static const startPipelineOk = "startPipeline.ok";
@@ -476,6 +482,7 @@ class DTKeys {
 
   // User administration DT
   static const usersTable = "userTable";
+  static const userRolesTable = "userRolesTable";
 
   // Workspace IDE DT
   static const workspaceRegistryTable = "workspaceRegistryTable";
