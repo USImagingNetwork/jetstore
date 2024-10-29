@@ -83,7 +83,7 @@ final adminMenuEntries = [
   MenuEntry(
       otherPageStyle: ActionStyle.danger,
       key: 'runInitDb',
-      label: 'Run Workspace Database Initialization',
+      label: 'Run Workspace DB Base Initialization',
       menuAction: rerunDbInitAction),
 ];
 
@@ -281,6 +281,16 @@ final Map<String, ScreenConfig> _screenConfigurations = {
 
   ScreenKeys.execStatusDetailsTable: ScreenConfig(
       key: ScreenKeys.execStatusDetailsTable,
+      appBarLabel: 'JetStore Workspace',
+      // title: 'Pipeline Execution Details',
+      showLogout: true,
+      leftBarLogo: 'assets/images/logo.png',
+      menuEntries: defaultMenuEntries,
+      adminMenuEntries: adminMenuEntries,
+      toolbarMenuEntries: toolbarMenuEntries),
+
+  ScreenKeys.execStatsDetailsTable: ScreenConfig(
+      key: ScreenKeys.execStatsDetailsTable,
       appBarLabel: 'JetStore Workspace',
       // title: 'Pipeline Execution Details',
       showLogout: true,

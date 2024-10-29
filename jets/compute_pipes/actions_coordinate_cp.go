@@ -1,0 +1,217 @@
+package compute_pipes
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"os"
+	"regexp"
+	"time"
+
+	"github.com/artisoft-io/jetstore/jets/datatable"
+	"github.com/jackc/pgx/v4/pgxpool"
+)
+
+// Compute Pipes Actions
+
+func (args *ComputePipesNodeArgs) CoordinateComputePipes(ctx context.Context, dsn string) error {
+	var cpErr, err error
+	var inFolderPath string
+	var cpContext *ComputePipesContext
+	var fileKeyComponents map[string]interface{}
+	var fileKeyDate time.Time
+	var fileKeys []string
+	var cpipesConfigJson string
+	var cpConfig *ComputePipesConfig
+	var mainSchemaName interface{}
+	var envSettings map[string]interface{}
+	var schemaManager *SchemaManager
+
+	stmt := "SELECT cpipes_config_json FROM jetsapi.cpipes_execution_status WHERE pipeline_execution_status_key = %d"
+
+	// open db connection
+	dbpool, err := pgxpool.Connect(ctx, dsn)
+	if err != nil {
+		cpErr = fmt.Errorf("while opening db connection: %v", err)
+		goto gotError
+	}
+	defer dbpool.Close()
+
+	// Get the cpipes config from cpipes_execution_status
+	err = dbpool.QueryRow(ctx, fmt.Sprintf(stmt, args.PipelineExecKey)).Scan(&cpipesConfigJson)
+	if err != nil {
+		cpErr = fmt.Errorf("while reading cpipes config from cpipes_execution_status table (CoordinateComputePipes): %v", err)
+		goto gotError
+	}
+	cpConfig, err = UnmarshalComputePipesConfig(&cpipesConfigJson)
+	if err != nil {
+		cpErr = fmt.Errorf("failed to unmarshal cpipes config json: %v", err)
+		goto gotError
+	}
+
+	// Get file keys
+	switch cpConfig.CommonRuntimeArgs.CpipesMode {
+	case "sharding":
+		// Case sharding, get the file keys from compute_pipes_shard_registry
+		fileKeys, err = GetFileKeys(ctx, dbpool, cpConfig.CommonRuntimeArgs.SessionId, args.NodeId)
+		if err != nil {
+			cpErr = fmt.Errorf("while loading aws configuration (in CoordinateComputePipes): %v", err)
+			goto gotError
+		}
+		log.Printf("%s node %d %s Got %d file keys from database for file_key: %s",
+			cpConfig.CommonRuntimeArgs.SessionId, args.NodeId,
+			cpConfig.CommonRuntimeArgs.MainInputStepId, len(fileKeys), cpConfig.CommonRuntimeArgs.FileKey)
+
+	case "reducing":
+		// Case cpipes reducing mode, get the file keys from s3
+		fileKeys, err = GetS3FileKeys(cpConfig.CommonRuntimeArgs.ProcessName, cpConfig.CommonRuntimeArgs.SessionId,
+			cpConfig.CommonRuntimeArgs.MainInputStepId, args.JetsPartitionLabel)
+		if err != nil {
+			cpErr = err
+			goto gotError
+		}
+		log.Printf("%s node %d %s Got %d file keys from s3",
+			cpConfig.CommonRuntimeArgs.SessionId, args.NodeId,
+			cpConfig.CommonRuntimeArgs.MainInputStepId, len(fileKeys))
+		if cpConfig.ClusterConfig.IsDebugMode {
+			for _, k := range fileKeys {
+				log.Printf("%s node %d %s Got file key from s3: %s",
+					cpConfig.CommonRuntimeArgs.SessionId, args.NodeId,
+					cpConfig.CommonRuntimeArgs.MainInputStepId, k)
+			}
+		}
+
+	default:
+		cpErr = fmt.Errorf("error: invalid cpipesMode in CoordinateComputePipes: %s", cpConfig.CommonRuntimeArgs.CpipesMode)
+		goto gotError
+	}
+
+	// Extract processing date from file key inFile
+	fileKeyComponents = make(map[string]interface{})
+	fileKeyComponents = datatable.SplitFileKeyIntoComponents(fileKeyComponents, &cpConfig.CommonRuntimeArgs.FileKey)
+	if len(fileKeyComponents) > 0 {
+		year := fileKeyComponents["year"].(int)
+		month := fileKeyComponents["month"].(int)
+		day := fileKeyComponents["day"].(int)
+		fileKeyDate = time.Date(year, time.Month(month), day, 14, 0, 0, 0, time.UTC)
+		// log.Println("fileKeyDate:", fileKeyDate)
+	}
+	for i := range cpConfig.SchemaProviders {
+		if cpConfig.SchemaProviders[i].SourceType == "main_input" {
+			if len(cpConfig.SchemaProviders[i].SchemaName) > 0 {
+				mainSchemaName = cpConfig.SchemaProviders[i].SchemaName
+			}
+			break
+		}
+	}
+
+	envSettings = map[string]interface{}{
+		"$FILE_KEY":             cpConfig.CommonRuntimeArgs.FileKey,
+		"$SESSIONID":            cpConfig.CommonRuntimeArgs.SessionId,
+		"$SHARD_ID":             args.NodeId,
+		"$PROCESS_NAME":         cpConfig.CommonRuntimeArgs.ProcessName,
+		"$FILE_KEY_DATE":        fileKeyDate,
+		"$JETS_PARTITION_LABEL": args.JetsPartitionLabel,
+		"$MAIN_SCHEMA_NAME":     mainSchemaName,
+	}
+
+	// Create the SchemaManager and prepare the providers
+	schemaManager = NewSchemaManager(cpConfig.SchemaProviders, envSettings, cpConfig.ClusterConfig.IsDebugMode)
+	err = schemaManager.PrepareSchemaProviders(dbpool)
+	if err != nil {
+		cpErr = fmt.Errorf("while calling schemaManager.PrepareSchemaProviders: %v", err)
+		goto gotError
+	}
+
+	cpContext = &ComputePipesContext{
+		ComputePipesArgs: ComputePipesArgs{
+			ComputePipesNodeArgs:   *args,
+			ComputePipesCommonArgs: *cpConfig.CommonRuntimeArgs,
+		},
+		CpConfig:           cpConfig,
+		EnvSettings:        envSettings,
+		FileKeyComponents:  fileKeyComponents,
+		SchemaManager:      schemaManager,
+		KillSwitch:         make(chan struct{}),
+		Done:               make(chan struct{}),
+		ErrCh:              make(chan error, 1000),
+		FileNamesCh:        make(chan FileName, 2),
+		DownloadS3ResultCh: make(chan DownloadS3Result, 1),
+	}
+
+	// Add to envSettings based on compute pipe config
+	if cpConfig.Context != nil {
+		for _, contextSpec := range *cpConfig.Context {
+			switch contextSpec.Type {
+			case "file_key_component":
+				cpContext.EnvSettings[contextSpec.Key] = cpContext.FileKeyComponents[contextSpec.Expr]
+			case "value":
+				cpContext.EnvSettings[contextSpec.Key] = contextSpec.Expr
+			case "partfile_key_component":
+			default:
+				cpErr = fmt.Errorf("error: unknown ContextSpec Type: %v", contextSpec.Type)
+				goto gotError
+			}
+		}
+	}
+
+	if cpConfig.CommonRuntimeArgs.CpipesMode == "sharding" {
+		// partfile_key_component :: explained
+		// ContextSpec.Type == partfile_key_component:
+		//		Key is column name of input_row to put the key component (must be at end of columns comming from parquet parfiles)
+		//		Expr is key in partfile file_key
+		// Prepare the regex for the partfile_key_component
+		cpContext.PartFileKeyComponents = make([]CompiledPartFileComponent, 0)
+		for i := range *cpContext.CpConfig.Context {
+			if (*cpContext.CpConfig.Context)[i].Type == "partfile_key_component" {
+				regex_query := fmt.Sprintf(`%s=(.*?)\/`, (*cpContext.CpConfig.Context)[i].Expr)
+				// log.Println("**!@@",args.SessionId,"partfile_key_component Got regex_query",regex_query,"for column",(*cpContext.CpConfig.Context)[i].Key)
+				re, err := regexp.Compile(regex_query)
+				if err == nil {
+					cpContext.PartFileKeyComponents = append(cpContext.PartFileKeyComponents, CompiledPartFileComponent{
+						ColumnName: (*cpContext.CpConfig.Context)[i].Key,
+						Regex:      re,
+					})
+				} else {
+					log.Println("*** WARNING *** error compiling regex:", regex_query, "err:", err)
+				}
+			}
+		}
+	}
+
+	defer func() {
+		// log.Printf("##!@@ DONE CoordinateComputePipes closing Done ch")
+		select {
+		case <-cpContext.Done:
+			// log.Printf("##!@@ Done ch was already closed!")
+			// done chan is already closed due to error
+		default:
+			close(cpContext.Done)
+			// log.Printf("##!@@ Done ch closed")
+		}
+	}()
+
+	// Create a local temp directory to hold the file(s)
+	inFolderPath, err = os.MkdirTemp("", "jetstore")
+	if err != nil {
+		cpErr = fmt.Errorf("failed to create local temp directory: %v", err)
+		goto gotError
+	}
+	defer os.Remove(inFolderPath)
+
+	// Download files from s3
+	err = cpContext.DownloadS3Files(inFolderPath, fileKeys)
+	if err != nil {
+		cpErr = fmt.Errorf("while DownloadingS3Files (in CoordinateComputePipes): %v", err)
+		goto gotError
+	}
+
+	// Process the downloaded file(s)
+	return cpContext.ProcessFilesAndReportStatus(ctx, dbpool, inFolderPath)
+
+gotError:
+	log.Println(cpConfig.CommonRuntimeArgs.SessionId, "node", args.NodeId, "error in CoordinateComputePipes:", cpErr)
+
+	//*TODO insert error in pipeline_execution_details
+	return cpErr
+}

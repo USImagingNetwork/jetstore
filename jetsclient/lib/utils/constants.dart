@@ -5,6 +5,7 @@ const betweenTheButtonsPadding = 8.0;
 var globalWorkspaceUri = '';
 var globalWorkspaceName = '';
 var globalWorkspaceBranch = '';
+RegExp? globalWorkspaceFileKeyLabelRe;
 
 /// Button action style, used by both JetsDataTable and JetsForm
 enum ActionStyle {
@@ -136,6 +137,7 @@ class ScreenKeys {
   static const fileRegistryTable = "fileRegistryTableScreen";
   static const filePreview = "filePreviewScreen";
   static const execStatusDetailsTable = "execStatusDetailsTable";
+  static const execStatsDetailsTable = "execStatsDetailsTable";
   static const processErrorsTable = "processErrorsTable";
 
   // Workspace IDE Screens
@@ -231,6 +233,7 @@ class FormKeys {
   static const scEditFixedWidthLayoutUF = "scEditFixedWidthLayoutUF";
   static const scEditDomainKeysUF = "scEditDomainKeysUF";
   static const scEditCodeValueMappingUF = "scEditCodeValueMappingUF";
+  static const scEditComputePipesJsonUF = "scEditComputePipesJsonUF";
   static const scEditAutomatedModeUF = "scEditAutomatedModeUF";
   static const scSummaryUF = "scSummaryUF";
   // File Mapping UF Forms
@@ -321,6 +324,7 @@ class FSK {
   static const inputColumnsJson = "input_columns_json";
   static const inputColumnsPositionsCsv = "input_columns_positions_csv";
   static const codeValuesMappingJson = "code_values_mapping_json";
+  static const computePipesJson = "compute_pipes_json";
   static const entityRdfType = "entity_rdf_type";
   static const entityKey = "entity_key";
   static const entityProperty = "entity_property";
@@ -710,6 +714,7 @@ class DTKeys {
   static const inputLoaderStatusTable = "inputLoaderStatusTable";
   static const pipelineExecStatusTable = "pipelineExecStatusTable";
   static const pipelineExecDetailsTable = "pipelineExecDetailsTable";
+  static const cpipesExecDetailsTable = "cpipesExecDetailsTable";
   static const processErrorsTable = "processErrorsTable";
   // View rete session triples v1
   static const reteSessionTriplesTable = "reteSessionTriplesTable";

@@ -4,23 +4,25 @@ import (
 	"bufio"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"runtime/debug"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/artisoft-io/jetstore/jets/awsi"
-	"github.com/artisoft-io/jetstore/jets/schema"
 	"github.com/artisoft-io/jetstore/jets/workspace"
+	"github.com/jackc/pgx/v4"
 	"github.com/jackc/pgx/v4/pgxpool"
 	"go.uber.org/zap"
 )
+
 var logger *zap.Logger
+
 func init() {
 	// Create logger.
 	var err error
@@ -29,6 +31,7 @@ func init() {
 		panic("failed to create logger: " + err.Error())
 	}
 }
+
 // The delegate that actually execute the report
 // Required Env variable:
 // JETS_DSN_SECRET
@@ -37,6 +40,7 @@ func init() {
 // JETS_DSN_URI_VALUE
 // JETS_DSN_JSON_VALUE
 // JETS_s3_INPUT_PREFIX
+// JETS_S3_KMS_KEY_ARN
 // ENVIRONMENT
 
 type StringSubstitution struct {
@@ -44,43 +48,85 @@ type StringSubstitution struct {
 	With    string `json:"with"`
 }
 
+type SentinelConfig struct {
+	FilePathSubstitution []StringSubstitution `json:"filePathSubstitution"`
+}
+
 type ReportDirectives struct {
-	FilePathSubstitution         []StringSubstitution           `json:"filePathSubstitution"`
-	ReportScripts                []string                       `json:"reportScripts"`
-	UpdateLookupTables           bool                           `json:"updateLookupTables"`
-	OutputS3Prefix               string                         `json:"outputS3Prefix"`
-	OutputPath                   string                         `json:"outputPath"`
-	ReportsAsTable               map[string]string              `json:"reportsAsTable"`
-	ReportOrStatementProperties  map[string]map[string]string   `json:"reportOrStatementProperties"`
+	// InputPath is original fileKey, unless overriten in config file, used to emit sentinel file
+	FilePathSubstitution []StringSubstitution         `json:"filePathSubstitution"`
+	ReportScripts        []string                     `json:"reportScripts"`
+	UpdateLookupTables   bool                         `json:"updateLookupTables"`
+	EmitSentinelFile     *SentinelConfig              `json:"emitSentinelFile"`
+	OutputS3Prefix       string                       `json:"outputS3Prefix"`
+	InputPath            string                       `json:"inputPath"`
+	OutputPath           string                       `json:"outputPath"`
+	ReportProperties     map[string]ReportProperty    `json:"reportProperties"`
+	StatementProperties  map[string]StatementProperty `json:"statementProperties"`
+	RegisterReports      []RegisterReportSpec         `json:"registerReport"`
+}
+
+type ReportProperty struct {
+	ReportOrScript string            `json:"reportOrScript"`
+	RunWhen        []RunWhenCriteria `json:"runWhen"`
+}
+
+type StatementProperty struct {
+	Org          string            `json:"org"`
+	ObjectType   string            `json:"object_type"`
+	OutputFormat string            `json:"outputFormat"`
+	RunWhen      []RunWhenCriteria `json:"runWhen"`
+}
+
+type RunWhenCriteria struct {
+	FileKeyComponent        string `json:"fileKeyComponent"`
+	HasValue                string `json:"hasValue"`
+	HasNotValue             string `json:"hasNotValue"`
+	HasNonZeroOutputRecords bool   `json:"hasOutputRecordsOnly"`
+}
+
+type RegisterReportSpec struct {
+	TableName  string `json:"table_name"`
+	Org        string `json:"org"`
+	ObjectType string `json:"object_type"`
+	SourceType string `json:"source_type"`
 }
 
 type CommandArguments struct {
-	WorkspaceName string
-	Client string
-	Org string
-	ObjectType string
-	Environment string
-	SessionId string
-	SourcePeriodKey string
-	ProcessName string
-	ReportName string
-	FileKey string
-	OutputPath string
-	OriginalFileName string
-	ReportScriptPaths []string
+	WorkspaceName           string
+	Client                  string
+	Org                     string
+	ObjectType              string
+	Environment             string
+	SessionId               string
+	SourcePeriodKey         string
+	ProcessName             string
+	ReportName              string
+	FileKey                 string
+	OutputPath              string
+	OriginalFileName        string
+	ReportScriptPaths       []string
 	CurrentReportDirectives *ReportDirectives
-	BucketName string
-	RegionName string
+	BucketName              string
+	RegionName              string
+	FileKeyComponents       map[string]interface{}
 }
 
 // Main Functions
 // --------------------------------------------------------------------------------------
-func (ca *CommandArguments)RunReports(dbpool *pgxpool.Pool) (err error) {
+func (ca *CommandArguments) RunReports(dbpool *pgxpool.Pool) (err error) {
+
+	// Create temp directory for the local temp files
+	tempDir, err := os.MkdirTemp("", "jetstore")
+	if err != nil {
+		return fmt.Errorf("while creating temp dir: %v", err)
+	}
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("recovered error: %v", r)
 			debug.PrintStack()
 		}
+		os.RemoveAll(tempDir)
 	}()
 
 	// Keep track of files (reports) written to s3 (use case UpdateLookupTables)
@@ -88,21 +134,87 @@ func (ca *CommandArguments)RunReports(dbpool *pgxpool.Pool) (err error) {
 	reportDirectives := *ca.CurrentReportDirectives
 
 	// Run the reports
+	var dbRecordCount, outputRecordCount int64
+	gotRecordCount := false
+	didAnyReport := false
 	for i := range ca.ReportScriptPaths {
-		reportProps := reportDirectives.ReportOrStatementProperties[reportDirectives.ReportScripts[i]]
-		// Determine if we file is a sql reports or a sql script, sql script are executed in one go
+		reportProps := reportDirectives.ReportProperties[reportDirectives.ReportScripts[i]]
+		doIt := true
+		for i := range reportProps.RunWhen {
+			value, ok := ca.FileKeyComponents[reportProps.RunWhen[i].FileKeyComponent].(string)
+			if ok {
+				hasValue := reportProps.RunWhen[i].HasValue
+				hasNotValue := reportProps.RunWhen[i].HasNotValue
+				switch {
+				case len(hasValue) > 0 && value != hasValue:
+					doIt = false
+				case len(hasNotValue) > 0 && value == hasNotValue:
+					doIt = false
+				}
+			} else {
+				doIt = false
+			}
+			if reportProps.RunWhen[i].HasNonZeroOutputRecords {
+				if !gotRecordCount {
+					dbRecordCount, outputRecordCount = GetOutputRecordCount(dbpool, ca.SessionId)	
+					gotRecordCount = true
+				}
+				if dbRecordCount > 0 && outputRecordCount == 0 {
+					log.Println("This report is requiring having non zero output records and no output records are found, skipping report")
+					doIt = false
+				}		
+			}
+			if !doIt {
+				break
+			}
+		}
+		if !doIt {
+			continue
+		}
+		// Determine if the file is a sql reports or a sql script, sql script are executed in one go
 		// while sql report are executed statement by statement with results generally saved to s3 (most common)
-		if reportProps["reportOrScript"] == "script" {
+		if reportProps.ReportOrScript == "script" {
 			// Running as sql script
-			log.Println("Running sql script:",ca.ReportScriptPaths[i])
-			err = ca.runSqlScriptDelegate(dbpool, ca.ReportScriptPaths[i])	
+			log.Println("Running sql script:", ca.ReportScriptPaths[i])
+			err = ca.runSqlScriptDelegate(dbpool, ca.ReportScriptPaths[i])
 		} else {
 			// Running as sql report by default
-			log.Println("Running report:",ca.ReportScriptPaths[i])
-			err = ca.runReportsDelegate(dbpool, ca.ReportScriptPaths[i], &updatedKeys)	
+			log.Println("Running report:", ca.ReportScriptPaths[i])
+			err = ca.runReportsDelegate(dbpool, tempDir, ca.ReportScriptPaths[i], &updatedKeys)
 		}
 		if err != nil {
 			return err
+		}
+		didAnyReport = true
+	}
+
+	if !didAnyReport {
+		// Did no report, bailing out
+		log.Println("Done no reports, bailing out")
+		return
+	}
+
+	// Register reports
+	if reportDirectives.RegisterReports != nil {
+		for i := range reportDirectives.RegisterReports {
+			rr := &reportDirectives.RegisterReports[i]
+			tableName := rr.TableName
+			if tableName == "" {
+				continue
+			}
+			objectType := rr.ObjectType
+			if objectType == "" {
+				objectType = ca.ObjectType
+			}
+			sourceType := rr.SourceType
+			if sourceType == "" {
+				sourceType = "report_table"
+			}
+			err2 := RegisterReport(dbpool, ca.Client, rr.Org, objectType, ca.FileKey,
+				ca.SourcePeriodKey, tableName, sourceType, ca.SessionId, "system")
+			if err2 != nil {
+				return err2
+			}
 		}
 	}
 
@@ -111,10 +223,10 @@ func (ca *CommandArguments)RunReports(dbpool *pgxpool.Pool) (err error) {
 		// sync s3 reports to to db and locally
 		// to make sure we get the report we just created
 		for i := range updatedKeys {
-			err = awsi.SyncS3Files(dbpool, ca.WorkspaceName, updatedKeys[i], reportDirectives.OutputPath + "/", "lookups")
+			err = awsi.SyncS3Files(dbpool, ca.WorkspaceName, updatedKeys[i], reportDirectives.OutputPath+"/", "lookups")
 			if err != nil {
 				return fmt.Errorf("run_reports: failed to sync s3 files: %v", err)
-			}	
+			}
 		}
 
 		version := strconv.FormatInt(time.Now().Unix(), 10)
@@ -123,11 +235,45 @@ func (ca *CommandArguments)RunReports(dbpool *pgxpool.Pool) (err error) {
 			return err
 		}
 	}
+
+	// Check if we need to emit a sentinel file (cpipesSM)
+	if reportDirectives.EmitSentinelFile != nil {
+		log.Println("Emitting Sentinel File to:", reportDirectives.InputPath)
+		// Write the 0-byte sentinel file (take the file name from env JETS_SENTINEL_FILE_NAME)
+		// Copy file to s3 location
+		sentinelFileName := os.Getenv("JETS_SENTINEL_FILE_NAME")
+		if len(sentinelFileName) == 0 {
+			sentinelFileName = "_DONE"
+		}
+		tempFileName := fmt.Sprintf("%s/%s", tempDir, sentinelFileName)
+		fileHd, err2 := os.OpenFile(tempFileName, os.O_RDWR|os.O_CREATE, 0644)
+		if err2 != nil {
+			err = fmt.Errorf("while creating sentinel file to copy to s3: %v", err2)
+			log.Println(err)
+			return err
+		}
+		defer func() {
+			fileHd.Close()
+			os.Remove(tempFileName)
+		}()
+		s3FileDir := reportDirectives.InputPath
+		for i := range reportDirectives.EmitSentinelFile.FilePathSubstitution {
+			s3FileDir = strings.ReplaceAll(s3FileDir,
+				reportDirectives.EmitSentinelFile.FilePathSubstitution[i].Replace,
+				reportDirectives.EmitSentinelFile.FilePathSubstitution[i].With)
+		}
+
+		s3FileName := fmt.Sprintf("%s/%s/session_id=%s/%s", s3FileDir, ca.OriginalFileName, ca.SessionId, sentinelFileName)
+		if err2 = awsi.UploadToS3(ca.BucketName, ca.RegionName, s3FileName, fileHd); err2 != nil {
+			err = fmt.Errorf("while copying sentinel to s3: %v", err2)
+			return err
+		}
+	}
 	return
 }
 
 // Support Functions
-func (ca *CommandArguments)runSqlScriptDelegate(dbpool *pgxpool.Pool, reportScriptPath string) error {
+func (ca *CommandArguments) runSqlScriptDelegate(dbpool *pgxpool.Pool, reportScriptPath string) error {
 
 	// Read the sql script
 	file, err := os.ReadFile(reportScriptPath)
@@ -159,13 +305,13 @@ func (ca *CommandArguments)runSqlScriptDelegate(dbpool *pgxpool.Pool, reportScri
 	stmt = strings.ReplaceAll(stmt, "$SOURCE_PERIOD_KEY", ca.SourcePeriodKey)
 
 	_, err = dbpool.Exec(context.Background(), stmt)
-if err != nil {
-	return fmt.Errorf("while executing sql script %s: %v", reportScriptPath, err)
-}
+	if err != nil {
+		return fmt.Errorf("while executing sql script %s: %v", reportScriptPath, err)
+	}
 	return nil
 }
 
-func (ca *CommandArguments)runReportsDelegate(dbpool *pgxpool.Pool, reportScriptPath string, updatedKeys *[]string) error {
+func (ca *CommandArguments) runReportsDelegate(dbpool *pgxpool.Pool, tempDir string, reportScriptPath string, updatedKeys *[]string) error {
 
 	// Get the report definitions
 	file, err := os.Open(reportScriptPath)
@@ -193,8 +339,8 @@ func (ca *CommandArguments)runReportsDelegate(dbpool *pgxpool.Pool, reportScript
 		name = strings.TrimSpace(name)
 		// remove leading -- and ending ; in name
 		name = name[2 : len(name)-1]
-		
-		// read the sql statement		
+
+		// read the sql statement
 		stmt, err = reader.ReadString(';')
 		if err == io.EOF {
 			isDone = true
@@ -208,7 +354,7 @@ func (ca *CommandArguments)runReportsDelegate(dbpool *pgxpool.Pool, reportScript
 		stmt = strings.TrimSuffix(stmt, ";")
 
 		// Do the report
-		s3FileName, err := ca.DoReport(dbpool, &name, &stmt)
+		s3FileName, err := ca.DoReport(dbpool, tempDir, &name, &stmt)
 		if err != nil {
 			return err
 		}
@@ -221,7 +367,7 @@ func (ca *CommandArguments)runReportsDelegate(dbpool *pgxpool.Pool, reportScript
 
 // The heavy lifting
 // outputFileName is the name in the report sql file, this is mapped to a table name in ReportDirectives.ReportsAsTable
-func (ca *CommandArguments)DoReport(dbpool *pgxpool.Pool, outputFileName *string, sqlStmt *string) (string, error) {
+func (ca *CommandArguments) DoReport(dbpool *pgxpool.Pool, tempDir string, outputFileName *string, sqlStmt *string) (string, error) {
 
 	name := *outputFileName
 	// Remove ':' and '.' from originalFileName
@@ -259,21 +405,15 @@ func (ca *CommandArguments)DoReport(dbpool *pgxpool.Pool, outputFileName *string
 	}
 
 	reportDirectives := *ca.CurrentReportDirectives
-	stmtProps := reportDirectives.ReportOrStatementProperties[*outputFileName]
-	if stmtProps == nil {
-		stmtProps = make(map[string]string)
-	}
+	stmtProps := reportDirectives.StatementProperties[*outputFileName]
 	// when org and object_type is not provided, use values from file key
-	var ok bool
-	_, ok = stmtProps["org"]
-	if !ok {
-		stmtProps["org"] = ca.Org
+	if stmtProps.Org == "" {
+		stmtProps.Org = ca.Org
 	}
-	_, ok = stmtProps["object_type"]
-	if !ok {
-		stmtProps["object_type"] = ca.ObjectType
+	if stmtProps.ObjectType == "" {
+		stmtProps.ObjectType = ca.ObjectType
 	}
-	outputFormat := stmtProps["outputFormat"]
+	outputFormat := stmtProps.OutputFormat
 
 	// Determine the output format
 	// s3 file name w/ path
@@ -283,11 +423,11 @@ func (ca *CommandArguments)DoReport(dbpool *pgxpool.Pool, outputFileName *string
 	case outputFormat == "parquet" || strings.HasSuffix(name, ".parquet"):
 		outputFormat = "parquet"
 		s3FileName = fmt.Sprintf("%s/%s", ca.OutputPath, name)
-	case outputFormat == "csv" || strings.HasSuffix(name, ".csv"): 
+	case outputFormat == "csv" || strings.HasSuffix(name, ".csv"):
 		options = "format CSV, HEADER"
 		outputFormat = "csv"
 		s3FileName = fmt.Sprintf("%s/%s", ca.OutputPath, name)
-	case outputFormat == "json" || strings.HasSuffix(name, ".json"): 
+	case outputFormat == "json" || strings.HasSuffix(name, ".json"):
 		options = "format TEXT"
 		outputFormat = "json"
 		s3FileName = fmt.Sprintf("%s/%s", ca.OutputPath, name)
@@ -320,92 +460,75 @@ func (ca *CommandArguments)DoReport(dbpool *pgxpool.Pool, outputFileName *string
 	switch outputFormat {
 	case "parquet":
 		// Output to parquet format
-		err := ca.DoParquetReport(dbpool, &s3FileName, name, &stmt)
+		err := ca.DoParquetReport(dbpool, tempDir, &s3FileName, name, &stmt)
 		if err != nil {
 			return "", err
 		}
 	case "csv", "json":
-		// save to s3 file s3FileName in csv or json format
-		escapedStmt := strings.ReplaceAll(stmt, "'", "''")
-		s3Stmt := fmt.Sprintf("SELECT * from aws_s3.query_export_to_s3('%s', '%s', '%s','%s',options:='%s')", 
-								escapedStmt, ca.BucketName, s3FileName, ca.RegionName, options)
-		// fmt.Println("S3 QUERY:", s3Stmt)
-		var rowsUploaded, filesUploaded, bytesUploaded sql.NullInt64
-		err := dbpool.QueryRow(context.Background(), s3Stmt).Scan(&rowsUploaded, &filesUploaded, &bytesUploaded)
-		if err != nil {
-			return "", fmt.Errorf("while executing s3 query %s: %v", escapedStmt, err)
+		// Check if a specific kms is specified in the deployment, if so do not use the aws_s3 plug in
+		// since it does not support custom kms key but uses the default kms key of the account
+		if len(os.Getenv("JETS_S3_KMS_KEY_ARN")) > 0 {
+			// Save the report locally and copy file to s3
+			err := ca.DoCsvReport(dbpool, tempDir, &s3FileName, name, &stmt)
+			if err != nil {
+				return "", err
+			}
+		} else {
+			// save to s3 file s3FileName in csv or json format
+			escapedStmt := strings.ReplaceAll(stmt, "'", "''")
+			s3Stmt := fmt.Sprintf("SELECT * from aws_s3.query_export_to_s3('%s', '%s', '%s','%s',options:='%s')",
+				escapedStmt, ca.BucketName, s3FileName, ca.RegionName, options)
+			// fmt.Println("S3 QUERY:", s3Stmt)
+			var rowsUploaded, filesUploaded, bytesUploaded sql.NullInt64
+			err := dbpool.QueryRow(context.Background(), s3Stmt).Scan(&rowsUploaded, &filesUploaded, &bytesUploaded)
+			if err != nil {
+				return "", fmt.Errorf("while executing s3 query %s: %v", escapedStmt, err)
+			}
+			fmt.Println("Report:", name, "rowsUploaded", rowsUploaded.Int64, "filesUploaded", filesUploaded.Int64, "bytesUploaded", bytesUploaded.Int64)
 		}
-		fmt.Println("Report:", name, "rowsUploaded", rowsUploaded.Int64, "filesUploaded", filesUploaded.Int64, "bytesUploaded", bytesUploaded.Int64)
 	default:
 		// Report not saved to s3, probably as as table (see below)
-		fmt.Println("Report %s not saved to s3", *outputFileName)
-	}
-
-	// Check if save the report to table
-	if reportDirectives.ReportsAsTable != nil {
-		tableName := reportDirectives.ReportsAsTable[*outputFileName]
-		if len(tableName) > 0 {
-			tableExists, err := schema.DoesTableExists(dbpool, "public", tableName)
-			if err != nil {
-				return "", fmt.Errorf("while verifying if table %s exist: %w", tableName, err)
-			}
-			// Save report as table
-			var tableStmt string
-			if tableExists {
-				// Get the column names
-				// Get the column definitions
-				columns := make([]string, 0)
-				cstmt := fmt.Sprintf(
-					"SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = '%s'",
-					tableName)
-				rows, err := dbpool.Query(context.Background(), cstmt)
-				if err != nil {
-					return "", fmt.Errorf("while getting definition of table: %s", tableName)
-				}
-				for rows.Next() { // Iterate and fetch the records from result cursor
-					var columnName string
-					rows.Scan(&columnName)
-					columns = append(columns, fmt.Sprintf("\"%s\"", columnName))
-				}
-				rows.Close()
-				fmt.Println("*** SORTING columns for Report AS Table, make sure columns are sorted in query")
-				sort.Slice(columns, func(i, j int) bool {
-					return columns[i] < columns[j]
-				})
-				tableStmt = fmt.Sprintf("INSERT INTO public.\"%s\" (%s) (%s)", tableName, strings.Join(columns, ","), stmt)
-			} else {
-				// Create the table with the select stmt
-				tableStmt = fmt.Sprintf("CREATE TABLE IF NOT EXISTS public.\"%s\" AS (%s)", tableName, stmt)
-
-			}
-			fmt.Println("Insert/Create table", tableName, "using statement:")
-			fmt.Println(tableStmt)
-			_, err2 := dbpool.Exec(context.Background(), tableStmt)
-			if err2 != nil {
-				return "", fmt.Errorf("while executing report as table, statement:\n%s\nError is: %v", tableStmt, err2)
-			}
-
-			// Register the report with table input_registry:
-			registerReportStmt := `INSERT INTO jetsapi.input_registry (
-					client, org, object_type, file_key, 
-					source_period_key, table_name, source_type, 
-					session_id, user_email
-				) 
-				VALUES 
-					(
-						$1, $2, $3, $4, $5, 
-						$6, 'file', $7, $8
-					) ON CONFLICT DO NOTHING RETURNING key`
-			_, err2 = dbpool.Exec(context.Background(), registerReportStmt, 
-				ca.Client, stmtProps["org"], stmtProps["object_type"], ca.FileKey,
-				ca.SourcePeriodKey, tableName, ca.SessionId, "system")
-			if err2 != nil {
-				return "", fmt.Errorf("while adding report to input_registry table: %v", err2)
-			}
-		}
+		log.Printf("Report %s not saved to s3", *outputFileName)
 	}
 
 	fmt.Println("------")
 
 	return s3FileName, nil
+}
+
+func RegisterReport(dbpool *pgxpool.Pool, client, org, objectType, fileKey string,
+	sourcePeriodKey, tableName, sourceType, sessionId, userEmail string) error {
+
+	// Register the report with table input_registry:
+	registerReportStmt := `INSERT INTO jetsapi.input_registry (
+		client, org, object_type, file_key, 
+		source_period_key, table_name, source_type, 
+		session_id, user_email
+	) VALUES (
+		$1, $2, $3, $4, $5, 
+		$6, $7, $8, $9
+	) ON CONFLICT DO NOTHING`
+	_, err := dbpool.Exec(context.Background(), registerReportStmt,
+		client, org, objectType, fileKey, sourcePeriodKey, tableName,
+		sourceType, sessionId, userEmail)
+	if err != nil {
+		return fmt.Errorf("while adding report to input_registry table: %v", err)
+	}
+	return nil
+}
+
+// Returns dbRecordCount (nbr of rows in pipeline_execution_details) and outputRecordCount (nbr of rows saved from server process)
+func GetOutputRecordCount(dbpool *pgxpool.Pool, sessionId string) (int64, int64) {
+	var dbRecordCount, outputRecordCount sql.NullInt64
+	err := dbpool.QueryRow(context.Background(),
+		"SELECT COUNT(*), SUM(output_records_count) FROM jetsapi.pipeline_execution_details WHERE session_id=$1",
+		sessionId).Scan(&dbRecordCount, &outputRecordCount)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, 0
+		}
+		msg := fmt.Sprintf("QueryRow on pipeline_execution_details to get nbr of output records failed: %v", err)
+		log.Fatal(msg)
+	}
+	return dbRecordCount.Int64, outputRecordCount.Int64
 }

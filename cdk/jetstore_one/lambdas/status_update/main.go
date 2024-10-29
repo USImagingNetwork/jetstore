@@ -70,14 +70,20 @@ func main() {
 // map[string]interface{}
 // {
 //  "-peKey": peKey,
+//  "cpipesMode": true/false,
 //  "-status": "completed",
+//  "file_key": "...",
 //  "failureDetails": {...}
 // }
+// fileKey is optional, needed for cpipes api notification
 
 func handler(ctx context.Context, arguments map[string]interface{}) (err error) {
 	logger.Info("Starting in ", zap.String("AWS Region", c.AWSRegion))
 	ca := datatable.StatusUpdate{
 		Status: arguments["-status"].(string),
+	}
+	if arguments["cpipesMode"] != nil {
+		ca.CpipesMode = true
 	}
 	v, err := strconv.Atoi(arguments["-peKey"].(string))
 	if err != nil {
@@ -100,7 +106,13 @@ func handler(ctx context.Context, arguments map[string]interface{}) (err error) 
 	default:
 		fmt.Println("Unknown type for failureDetails")
 	}
-	fmt.Println("Got peKey",ca.PeKey,"and failureDetails", ca.FailureDetails)
+	fileKey := arguments["file_key"]
+	if fileKey != nil {
+		ca.FileKey = fileKey.(string)
+	}
+	// dbPoolSize = 3
+	ca.DbPoolSize = 3
+	fmt.Println("Got peKey:",ca.PeKey,"fileKey:", fileKey,"failureDetails:", ca.FailureDetails, "dbPoolSize:", ca.DbPoolSize)
 	
 	errors := ca.ValidateArguments()
 	for _, m := range errors {

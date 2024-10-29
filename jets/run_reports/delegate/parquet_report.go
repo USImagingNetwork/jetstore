@@ -15,15 +15,9 @@ import (
 
 // Run report and save it as parquet file locally and then copy it to s3
 
-func (ca *CommandArguments)DoParquetReport(dbpool *pgxpool.Pool, s3FileName *string, name string, sqlStmt *string) error {
+func (ca *CommandArguments)DoParquetReport(dbpool *pgxpool.Pool, tempDir string, s3FileName *string, name string, sqlStmt *string) error {
 		// save report locally in parquet
 		fmt.Println("STMT", name, "saving in parquet format")
-		// Create temp directory for the local parquet file
-		tempDir, err := os.MkdirTemp("", "jetstore")
-		if err != nil {
-			return fmt.Errorf("while creating temp dir: %v", err)
-		}
-		defer os.RemoveAll(tempDir)
 	
 		// open the parquet writer
 		tempFileName := fmt.Sprintf("%s/csv.parquet", tempDir)
@@ -31,6 +25,7 @@ func (ca *CommandArguments)DoParquetReport(dbpool *pgxpool.Pool, s3FileName *str
 		if err != nil {
 			return fmt.Errorf("while opening parquet file for write: %v", err)
 		}
+		defer os.Remove(tempFileName)
 
 		// reading from db
 		rows, err := dbpool.Query(context.Background(), *sqlStmt)
@@ -180,6 +175,7 @@ func (ca *CommandArguments)DoParquetReport(dbpool *pgxpool.Pool, s3FileName *str
 		if err != nil {
 			return fmt.Errorf("while opening written file to copy to s3: %v", err)
 		}
+		defer fileHd.Close()
 		if err = awsi.UploadToS3(ca.BucketName, ca.RegionName, *s3FileName, fileHd); err != nil {
 			return fmt.Errorf("while copying to s3: %v", err)
 		}
