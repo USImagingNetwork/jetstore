@@ -238,7 +238,7 @@ func (args *StartComputePipesArgs) StartShardingComputePipes(ctx context.Context
 			return result, fmt.Errorf("while unmarshaling input_columns_json: %s", err)
 		}
 	}
-	if len(ic) == 0 && len(schemaProviderConfig.FixedWidthColumnsCsv) > 0 {
+	if len(ic) == 0 && schemaProviderConfig.InputFormat == "fixed_width" {
 		// Need to initialize the schema provider to get the column info
 		sp := NewDefaultSchemaProvider()
 		err = sp.Initialize(dbpool, schemaProviderConfig, nil, cpConfig.ClusterConfig.IsDebugMode)
@@ -601,7 +601,7 @@ func ValidatePipeSpecOutputChannels(pipeConfig []PipeSpec) error {
 			}
 			config := &transformationConfig.OutputChannel
 			if config.Type == "" {
-				config.Type = "stage"
+				config.Type = "memory"
 			}
 			switch config.Type {
 			case "sql":
@@ -632,9 +632,12 @@ func ValidatePipeSpecOutputChannels(pipeConfig []PipeSpec) error {
 					if config.Compression == "" {
 						config.Compression = "none"
 					}
+				
+				case "memory":
+					config.Compression = "" 
 				default:
 					return fmt.Errorf(
-						"error: invalid cpipes config, unknown output_channel config type: %s (expecting: stage, output, sql)", config.Type)
+						"error: invalid cpipes config, unknown output_channel config type: %s (expecting: memory (default), stage, output, sql)", config.Type)
 				}
 			}
 		}
