@@ -22,7 +22,7 @@ func (args *ComputePipesNodeArgs) CoordinateComputePipes(ctx context.Context, ds
 	var fileKeyComponents map[string]interface{}
 	var fileKeyPath, fileKeyName string // Components extracted from File_Key based on is_part_file
 	var fileKeyDate time.Time
-	var fileKeys []string
+	var fileKeys []*FileKeyInfo
 	var cpipesConfigJson string
 	var cpConfig *ComputePipesConfig
 	var mainSchemaProviderConfig *SchemaProviderSpec
@@ -79,7 +79,7 @@ func (args *ComputePipesNodeArgs) CoordinateComputePipes(ctx context.Context, ds
 			for _, k := range fileKeys {
 				log.Printf("%s node %d %s Got file key from s3: %s",
 					cpConfig.CommonRuntimeArgs.SessionId, args.NodeId,
-					cpConfig.CommonRuntimeArgs.MainInputStepId, k)
+					cpConfig.CommonRuntimeArgs.MainInputStepId, k.key)
 			}
 		}
 
@@ -145,6 +145,11 @@ func (args *ComputePipesNodeArgs) CoordinateComputePipes(ctx context.Context, ds
 		"$PROCESS_NAME":         cpConfig.CommonRuntimeArgs.ProcessName,
 		"$JETS_PARTITION_LABEL": args.JetsPartitionLabel,
 		"$MAIN_SCHEMA_NAME":     mainSchemaProviderConfig.SchemaName,
+	}
+	if mainSchemaProviderConfig.Env != nil {
+		for k,v := range mainSchemaProviderConfig.Env {
+			envSettings[k] = v
+		}
 	}
 
 	cpContext = &ComputePipesContext{

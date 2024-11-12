@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/artisoft-io/jetstore/jets/awsi"
-	"github.com/artisoft-io/jetstore/jets/compute_pipes"
 	"github.com/artisoft-io/jetstore/jets/datatable/jcsv"
 	"github.com/artisoft-io/jetstore/jets/user"
 )
@@ -19,7 +18,6 @@ import (
 
 // Loader env variable:
 // AWS_API_SECRET or API_SECRET
-// CPIPES_SERVER_ADDR cpipes listerner addr for peer connections
 // JETS_ADMIN_EMAIL (set as admin in dockerfile)
 // JETS_BUCKET
 // JETS_S3_KMS_KEY_ARN
@@ -53,7 +51,7 @@ var objectType = flag.String("objectType", "", "The type of object contained in 
 var userEmail = flag.String("userEmail", "", "User identifier to register the load (required)")
 var nbrShards = flag.Int("nbrShards", 1, "Number of shards to use in sharding the input file")
 var sourcePeriodKey = flag.Int("sourcePeriodKey", -1, "Source period key associated with the in_file (fileKey)")
-var sessionId = flag.String("sessionId", "", "Process session ID, is needed as -inSessionId for the server process (must be unique), default based on timestamp.")
+var sessionId = flag.String("sessionId", "", "Process session ID, is needed as -inSessionId for the server process (must be unique, required)")
 var completedMetric = flag.String("loaderCompletedMetric", "loaderCompleted", "Metric name to register the loader successfull completion (default: loaderCompleted)")
 var failedMetric = flag.String("loaderFailedMetric", "loaderFailed", "Metric name to register the load failure [success load metric: loaderCompleted] (default: loaderFailed)")
 var cpipesCompletedMetric = flag.String("serverCompletedMetric", "", "Metric name to register the server/cpipes successfull completion")
@@ -67,11 +65,6 @@ var pipelineExecKey = flag.Int("peKey", -1, "Pipeline execution key (required fo
 var shardId = flag.Int("shardId", -1, "Run the cpipes process for this single shard. (required when peKey is provided)")
 var jetsPartition = flag.String("jetsPartition", "", "the jets_partition to process (case cpipes reducing mode)")
 var inputSessionId string		// needed to read the file_keys from sharding table when peKey is provided
-var cpipesMode string // values: loader, sharding, reducing, standalone :: set in coordinateWork()
-var cpipesFileKeys []string
-var cpipesShardWithNoFileKeys bool	// Indicate the table compute_pipes_shard_registry has no file keys for this session_id & shardId
-var cpipesServerAddr string
-var cpConfig *compute_pipes.ComputePipesConfig
 
 var tableName string
 var domainKeysJson string
@@ -95,10 +88,6 @@ var fileKeyDate time.Time
 func init() {
 	flag.Var(&sep_flag, "sep", "Field separator for csv files, default is auto detect between pipe ('|'), tilda ('~'), tab ('\t') or comma (',')")
 	processingErrors = make([]string, 0)
-	cpipesServerAddr = os.Getenv("CPIPES_SERVER_ADDR")
-	if len(cpipesServerAddr) == 0 {
-		cpipesServerAddr = ":8085"
-	}
 }
 
 func main() {
@@ -176,6 +165,10 @@ func main() {
 		hasErr = true
 		errMsg = append(errMsg, "aws JETS_REGION and JETS_BUCKET are required")
 	}
+	if *sessionId == "" {
+		hasErr = true
+		errMsg = append(errMsg, "argument -sessionId is required.")
+	}
 
 	errOutDir = os.Getenv("LOADER_ERR_DIR")
 	adminEmail = os.Getenv("JETS_ADMIN_EMAIL")
@@ -208,12 +201,6 @@ func main() {
 			log.Println("**", msg)
 		}
 		panic("Invalid arguments")
-	}
-	sessId := ""
-	if *sessionId == "" {
-		sessId = strconv.FormatInt(time.Now().UnixMilli(), 10)
-		sessionId = &sessId
-		log.Println("sessionId is set to", *sessionId)
 	}
 	if *clientOrg == "''" {
 		*clientOrg = ""

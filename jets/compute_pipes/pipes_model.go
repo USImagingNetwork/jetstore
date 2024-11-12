@@ -19,24 +19,48 @@ type ComputePipesConfig struct {
 
 // Cluster configuration
 // DefaultMaxConcurrency is to override the env var MAX_CONCURRENCY
+// NbrPartitions is specified at ClusterShardingSpec level, if not
+// spefified it will be set to the nbr of sharding nodes, capped by the value
+// specified here at the cluster level.
+// NbrPartitions is used for the hash operator in the sharding step (step 0).
+// DefaultShardSizeMb is the default value when not specified at ClusterShardingSpec level.
+// DefaultShardMaxSizeMb is the default value when not specified at ClusterShardingSpec level.
+// DefaultShardSizeBy is the default value when not specified at ClusterShardingSpec level.
+// DefaultShardMaxSizeBy is the default value when not specified at ClusterShardingSpec level.
+// NOTE: ShardSizeMb / ShardMaxSizeMb must be spefified for the sharding to take place.
 type ClusterSpec struct {
-	NbrNodes              int                  `json:"nbr_nodes"`
-	DefaultMaxConcurrency int                  `json:"default_max_concurrency"`
-	S3WorkerPoolSize      int                  `json:"s3_worker_pool_size"`
-	NbrNodesLookup        *[]ClusterSizingSpec `json:"nbr_nodes_lookup"`
-	IsDebugMode           bool                 `json:"is_debug_mode"`
-	KillSwitchMin         int                  `json:"kill_switch_min"`
+	NbrPartitions         int                    `json:"nbr_partitons"`
+	DefaultShardSizeMb    int                    `json:"default_shard_size_mb"`
+	DefaultShardMaxSizeMb int                    `json:"default_shard_max_size_mb"`
+	DefaultShardSizeBy    int                    `json:"default_shard_size_by"`     // for testing only
+	DefaultShardMaxSizeBy int                    `json:"default_shard_max_size_by"` // for testing only
+	ShardOffset           int                    `json:"shard_offset"`
+	DefaultMaxConcurrency int                    `json:"default_max_concurrency"`
+	S3WorkerPoolSize      int                    `json:"s3_worker_pool_size"`
+	ClusterShardingTiers  *[]ClusterShardingSpec `json:"cluster_sharding_tiers"`
+	IsDebugMode           bool                   `json:"is_debug_mode"`
+	KillSwitchMin         int                    `json:"kill_switch_min"`
 }
 
 // Cluster sizing configuration
 // Allows to dynamically determine the NbrNodes based on total size of input files.
-// UseEcsTasks and MaxConcurrency is used for step id 'reducing0'
+// UseEcsTasks is used for step id 'reducing0'
 // When UseEcsTasks == true, MaxConcurrency applies to ECS cluster (reducing0 step id).
+// otherwise MaxConcurrency is the number of concurrent lambda functions executing.
 // Note that S3WorkerPoolSize is used for reducing01, all other reducing steps use the
 // S3WorkerPoolSize set at the ClusterSpec level.
-type ClusterSizingSpec struct {
+// NbrPartitions is used by the hash operator.
+// If NbrPartitions == 0, it will be set to the number of sharding node
+// and capped to clusterConfig.NbrPartitions
+// ShardSizeMb/ShardMaxSizeMb must be spcified to determine the nbr of nodes and to allocate files
+// to shards.
+type ClusterShardingSpec struct {
 	WhenTotalSizeGe  int  `json:"when_total_size_ge_mb"`
-	NbrNodes         int  `json:"nbr_nodes"`
+	NbrPartitions    int  `json:"nbr_partitions"`
+	ShardSizeMb      int  `json:"shard_size_mb"`
+	ShardMaxSizeMb   int  `json:"shard_max_size_mb"`
+	ShardSizeBy      int  `json:"shard_size_by"`     // for testing only
+	ShardMaxSizeBy   int  `json:"shard_max_size_by"` // for testing only
 	S3WorkerPoolSize int  `json:"s3_worker_pool_size"`
 	UseEcsTasks      bool `json:"use_ecs_tasks"`
 	MaxConcurrency   int  `json:"max_concurrency"`
@@ -108,17 +132,16 @@ type SchemaProviderSpec struct {
 	Type                 string             `json:"type"`
 	SourceType           string             `json:"source_type"`
 	Key                  string             `json:"key"`
-	Client               string             `json:"client"`
-	Vendor               string             `json:"vendor"`
-	ObjectType           string             `json:"object_type"`
 	SchemaName           string             `json:"schema_name"`
 	InputFormat          string             `json:"input_format"`
 	Compression          string             `json:"compression"`
 	InputFormatDataJson  string             `json:"input_format_data_json"`
 	Delimiter            string             `json:"delimiter"`
+	TrimColumns          bool               `json:"trim_columns"`
 	IsPartFiles          bool               `json:"is_part_files"`
 	FixedWidthColumnsCsv string             `json:"fixed_width_columns_csv"`
 	Columns              []SchemaColumnSpec `json:"columns"`
+	Env                  map[string]string  `json:"env"`
 }
 
 type SchemaColumnSpec struct {
@@ -135,9 +158,13 @@ type TableSpec struct {
 }
 
 type OutputFileSpec struct {
-	Key     string   `json:"key"`
-	Name    string   `json:"name"`
-	Headers []string `json:"headers"`
+	// KeyPrefix is optional, default to input file key path
+	// Name is required
+	Key            string   `json:"key"`
+	Name           string   `json:"name"`
+	SchemaProvider string   `json:"schema_provider"`
+	KeyPrefix      string   `json:"key_prefix"`
+	Headers        []string `json:"headers"`
 }
 
 type TableColumnSpec struct {
@@ -167,23 +194,27 @@ type SplitterSpec struct {
 }
 
 type TransformationSpec struct {
-	// Type range: map_record, aggregate, analyze, high_freq, partition_writer, anonymize, distinct
+	// Type range: map_record, aggregate, analyze, high_freq, partition_writer, anonymize, distinct, shuffling
 	// DeviceWriterType range: csv_writer, parquet_writer, fixed_width_writer
+	// JetsPartitionKey used by partition_writer as the default value for jet_partition
+	// WriteHeaders / WriteHeaderless takes precedence over SchemaProvider and Format (from OutputChannelConfig)
 	Type                  string                     `json:"type"`
 	NewRecord             bool                       `json:"new_record"`
 	PartitionSize         *int                       `json:"partition_size"`
-	JetsPartitionKey      *string                    `json:"jets_partition_key"` // Type partition_writer, default partition key
+	JetsPartitionKey      *string                    `json:"jets_partition_key"` // Type partition_writer
 	FilePathSubstitutions *[]PathSubstitution        `json:"file_path_substitutions"`
 	Columns               []TransformationColumnSpec `json:"columns"`
 	DataSchema            *[]DataSchemaSpec          `json:"data_schema"`
 	DeviceWriterType      *string                    `json:"device_writer_type"` // Type partition_writer
-	WriteHeaders          bool                       `json:"write_headers"`
-	RegexTokens           *[]RegexNode               `json:"regex_tokens"`      // Type analyze
-	LookupTokens          *[]LookupTokenNode         `json:"lookup_tokens"`     // Type analyze
-	KeywordTokens         *[]KeywordTokenNode        `json:"keyword_tokens"`    // Type analyze
-	HighFreqColumns       *[]*HighFreqSpec           `json:"high_freq_columns"` // Type high_freq
+	WriteHeaders          bool                       `json:"write_headers"`      // Type partition_writer
+	WriteHeaderless       bool                       `json:"write_headerless"`   // Type partition_writer
+	RegexTokens           *[]RegexNode               `json:"regex_tokens"`       // Type analyze
+	LookupTokens          *[]LookupTokenNode         `json:"lookup_tokens"`      // Type analyze
+	KeywordTokens         *[]KeywordTokenNode        `json:"keyword_tokens"`     // Type analyze
+	HighFreqColumns       *[]*HighFreqSpec           `json:"high_freq_columns"`  // Type high_freq
 	AnonymizeConfig       *AnonymizeSpec             `json:"anonymize_config"`
 	DistinctConfig        *DistinctSpec              `json:"distinct_config"`
+	ShufflingConfig       *ShufflingSpec             `json:"shuffling_config"`
 	OutputChannel         OutputChannelConfig        `json:"output_channel"`
 }
 
@@ -192,12 +223,13 @@ type InputChannelConfig struct {
 	// Format: csv, headerless_csv, etc.
 	// Compression: none, snappy
 	// SchemaProvider is provided via ComputePipesCommonArgs.SourcesConfig (ie input_registry table)
-	Type         string `json:"type"`
-	Name         string `json:"name"`
-	Format       string `json:"format"`      // Override default behavior
-	Compression  string `json:"compression"` // Override default behavior
-	ReadStepId   string `json:"read_step_id"`
-	SamplingRate int    `json:"sampling_rate"`
+	Type             string `json:"type"`
+	Name             string `json:"name"`
+	Format           string `json:"format"`      // Override default behavior
+	Compression      string `json:"compression"` // Override default behavior
+	ReadStepId       string `json:"read_step_id"`
+	SamplingRate     int    `json:"sampling_rate"`
+	SamplingMaxCount int    `json:"sampling_max_count"`
 }
 
 type OutputChannelConfig struct {
@@ -259,6 +291,11 @@ type AnonymizeSpec struct {
 
 type DistinctSpec struct {
 	DistinctOn []string `json:"distinct_on"`
+}
+
+type ShufflingSpec struct {
+	MaxInputSampleSize int `json:"max_input_sample_size"`
+	OutputSampleSize   int `json:"output_sample_size"`
 }
 
 type TransformationColumnSpec struct {
