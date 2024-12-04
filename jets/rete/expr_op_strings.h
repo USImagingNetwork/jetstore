@@ -192,6 +192,23 @@ struct StartsWithVisitor: public boost::static_visitor<RDFTTYPE>, public NoCallb
   BetaRow const* br;
 };
 
+// EndsWithVisitor
+// --------------------------------------------------------------------------------------
+struct EndsWithVisitor: public boost::static_visitor<RDFTTYPE>, public NoCallbackNeeded
+{
+  EndsWithVisitor(ReteSession * rs, BetaRow const* br): rs(rs), br(br) {}
+  EndsWithVisitor(): rs(nullptr), br(nullptr) {}
+  template<class T, class U> RDFTTYPE operator()(T lhs, U rhs)const{if(br==nullptr) return rdf::Null(); else RETE_EXCEPTION("Invalid arguments for starts_with: ("<<lhs<<", "<<rhs<<")");};
+
+  RDFTTYPE operator()(rdf::LString       lhs, rdf::LString       rhs)const
+  {
+    return rdf::LInt32{ boost::ends_with(lhs.data, rhs.data) };
+  }
+
+  ReteSession * rs;
+  BetaRow const* br;
+};
+
 // SubstringOfVisitor
 // --------------------------------------------------------------------------------------
 struct SubstringOfVisitor: public boost::static_visitor<RDFTTYPE>, public NoCallbackNeeded
@@ -206,6 +223,7 @@ struct SubstringOfVisitor: public boost::static_visitor<RDFTTYPE>, public NoCall
     //    - jets:from int value for start position of substring
     //    - jets:length int value for length of substring.
     // Note: if jets:from + jets:length > rhs.data.size() then return the available characters of rhs.data
+    // Note: if jets:length < 0 then remove jets:length from the end of the string
     // Get from and length from the config object
     auto * sess = rs->rdf_session();
     auto rmgr = sess->rmgr();
@@ -225,6 +243,10 @@ struct SubstringOfVisitor: public boost::static_visitor<RDFTTYPE>, public NoCall
     }
     auto from = boost::get<rdf::LInt32>(from_obj)->data;
     auto length = boost::get<rdf::LInt32>(length_obj)->data;
+    if (length < 0) {
+      auto sz = rhs.data.size();
+      length = sz + length - from;
+    }
     return rdf::LString{ rhs.data.substr(from, length) };
   }
 

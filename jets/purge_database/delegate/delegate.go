@@ -69,6 +69,7 @@ func DoPurgeSessions() error {
 	//    - Delete rows in staging tables (via input_registry)
 	//    - Delete rows in domain tables (via input_registry)
 	//    - Delete rows in input_registry
+	//    - Delete rows in compute_pipes_shard_registry
 	//		- Compact the database
 	
 	// Get all session_id prior to purgeFrom
@@ -92,6 +93,10 @@ func DoPurgeSessions() error {
 	tableNames = append(tableNames, "jetsapi.process_errors")
 	tableNames = append(tableNames, "jetsapi.pipeline_execution_details")
 	tableNames = append(tableNames, "jetsapi.report_execution_status")
+	tableNames = append(tableNames, "jetsapi.compute_pipes_shard_registry")
+	tableNames = append(tableNames, "jetsapi.compute_pipes_partitions_registry")
+	tableNames = append(tableNames, "jetsapi.cpipes_results")
+	tableNames = append(tableNames, "jetsapi.cpipes_metrics")
 	tableNames = append(tableNames, "jetsapi.session_registry")
 
 	for _,s := range tableNames {
@@ -180,6 +185,7 @@ func purgeMatchingRows(dbpool *pgxpool.Pool, sessionIds []string, tableName stri
 	sqlstmt := buf.String()
 	// fmt.Println(sqlstmt)
 	fmt.Printf("Purging %d sessions from table %s",len(sessionIds), tableName)
-	_, err := dbpool.Exec(context.Background(), sqlstmt)
-	return err
+	// ignore returned error, due to tableName that does not exis (virtual table)
+	dbpool.Exec(context.Background(), sqlstmt)
+	return nil
 }

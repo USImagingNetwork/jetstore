@@ -10,7 +10,6 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/artisoft-io/jetstore/jets/awsi"
 	"github.com/artisoft-io/jetstore/jets/dbutils"
@@ -40,6 +39,7 @@ type dbConnections struct {
 // JETS_LOG_DEBUG (optional, if == 1 set glog=3, ps=false, poolSize=1 for debugging)
 // JETS_LOG_DEBUG (optional, if == 2 set glog=3, ps=true, poolSize=1 for debugging)
 // JETS_s3_INPUT_PREFIX (required for registrying the domain table with input_registry)
+// JETS_S3_KMS_KEY_ARN
 // JETS_LOADER_SM_ARN state machine arn
 // JETS_SERVER_SM_ARN state machine arn
 // GLOG_v log level
@@ -59,7 +59,7 @@ var ruleseq = flag.String("ruleseq", "", "rule set sequence (override process co
 var pipelineConfigKey = flag.Int("pcKey", -1, "Pipeline config key (required or -peKey)")
 var pipelineExecKey = flag.Int("peKey", -1, "Pipeline execution key (required or -pcKey)")
 var poolSize = flag.Int("poolSize", 10, "Coroutines pool size constraint")
-var outSessionId = flag.String("sessionId", "", "Process session ID for the output Domain Tables. Use 'autogen' to generate a new sessionId (required)")
+var outSessionId = flag.String("sessionId", "", "Process session ID for the output Domain Tables. (required)")
 var inSessionIdOverride = flag.String("inSessionId", "", "Session ID for input domain tables, defaults to latest in input_registry table.")
 var limit = flag.Int("limit", -1, "Limit the number of input row (rete sessions), default no limit.")
 var nodeId = flag.Int("nodeId", 0, "DB node id associated to this processing node, can be overriden by -shardId.")
@@ -100,8 +100,11 @@ func init() {
 func doJob() (pipelineResult *PipelineResult, err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			err = fmt.Errorf("recovered error: %v", r)
-			debug.PrintStack()
+			var buf strings.Builder
+			buf.WriteString(fmt.Sprintf("doJob: recovered error: %v\n", r))
+			buf.WriteString(string(debug.Stack()))
+			err = errors.New(buf.String())
+			log.Println(err)
 		}
 	}()
 
@@ -202,6 +205,7 @@ func doJobAndReportStatus() error {
 	log.Printf("ENV JETS_INVALID_CODE: %s\n", os.Getenv("JETS_INVALID_CODE"))
 	log.Printf("ENV JETSTORE_DEV_MODE: %s\n", os.Getenv("JETSTORE_DEV_MODE"))
 	log.Printf("ENV JETS_DOMAIN_KEY_SEPARATOR: %s\n", os.Getenv("JETS_DOMAIN_KEY_SEPARATOR"))
+	log.Printf("ENV JETS_S3_KMS_KEY_ARN: %s\n", os.Getenv("JETS_S3_KMS_KEY_ARN"))
 	log.Printf("Command Line Argument: GLOG_v is set to %d\n", glogv)
 	dsn := dsnSplit[*nodeId%nbrDbNodes]
 	dbpool, err := pgxpool.Connect(context.Background(), dsn)
@@ -334,9 +338,6 @@ func main() {
 	if *nbrShards < 1 {
 		hasErr = true
 		errMsg = append(errMsg, "The number of shards (-nbrShards) for the output entities must at least be 1.")
-	}
-	if *outSessionId == "autogen" {
-		*outSessionId = strconv.FormatInt(time.Now().UnixMilli(), 10)
 	}
 	if *outSessionId == "" && *pipelineExecKey < 0 {
 		hasErr = true

@@ -2,10 +2,13 @@ package awsi
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"net/url"
 	"os"
 	"strconv"
@@ -16,12 +19,21 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
 	"github.com/aws/aws-sdk-go-v2/service/sfn"
 	"github.com/prozz/aws-embedded-metrics-golang/emf"
 )
 
 // This module provides aws integration for JetStore
+
+//*TODO no need to pass bucket and region to this module
+var bucket, region, kmsKeyArn string
+func init() {
+	kmsKeyArn = os.Getenv("JETS_S3_KMS_KEY_ARN")
+	bucket = os.Getenv("JETS_BUCKET")
+	region = os.Getenv("JETS_REGION")
+}
 
 func LogMetric(metricName string, dimentions *map[string]string, count int) {
 	m := emf.New().Namespace("JetStore/Pipeline").Metric(metricName, count)
@@ -31,7 +43,30 @@ func LogMetric(metricName string, dimentions *map[string]string, count int) {
 	m.Log()
 }
 
-func GetConfig() (aws.Config,error) {
+func GetPrivateIp() (string, error) {
+	resp, err := http.Get(os.Getenv("ECS_CONTAINER_METADATA_URI_V4"))
+	if err != nil {
+		log.Printf("while http get $ECS_CONTAINER_METADATA_URI_V4: %v", err)
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("while reading resp of http get $ECS_CONTAINER_METADATA_URI_V4: %v", err)
+		return "", err
+	}
+	fmt.Println("Got ECS_CONTAINER_METADATA_URI_V4:\n", string(body))
+	var data map[string]interface{}
+	err = json.Unmarshal(body, &data)
+	if err != nil {
+		return "", fmt.Errorf("** Invalid JSON from ECS_CONTAINER_METADATA_URI_V4: %v", err)
+	}
+	result := data["Networks"].([]interface{})[0].(map[string]interface{})["IPv4Addresses"].([]interface{})[0].(string)
+	fmt.Println("*** IPv4Addresses:", result)
+	return result, nil
+}
+
+func GetConfig() (aws.Config, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
 	defer cancel()
 	return config.LoadDefaultConfig(ctx)
@@ -75,17 +110,20 @@ func GetDsnFromJson(dsnJson string, useLocalhost bool, poolSize int) (string, er
 		return "", fmt.Errorf("while umarshaling dsn json: %v", err)
 	}
 	// fmt.Println(m)
+	if !useLocalhost {
+		_, useLocalhost = os.LookupEnv("USING_SSH_TUNNEL")
+	}
 	if useLocalhost {
 		m["host"] = "localhost"
 		fmt.Println("LOCAL TESTING using ssh tunnel (expecting ssh tunnel open)")
 	}
-	if poolSize < 10 {
+	if poolSize == 0 {
 		poolSize = 10
 	}
-	dsn := fmt.Sprintf("postgresql://%s:%s@%s:%.0f/postgres?pool_max_conns=%d", 
-		m["username"].(string), 
-		url.QueryEscape(m["password"].(string)), 
-		m["host"].(string), 
+	dsn := fmt.Sprintf("postgresql://%s:%s@%s:%.0f/postgres?pool_max_conns=%d",
+		m["username"].(string),
+		url.QueryEscape(m["password"].(string)),
+		m["host"].(string),
 		m["port"].(float64),
 		poolSize)
 	return dsn, nil
@@ -105,12 +143,12 @@ func GetDsnFromSecret(secret string, useLocalhost bool, poolSize int) (string, e
 }
 
 type S3Object struct {
-	Key string
+	Key  string
 	Size int64
 }
 
 // ListObjects lists the objects in a bucket with prefix if not nil.
-func ListS3Objects(prefix *string, bucket, region string) ([]*S3Object, error) {
+func ListS3Objects(prefix *string) ([]*S3Object, error) {
 	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(region))
 	if err != nil {
 		return nil, fmt.Errorf("while loading aws configuration: %v", err)
@@ -124,8 +162,8 @@ func ListS3Objects(prefix *string, bucket, region string) ([]*S3Object, error) {
 	var token *string
 	for isTruncated := true; isTruncated; {
 		result, err := s3Client.ListObjectsV2(context.TODO(), &s3.ListObjectsV2Input{
-			Bucket: aws.String(bucket),
-			Prefix: prefix,
+			Bucket:            aws.String(bucket),
+			Prefix:            prefix,
 			ContinuationToken: token,
 		})
 		if err != nil {
@@ -136,7 +174,7 @@ func ListS3Objects(prefix *string, bucket, region string) ([]*S3Object, error) {
 			// Skip the directories
 			if !strings.HasSuffix(*result.Contents[i].Key, "/") {
 				keys = append(keys, &S3Object{
-					Key: *result.Contents[i].Key,
+					Key:  *result.Contents[i].Key,
 					Size: *result.Contents[i].Size,
 				})
 			}
@@ -166,6 +204,25 @@ func DownloadFromS3(bucket, region, objKey string, fileHd *os.File) (int64, erro
 	return nsz, nil
 }
 
+func NewDownloader(region string) (*manager.Downloader, error) {
+	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(region))
+	if err != nil {
+		return nil, fmt.Errorf("while loading aws configuration: %v", err)
+	}
+	// Create a s3 client
+	s3Client := s3.NewFromConfig(cfg)
+	return manager.NewDownloader(s3Client), nil
+}
+
+// Use a shared Downloader to download obj from s3 into fileHd (must be writable), return size of download in bytes
+func DownloadFromS3v2(downloader *manager.Downloader, bucket, objKey string, byteRange *string, fileHd *os.File) (int64, error) {
+	nsz, err := downloader.Download(context.TODO(), fileHd, &s3.GetObjectInput{Bucket: &bucket, Key: &objKey, Range: byteRange})
+	if err != nil {
+		return 0, fmt.Errorf("failed to download file from s3: %v", err)
+	}
+	return nsz, nil
+}
+
 // upload object to S3, reading the obj from fileHd (from current position to EOF)
 func UploadToS3(bucket, region, objKey string, fileHd *os.File) error {
 	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(region))
@@ -178,17 +235,92 @@ func UploadToS3(bucket, region, objKey string, fileHd *os.File) error {
 
 	// Create an uploader with the client and custom options
 	uploader := manager.NewUploader(s3Client)
-	uout, err := uploader.Upload(context.TODO(), &s3.PutObjectInput{
+	putObjInput := &s3.PutObjectInput{
 		Bucket: &bucket,
 		Key:    &objKey,
 		Body:   bufio.NewReader(fileHd),
-	})
+	}
+	if len(kmsKeyArn) > 0 {
+		putObjInput.ServerSideEncryption = types.ServerSideEncryptionAwsKms
+		putObjInput.SSEKMSKeyId = &kmsKeyArn
+	}
+	// uout, err := uploader.Upload(context.TODO(), putObjInput)
+	_, err = uploader.Upload(context.TODO(), putObjInput)
 	if err != nil {
 		return fmt.Errorf("failed to upload file to s3: %v", err)
 	}
-	if uout != nil {
-		log.Println("Uploaded",*uout.Key,"to location",uout.Location)
+	// if uout != nil {
+	// 	log.Println("Uploaded",*uout.Key,"to location",uout.Location)
+	// }
+	return nil
+}
+
+// upload object to S3, reading the obj from reader (from current position to EOF)
+func UploadToS3FromReader(objKey string, reader io.Reader) error {
+	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(region))
+	if err != nil {
+		return fmt.Errorf("while loading aws configuration: %v", err)
 	}
+
+	// Create a s3 client
+	s3Client := s3.NewFromConfig(cfg)
+
+	// Create an uploader with the client and custom options
+	uploader := manager.NewUploader(s3Client)
+	putObjInput := &s3.PutObjectInput{
+		Bucket: &bucket,
+		Key:    &objKey,
+		Body:   reader,
+	}
+	if len(kmsKeyArn) > 0 {
+		putObjInput.ServerSideEncryption = types.ServerSideEncryptionAwsKms
+		putObjInput.SSEKMSKeyId = &kmsKeyArn
+	}
+	// uout, err := uploader.Upload(context.TODO(), putObjInput)
+	_, err = uploader.Upload(context.TODO(), putObjInput)
+	if err != nil {
+		return fmt.Errorf("failed to upload file to s3: %v", err)
+	}
+	// if uout != nil {
+	// 	log.Println("Uploaded",*uout.Key,"to location",uout.Location)
+	// }
+	return nil
+}
+
+// upload buf to S3, reading the obj from in-memory buffer
+func UploadBufToS3(objKey string, buf []byte) error {
+	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(region))
+	if err != nil {
+		return fmt.Errorf("while loading aws configuration: %v", err)
+	}
+
+	// Create a s3 client
+	s3Client := s3.NewFromConfig(cfg)
+
+	// Create an uploader with the client and custom options
+	// uploader := manager.NewUploader(s3Client)
+	reader := bytes.NewReader(buf)
+	contentLen := int64(len(buf))
+	putObjInput := &s3.PutObjectInput{
+		Bucket: &bucket,
+		Key:    &objKey,
+		Body:   reader,
+		ContentLength: &contentLen,
+	}
+	if len(kmsKeyArn) > 0 {
+		putObjInput.ServerSideEncryption = types.ServerSideEncryptionAwsKms
+		putObjInput.SSEKMSKeyId = &kmsKeyArn
+	}
+	_, err = s3Client.PutObject(context.TODO(), putObjInput)
+	// uout, err := uploader.Upload(context.TODO(), putObjInput)
+	// _, err = uploader.Upload(context.TODO(), putObjInput)
+	if err != nil {
+		return fmt.Errorf("failed to PutObject buf to s3: %v", err)
+	}
+	// log.Println("*** UNREAD PORTION OF BUF:", reader.Len(), "contentLen:", contentLen)
+	// if uout != nil {
+	// 	log.Println("Uploaded",*uout.Key,"to location",uout.Location)
+	// }
 	return nil
 }
 
@@ -199,7 +331,7 @@ func StartExecution(stateMachineARN string, stateMachineInput map[string]interfa
 	if err != nil {
 		return "", fmt.Errorf("while load SDK configuration: %v", err)
 	}
-	
+
 	smInputJson, err := json.Marshal(stateMachineInput)
 	if err != nil {
 		return "", fmt.Errorf("while marshalling smInput: %v", err)
@@ -215,8 +347,8 @@ func StartExecution(stateMachineARN string, stateMachineInput map[string]interfa
 	// Set the parameters for starting a process
 	params := &sfn.StartExecutionInput{
 		StateMachineArn: &stateMachineARN,
-		Input: &smInputStr,
-		Name: &name,
+		Input:           &smInputStr,
+		Name:            &name,
 	}
 
 	// Step Function client

@@ -168,7 +168,7 @@ final Map<String, FormConfig> _formConfigurations = {
       [
         TextFieldConfig(
             label:
-                "Paste or enter the file headers as a json array,\ncan be column position for parquet files:",
+                "Paste or enter the file headers as a json array:",
             maxLines: 2,
             topMargin: 0,
             bottomMargin: 0),
@@ -176,9 +176,9 @@ final Map<String, FormConfig> _formConfigurations = {
       [
         FormInputFieldConfig(
             key: FSK.inputColumnsJson,
-            label: "Input file column names or position (json)",
+            label: "Input file column names (json)",
             hint:
-                "Input file column names or position, for csv headerless or parquet files",
+                "Input file column names, for csv headerless or parquet files",
             flex: 1,
             autofocus: false,
             obscureText: false,
@@ -268,7 +268,7 @@ final Map<String, FormConfig> _formConfigurations = {
     actions: standardActions,
     inputFields: [
       [
-        PaddingConfig(height: 2 * defaultPadding),
+        PaddingConfig(height: 1 * defaultPadding),
       ],
       [
         TextFieldConfig(
@@ -321,7 +321,7 @@ final Map<String, FormConfig> _formConfigurations = {
               DropdownItemConfig(label: 'Manual', value: '0'),
             ],
             flex: 1,
-            defaultItemPos: 0),
+            defaultItemPos: 1),
       ],
       [
         PaddingConfig(height: 2 * defaultPadding),
@@ -412,11 +412,15 @@ final Map<String, FormConfig> _formConfigurations = {
               DropdownItemConfig(label: 'CSV', value: 'csv'),
               DropdownItemConfig(
                   label: 'Headerless CSV', value: 'headerless_csv'),
+              DropdownItemConfig(
+                  label: 'Headerless CSV (with a Schema Provider)', value: 'headerless_csv_with_schema_provider'),
               DropdownItemConfig(label: 'XLSX', value: 'xlsx'),
               DropdownItemConfig(
                   label: 'Headerless XLSX', value: 'headerless_xlsx'),
               DropdownItemConfig(
                   label: 'Fixed-Width Columns', value: 'fixed_width'),
+              DropdownItemConfig(
+                  label: 'Fixed-Width Columns (with a Schema Provider)', value: 'fixed_width_with_schema_provider'),
               DropdownItemConfig(label: 'Parquet', value: 'parquet'),
               DropdownItemConfig(
                   label: 'Parquet, Selected Columns', value: 'parquet_select'),
