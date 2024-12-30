@@ -2,7 +2,6 @@ package main
 
 import (
 	"flag"
-	"fmt"
 	"log"
 	"os"
 	"strconv"
@@ -38,28 +37,33 @@ import (
 // JETS_LOADER_SM_ARN state machine arn
 // JETS_REGION
 // JETS_SERVER_SM_ARN state machine arn
+// JETS_SERVER_SM_ARNv2 state machine arn
 // JETSTORE_DEV_MODE Indicates running in dev mode
+// JETS_LOG_DEBUG set to 1 or 2 (will prints graph, very verbose)
 // NBR_SHARDS set the nbr of shard to use for loader and server
 // WEB_APP_DEPLOYMENT_DIR
 // WORKSPACE Workspace currently in use (active workspace)
 // WORKSPACE_BRANCH deployed branch of active workspace
+// WORKSPACE_FILE_KEY_LABEL_RE (optional) regex to extract label from file_key in UI
 // ACTIVE_WORKSPACE_URI Workspace uri for active workspace
 // WORKSPACE_URI (optional) fixed Workspace uri for all workspaces when defined
 // WORKSPACES_HOME Home dir of workspaces
 // JETS_BUCKET (required for SyncFileKeys)
 // JETS_s3_INPUT_PREFIX Input file key prefix
 // JETS_s3_OUTPUT_PREFIX Output file key prefix
+// JETS_s3_STAGE_PREFIX file key prefix for stage files (no notification is registered for those files)
+// JETS_S3_KMS_KEY_ARN optional for server side s3 object encryption
 // JETS_DOMAIN_KEY_HASH_ALGO (values: md5, sha1, none (default))
 // JETS_DOMAIN_KEY_HASH_SEED (required for md5 and sha1. MUST be a valid uuid )
-// JETS_RESET_DOMAIN_TABLE_ON_STARTUP (value: yes, will reset the domain table, run workspace db init script, and upgrade system tables if database version is less than build version)
 // JETS_DOMAIN_KEY_SEPARATOR 
 // JETS_SCHEMA_FILE location of jetstore db schema file
+// JETS_INIT_DB_SCRIPT path to jets_init_db.sql files (not workspace specific)
 // JETS_ENCRYPTION_KEY required key to encrypt git token in users table
 
 var awsDsnSecret       = flag.String("awsDsnSecret", "", "aws secret with dsn definition (aws integration) (required unless -dsn is provided)")
 var awsApiSecret       = flag.String("awsApiSecret", "", "aws secret with string to use for signing jwt tokens (aws integration) (required unless -dsn is provided)")
 var apiSecret          = flag.String("apiSecret", "", "Secret used for signing jwt tokens (required unless -awsApiSecret is provided)")
-var dbPoolSize         = flag.Int("dbPoolSize", 10, "DB connection pool size, used for -awsDnsSecret (default 10)")
+var dbPoolSize         = flag.Int("dbPoolSize", 100, "DB connection pool size, used for -awsDnsSecret (default 100)")
 var usingSshTunnel     = flag.Bool("usingSshTunnel", false, "Connect  to DB using ssh tunnel (expecting the ssh open)")
 var awsRegion          = flag.String("awsRegion", "", "aws region to connect to for aws secret and bucket (aws integration) (required if -awsDsnSecret is provided)")
 var dsn                = flag.String("dsn", "", "primary database connection string (required unless -awsDsnSecret is provided)")
@@ -147,7 +151,8 @@ func main() {
 		}
 	}
 
-	// This is used only in DEV MODE
+	// This specify the nbr of shard to the loaderand server processes via command line argument
+	// The serverv2 process will take it via env var, as done here.
 	nbrShards = 1
 	ns, ok := os.LookupEnv("NBR_SHARDS")
 	var err error
@@ -183,48 +188,50 @@ func main() {
 	if hasErr {
 		flag.Usage()
 		for _, msg := range errMsg {
-			fmt.Println("**",msg)
+			log.Println("**",msg)
 		}
 		panic(errMsg)
 	}
 	
-	fmt.Println("apiserver argument:")
-	fmt.Println("-------------------")
-	fmt.Println("Got argument: awsApiSecret",*awsApiSecret)
-	fmt.Println("Got argument: apiSecret len",len(*apiSecret))
-	fmt.Println("Got argument: dsn len",len(*dsn))
-	fmt.Println("Got argument: awsDsnSecret",*awsDsnSecret)
-	fmt.Println("Got argument: dbPoolSize",*dbPoolSize)
-	fmt.Println("Got argument: usingSshTunnel",*usingSshTunnel)
-	fmt.Println("Got argument: awsRegion",*awsRegion)
-	fmt.Println("Got argument: serverAddr",*serverAddr)
-	fmt.Println("Got argument: tokenExpiration",*tokenExpiration, "min")
-	fmt.Println("Got argument: adminEmail len", len(*adminEmail))
-	fmt.Println("Got argument: awsAdminPwdSecret",*awsAdminPwdSecret)
-	fmt.Println("Got argument: adminPwd len", len(*adminPwd))
-	fmt.Println("Got argument: WEB_APP_DEPLOYMENT_DIR",*uiWebDir)
+	log.Println("apiserver argument:")
+	log.Println("-------------------")
+	log.Println("Got argument: awsApiSecret",*awsApiSecret)
+	log.Println("Got argument: apiSecret len",len(*apiSecret))
+	log.Println("Got argument: dsn len",len(*dsn))
+	log.Println("Got argument: awsDsnSecret",*awsDsnSecret)
+	log.Println("Got argument: dbPoolSize",*dbPoolSize)
+	log.Println("Got argument: usingSshTunnel",*usingSshTunnel)
+	log.Println("Got argument: awsRegion",*awsRegion)
+	log.Println("Got argument: serverAddr",*serverAddr)
+	log.Println("Got argument: tokenExpiration",*tokenExpiration, "min")
+	log.Println("Got argument: adminEmail len", len(*adminEmail))
+	log.Println("Got argument: awsAdminPwdSecret",*awsAdminPwdSecret)
+	log.Println("Got argument: adminPwd len", len(*adminPwd))
+	log.Println("Got argument: WEB_APP_DEPLOYMENT_DIR",*uiWebDir)
 	if globalDevMode {
-		fmt.Println("Running in DEV MODE")
+		log.Println("Running in DEV MODE")
 		if len(*unitTestDir) > 0 {
-			fmt.Println("Running in DEV MODE with unitTestDir", *unitTestDir)
+			log.Println("Running in DEV MODE with unitTestDir", *unitTestDir)
 		}
-		fmt.Println("Nbr Shards in DEV MODE: nbrShards", nbrShards)
+		log.Println("Nbr Shards in DEV MODE: nbrShards", nbrShards)
 	}
-	fmt.Printf("ENV JETS_REGION: %s\n", os.Getenv("JETS_REGION"))
-	fmt.Printf("ENV JETS_BUCKET: %s\n", os.Getenv("JETS_BUCKET"))
-	fmt.Printf("ENV JETS_DSN_SECRET: %s\n", os.Getenv("JETS_DSN_SECRET"))
-	fmt.Println("ENV WORKSPACES_HOME:",os.Getenv("WORKSPACES_HOME"))
-	fmt.Println("ENV WORKSPACE:",os.Getenv("WORKSPACE"))
-	fmt.Println("ENV WORKSPACE_BRANCH:",os.Getenv("WORKSPACE_BRANCH"))
-	fmt.Println("ENV ACTIVE_WORKSPACE_URI:",os.Getenv("ACTIVE_WORKSPACE_URI"))
-	fmt.Println("ENV WORKSPACE_URI:",os.Getenv("WORKSPACE_URI"))
-	fmt.Println("ENV JETS_s3_INPUT_PREFIX:",os.Getenv("JETS_s3_INPUT_PREFIX"))
-	fmt.Println("ENV JETS_s3_OUTPUT_PREFIX:",os.Getenv("JETS_s3_OUTPUT_PREFIX"))
-	fmt.Println("ENV JETS_VERSION:",os.Getenv("JETS_VERSION"))
-	fmt.Println("ENV JETS_DOMAIN_KEY_HASH_ALGO:",os.Getenv("JETS_DOMAIN_KEY_HASH_ALGO"))
-	fmt.Println("ENV JETS_DOMAIN_KEY_HASH_SEED:",os.Getenv("JETS_DOMAIN_KEY_HASH_SEED"))
-	fmt.Println("ENV JETS_RESET_DOMAIN_TABLE_ON_STARTUP:",os.Getenv("JETS_RESET_DOMAIN_TABLE_ON_STARTUP"))
-	fmt.Println("ENV JETS_DOMAIN_KEY_SEPARATOR:",os.Getenv("JETS_DOMAIN_KEY_SEPARATOR"))
-	fmt.Println("ENV len JETS_ENCRYPTION_KEY:",len(os.Getenv("JETS_ENCRYPTION_KEY")))
+	log.Printf("ENV JETS_REGION: %s\n", os.Getenv("JETS_REGION"))
+	log.Printf("ENV JETS_BUCKET: %s\n", os.Getenv("JETS_BUCKET"))
+	log.Printf("ENV JETS_DSN_SECRET: %s\n", os.Getenv("JETS_DSN_SECRET"))
+	log.Println("ENV WORKSPACES_HOME:",os.Getenv("WORKSPACES_HOME"))
+	log.Println("ENV WORKSPACE:",os.Getenv("WORKSPACE"))
+	log.Println("ENV WORKSPACE_BRANCH:",os.Getenv("WORKSPACE_BRANCH"))
+	log.Println("ENV WORKSPACE_FILE_KEY_LABEL_RE:",os.Getenv("WORKSPACE_FILE_KEY_LABEL_RE"))
+	log.Println("ENV ACTIVE_WORKSPACE_URI:",os.Getenv("ACTIVE_WORKSPACE_URI"))
+	log.Println("ENV WORKSPACE_URI:",os.Getenv("WORKSPACE_URI"))
+	log.Println("ENV JETS_s3_INPUT_PREFIX:",os.Getenv("JETS_s3_INPUT_PREFIX"))
+	log.Println("ENV JETS_s3_OUTPUT_PREFIX:",os.Getenv("JETS_s3_OUTPUT_PREFIX"))
+	log.Println("ENV JETS_s3_STAGE_PREFIX:",os.Getenv("JETS_s3_STAGE_PREFIX"))
+	log.Println("ENV JETS_S3_KMS_KEY_ARN:",os.Getenv("JETS_S3_KMS_KEY_ARN"))
+	log.Println("ENV JETS_VERSION:",os.Getenv("JETS_VERSION"))
+	log.Println("ENV JETS_DOMAIN_KEY_HASH_ALGO:",os.Getenv("JETS_DOMAIN_KEY_HASH_ALGO"))
+	log.Println("ENV JETS_DOMAIN_KEY_HASH_SEED:",os.Getenv("JETS_DOMAIN_KEY_HASH_SEED"))
+	log.Println("ENV JETS_DOMAIN_KEY_SEPARATOR:",os.Getenv("JETS_DOMAIN_KEY_SEPARATOR"))
+	log.Println("ENV len JETS_ENCRYPTION_KEY:",len(os.Getenv("JETS_ENCRYPTION_KEY")))
 	log.Fatal(listenAndServe())
 }

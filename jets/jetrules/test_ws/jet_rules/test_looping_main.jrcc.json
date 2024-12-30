@@ -1,0 +1,1155 @@
+{
+    "resources": [
+        {
+            "type": "text",
+            "id": "jets:MONTHLY_PERIOD",
+            "value": "month_period",
+            "source_file_name": "data_model/jets_model.jr",
+            "key": 0,
+            "db_key": 82
+        },
+        {
+            "type": "text",
+            "id": "jets:WEEKLY_PERIOD",
+            "value": "week_period",
+            "source_file_name": "data_model/jets_model.jr",
+            "key": 1,
+            "db_key": 83
+        },
+        {
+            "type": "text",
+            "id": "jets:DAYLY_PERIOD",
+            "value": "day_period",
+            "source_file_name": "data_model/jets_model.jr",
+            "key": 2,
+            "db_key": 84
+        },
+        {
+            "type": "resource",
+            "id": "jets:iState",
+            "value": "jets:iState",
+            "source_file_name": "data_model/jets_model.jr",
+            "source_fname": "predefined",
+            "key": 3,
+            "db_key": 80
+        },
+        {
+            "type": "volatile_resource",
+            "id": "newPerson",
+            "value": "newPerson",
+            "source_file_name": "jet_rules/test_looping_main.jr",
+            "key": 4,
+            "db_key": 138
+        },
+        {
+            "id": "jets:Entity",
+            "type": "resource",
+            "value": "jets:Entity",
+            "source_file_name": "data_model/test_looping_model.jr",
+            "key": 5,
+            "db_key": 139
+        },
+        {
+            "id": "owl:Thing",
+            "type": "resource",
+            "value": "owl:Thing",
+            "source_file_name": "predefined",
+            "key": 6,
+            "db_key": 19
+        },
+        {
+            "id": "jets:client",
+            "type": "resource",
+            "value": "jets:client",
+            "source_file_name": "data_model/jets_model.jr",
+            "key": 7,
+            "db_key": 90
+        },
+        {
+            "id": "jets:key",
+            "type": "resource",
+            "value": "jets:key",
+            "source_file_name": "predefined",
+            "key": 8,
+            "db_key": 13
+        },
+        {
+            "id": "jets:org",
+            "type": "resource",
+            "value": "jets:org",
+            "source_file_name": "data_model/jets_model.jr",
+            "key": 9,
+            "db_key": 91
+        },
+        {
+            "id": "jets:ruleTag",
+            "type": "resource",
+            "value": "jets:ruleTag",
+            "source_file_name": "data_model/jets_model.jr",
+            "key": 10,
+            "db_key": 92
+        },
+        {
+            "id": "rdf:type",
+            "type": "resource",
+            "value": "rdf:type",
+            "source_file_name": "predefined",
+            "key": 11,
+            "db_key": 11
+        },
+        {
+            "id": "jets:InputRecord",
+            "type": "resource",
+            "value": "jets:InputRecord",
+            "source_file_name": "data_model/jets_model.jr",
+            "key": 12,
+            "db_key": 93
+        },
+        {
+            "id": "jets:State",
+            "type": "resource",
+            "value": "jets:State",
+            "source_file_name": "predefined",
+            "key": 13,
+            "db_key": 68
+        },
+        {
+            "id": "jets:completed",
+            "type": "resource",
+            "value": "jets:completed",
+            "source_file_name": "predefined",
+            "key": 14,
+            "db_key": 33
+        },
+        {
+            "id": "jets:currentSourcePeriod",
+            "type": "resource",
+            "value": "jets:currentSourcePeriod",
+            "source_file_name": "data_model/jets_model.jr",
+            "key": 15,
+            "db_key": 94
+        },
+        {
+            "id": "jets:currentSourcePeriodDate",
+            "type": "resource",
+            "value": "jets:currentSourcePeriodDate",
+            "source_file_name": "data_model/jets_model.jr",
+            "key": 16,
+            "db_key": 95
+        },
+        {
+            "id": "jets:exception",
+            "type": "resource",
+            "value": "jets:exception",
+            "source_file_name": "predefined",
+            "key": 17,
+            "db_key": 64
+        },
+        {
+            "id": "jets:from",
+            "type": "resource",
+            "value": "jets:from",
+            "source_file_name": "data_model/jets_model.jr",
+            "key": 18,
+            "db_key": 96
+        },
+        {
+            "id": "jets:length",
+            "type": "resource",
+            "value": "jets:length",
+            "source_file_name": "data_model/jets_model.jr",
+            "key": 19,
+            "db_key": 97
+        },
+        {
+            "id": "jets:loop",
+            "type": "resource",
+            "value": "jets:loop",
+            "source_file_name": "predefined",
+            "key": 20,
+            "db_key": 18
+        },
+        {
+            "id": "jets:max_vertex_visits",
+            "type": "resource",
+            "value": "jets:max_vertex_visits",
+            "source_file_name": "data_model/jets_model.jr",
+            "key": 21,
+            "db_key": 98
+        },
+        {
+            "id": "jets:range_value",
+            "type": "resource",
+            "value": "jets:range_value",
+            "source_file_name": "data_model/jets_model.jr",
+            "key": 22,
+            "db_key": 99
+        },
+        {
+            "id": "jets:replace_chars",
+            "type": "resource",
+            "value": "jets:replace_chars",
+            "source_file_name": "data_model/jets_model.jr",
+            "key": 23,
+            "db_key": 100
+        },
+        {
+            "id": "jets:replace_with",
+            "type": "resource",
+            "value": "jets:replace_with",
+            "source_file_name": "data_model/jets_model.jr",
+            "key": 24,
+            "db_key": 101
+        },
+        {
+            "id": "jets:sourcePeriodType",
+            "type": "resource",
+            "value": "jets:sourcePeriodType",
+            "source_file_name": "data_model/jets_model.jr",
+            "key": 25,
+            "db_key": 102
+        },
+        {
+            "id": "lp:Person",
+            "type": "resource",
+            "value": "lp:Person",
+            "source_file_name": "data_model/test_looping_model.jr",
+            "key": 26,
+            "db_key": 140
+        },
+        {
+            "id": "lp:name",
+            "type": "resource",
+            "value": "lp:name",
+            "source_file_name": "data_model/test_looping_model.jr",
+            "key": 27,
+            "db_key": 141
+        },
+        {
+            "type": "var",
+            "id": "?x1",
+            "is_binded": false,
+            "var_pos": 0,
+            "vertex": 1,
+            "key": 28,
+            "source_file_name": "jet_rules/test_looping_main.jr",
+            "db_key": 142
+        },
+        {
+            "type": "var",
+            "id": "?x1",
+            "is_binded": true,
+            "vertex": 2,
+            "is_antecedent": true,
+            "var_pos": 0,
+            "key": 29,
+            "source_file_name": "jet_rules/test_looping_main.jr",
+            "db_key": 143
+        },
+        {
+            "type": "var",
+            "id": "?x2",
+            "is_binded": false,
+            "var_pos": 2,
+            "vertex": 2,
+            "key": 30,
+            "source_file_name": "jet_rules/test_looping_main.jr",
+            "db_key": 144
+        },
+        {
+            "type": "var",
+            "id": "?x2",
+            "is_binded": true,
+            "vertex": 2,
+            "is_antecedent": false,
+            "var_pos": 1,
+            "key": 31,
+            "source_file_name": "jet_rules/test_looping_main.jr",
+            "db_key": 145
+        },
+        {
+            "type": "int",
+            "value": "3",
+            "inline": true,
+            "key": 32,
+            "source_file_name": "jet_rules/test_looping_main.jr",
+            "db_key": 146
+        },
+        {
+            "type": "var",
+            "id": "?x1",
+            "is_binded": true,
+            "vertex": 3,
+            "is_antecedent": true,
+            "var_pos": 0,
+            "key": 33,
+            "source_file_name": "jet_rules/test_looping_main.jr",
+            "db_key": 147
+        },
+        {
+            "type": "var",
+            "id": "?x2",
+            "is_binded": false,
+            "var_pos": 2,
+            "vertex": 3,
+            "key": 34,
+            "source_file_name": "jet_rules/test_looping_main.jr",
+            "db_key": 148
+        },
+        {
+            "type": "var",
+            "id": "?x1",
+            "is_binded": true,
+            "vertex": 4,
+            "is_antecedent": true,
+            "var_pos": 0,
+            "key": 35,
+            "source_file_name": "jet_rules/test_looping_main.jr",
+            "db_key": 149
+        },
+        {
+            "type": "var",
+            "id": "?x3",
+            "is_binded": false,
+            "var_pos": 2,
+            "vertex": 4,
+            "key": 36,
+            "source_file_name": "jet_rules/test_looping_main.jr",
+            "db_key": 150
+        },
+        {
+            "type": "var",
+            "id": "?x1",
+            "is_binded": true,
+            "vertex": 5,
+            "is_antecedent": true,
+            "var_pos": 0,
+            "key": 37,
+            "source_file_name": "jet_rules/test_looping_main.jr",
+            "db_key": 151
+        },
+        {
+            "type": "int",
+            "value": "3",
+            "inline": true,
+            "key": 38,
+            "source_file_name": "jet_rules/test_looping_main.jr",
+            "db_key": 152
+        },
+        {
+            "type": "var",
+            "id": "?x1",
+            "is_binded": false,
+            "var_pos": 0,
+            "vertex": 6,
+            "key": 39,
+            "source_file_name": "jet_rules/test_looping_main.jr",
+            "db_key": 153
+        },
+        {
+            "type": "var",
+            "id": "?x1",
+            "is_binded": false,
+            "var_pos": 0,
+            "vertex": 7,
+            "key": 40,
+            "source_file_name": "jet_rules/test_looping_main.jr",
+            "db_key": 154
+        },
+        {
+            "type": "var",
+            "id": "?x1",
+            "is_binded": false,
+            "var_pos": 0,
+            "vertex": 8,
+            "key": 41,
+            "source_file_name": "jet_rules/test_looping_main.jr",
+            "db_key": 155
+        },
+        {
+            "type": "var",
+            "id": "?x1",
+            "is_binded": true,
+            "vertex": 1,
+            "is_antecedent": false,
+            "var_pos": 0,
+            "key": 42,
+            "source_file_name": "jet_rules/test_looping_main.jr",
+            "db_key": 156
+        },
+        {
+            "type": "var",
+            "id": "?x1",
+            "is_binded": true,
+            "vertex": 2,
+            "is_antecedent": false,
+            "var_pos": 0,
+            "key": 43,
+            "source_file_name": "jet_rules/test_looping_main.jr",
+            "db_key": 157
+        },
+        {
+            "type": "int",
+            "value": "0",
+            "inline": true,
+            "key": 44,
+            "source_file_name": "jet_rules/test_looping_main.jr",
+            "db_key": 158
+        },
+        {
+            "type": "var",
+            "id": "?x3",
+            "is_binded": true,
+            "vertex": 4,
+            "is_antecedent": false,
+            "var_pos": 1,
+            "key": 45,
+            "source_file_name": "jet_rules/test_looping_main.jr",
+            "db_key": 159
+        },
+        {
+            "type": "var",
+            "id": "?x3",
+            "is_binded": true,
+            "vertex": 4,
+            "is_antecedent": false,
+            "var_pos": 1,
+            "key": 46,
+            "source_file_name": "jet_rules/test_looping_main.jr",
+            "db_key": 160
+        },
+        {
+            "type": "text",
+            "value": "person_",
+            "inline": true,
+            "key": 47,
+            "source_file_name": "jet_rules/test_looping_main.jr",
+            "db_key": 161
+        },
+        {
+            "type": "var",
+            "id": "?x2",
+            "is_binded": true,
+            "vertex": 4,
+            "is_antecedent": false,
+            "var_pos": 0,
+            "key": 48,
+            "source_file_name": "jet_rules/test_looping_main.jr",
+            "db_key": 162
+        },
+        {
+            "type": "var",
+            "id": "?x1",
+            "is_binded": true,
+            "vertex": 5,
+            "is_antecedent": false,
+            "var_pos": 0,
+            "key": 49,
+            "source_file_name": "jet_rules/test_looping_main.jr",
+            "db_key": 163
+        },
+        {
+            "type": "keyword",
+            "value": "true",
+            "inline": true,
+            "key": 50,
+            "source_file_name": "jet_rules/test_looping_main.jr",
+            "db_key": 164
+        },
+        {
+            "type": "var",
+            "id": "?x1",
+            "is_binded": true,
+            "vertex": 6,
+            "is_antecedent": false,
+            "var_pos": 0,
+            "key": 51,
+            "source_file_name": "jet_rules/test_looping_main.jr",
+            "db_key": 165
+        },
+        {
+            "type": "var",
+            "id": "?x1",
+            "is_binded": true,
+            "vertex": 7,
+            "is_antecedent": false,
+            "var_pos": 0,
+            "key": 52,
+            "source_file_name": "jet_rules/test_looping_main.jr",
+            "db_key": 166
+        },
+        {
+            "type": "var",
+            "id": "?x1",
+            "is_binded": true,
+            "vertex": 8,
+            "is_antecedent": false,
+            "var_pos": 0,
+            "key": 53,
+            "source_file_name": "jet_rules/test_looping_main.jr",
+            "db_key": 167
+        }
+    ],
+    "lookup_tables": [],
+    "jet_rules": [],
+    "imports": {
+        "jet_rules/test_looping_main.jr": [
+            "data_model/jets_model.jr",
+            "data_model/test_looping_model.jr"
+        ]
+    },
+    "jetstore_config": {
+        "$max_looping": "5",
+        "$max_rule_exec": "100",
+        "source_file_name": "jet_rules/test_looping_main.jr",
+        "type": "jsconfig"
+    },
+    "classes": [
+        {
+            "type": "class",
+            "name": "jets:Entity",
+            "base_classes": [
+                "owl:Thing"
+            ],
+            "data_properties": [
+                {
+                    "name": "jets:client",
+                    "type": "text",
+                    "as_array": false,
+                    "db_key": 0
+                },
+                {
+                    "name": "jets:key",
+                    "type": "text",
+                    "as_array": false,
+                    "db_key": 1
+                },
+                {
+                    "name": "jets:org",
+                    "type": "text",
+                    "as_array": false,
+                    "db_key": 2
+                },
+                {
+                    "name": "jets:ruleTag",
+                    "type": "text",
+                    "as_array": true,
+                    "db_key": 3
+                },
+                {
+                    "name": "rdf:type",
+                    "type": "resource",
+                    "as_array": true,
+                    "db_key": 4
+                }
+            ],
+            "source_file_name": "data_model/jets_model.jr",
+            "as_table": false,
+            "sub_classes": [
+                "lp:Person"
+            ],
+            "db_key": 1
+        },
+        {
+            "type": "class",
+            "name": "jets:InputRecord",
+            "base_classes": [
+                "owl:Thing"
+            ],
+            "data_properties": [],
+            "source_file_name": "data_model/jets_model.jr",
+            "as_table": false,
+            "sub_classes": [],
+            "db_key": 2
+        },
+        {
+            "type": "class",
+            "name": "jets:State",
+            "base_classes": [
+                "owl:Thing"
+            ],
+            "data_properties": [
+                {
+                    "name": "jets:completed",
+                    "type": "bool",
+                    "as_array": false,
+                    "db_key": 5
+                },
+                {
+                    "name": "jets:currentSourcePeriod",
+                    "type": "int",
+                    "as_array": false,
+                    "db_key": 6
+                },
+                {
+                    "name": "jets:currentSourcePeriodDate",
+                    "type": "date",
+                    "as_array": false,
+                    "db_key": 7
+                },
+                {
+                    "name": "jets:exception",
+                    "type": "text",
+                    "as_array": false,
+                    "db_key": 8
+                },
+                {
+                    "name": "jets:from",
+                    "type": "int",
+                    "as_array": false,
+                    "db_key": 9
+                },
+                {
+                    "name": "jets:length",
+                    "type": "int",
+                    "as_array": false,
+                    "db_key": 10
+                },
+                {
+                    "name": "jets:loop",
+                    "type": "int",
+                    "as_array": false,
+                    "db_key": 11
+                },
+                {
+                    "name": "jets:max_vertex_visits",
+                    "type": "int",
+                    "as_array": false,
+                    "db_key": 12
+                },
+                {
+                    "name": "jets:range_value",
+                    "type": "resource",
+                    "as_array": false,
+                    "db_key": 13
+                },
+                {
+                    "name": "jets:replace_chars",
+                    "type": "text",
+                    "as_array": false,
+                    "db_key": 14
+                },
+                {
+                    "name": "jets:replace_with",
+                    "type": "text",
+                    "as_array": false,
+                    "db_key": 15
+                },
+                {
+                    "name": "jets:sourcePeriodType",
+                    "type": "text",
+                    "as_array": false,
+                    "db_key": 16
+                }
+            ],
+            "source_file_name": "data_model/jets_model.jr",
+            "as_table": false,
+            "sub_classes": [],
+            "db_key": 3
+        },
+        {
+            "type": "class",
+            "name": "lp:Person",
+            "base_classes": [
+                "jets:Entity"
+            ],
+            "data_properties": [
+                {
+                    "name": "lp:name",
+                    "type": "text",
+                    "as_array": false,
+                    "db_key": 19
+                }
+            ],
+            "source_file_name": "data_model/test_looping_model.jr",
+            "as_table": true,
+            "sub_classes": [],
+            "db_key": 5
+        }
+    ],
+    "tables": [
+        {
+            "type": "table",
+            "table_name": "lp:Person",
+            "class_name": "lp:Person",
+            "columns": [
+                {
+                    "type": "text",
+                    "as_array": false,
+                    "property_name": "jets:client",
+                    "column_name": "jets:client"
+                },
+                {
+                    "type": "text",
+                    "as_array": false,
+                    "property_name": "jets:key",
+                    "column_name": "jets:key"
+                },
+                {
+                    "type": "text",
+                    "as_array": false,
+                    "property_name": "jets:org",
+                    "column_name": "jets:org"
+                },
+                {
+                    "type": "text",
+                    "as_array": true,
+                    "property_name": "jets:ruleTag",
+                    "column_name": "jets:ruleTag"
+                },
+                {
+                    "type": "text",
+                    "as_array": false,
+                    "property_name": "lp:name",
+                    "column_name": "lp:name"
+                },
+                {
+                    "type": "resource",
+                    "as_array": true,
+                    "property_name": "rdf:type",
+                    "column_name": "rdf:type"
+                }
+            ],
+            "source_file_name": "data_model/test_looping_model.jr",
+            "db_key": 1
+        }
+    ],
+    "triples": [
+        {
+            "type": "triple",
+            "subject_key": 3,
+            "predicate_key": 11,
+            "object_key": 13,
+            "source_file_name": "data_model/jets_model.jr"
+        }
+    ],
+    "main_rule_file_name": "jet_rules/test_looping_main.jr",
+    "rete_nodes": [
+        {
+            "vertex": 0,
+            "parent_vertex": 0,
+            "children_vertexes": [
+                1,
+                6,
+                7,
+                8
+            ],
+            "type": "head_node",
+            "db_key": 20
+        },
+        {
+            "type": "antecedent",
+            "isNot": false,
+            "normalizedLabel": "(?x1 rdf:type jets:State)",
+            "vertex": 1,
+            "parent_vertex": 0,
+            "beta_relation_vars": [
+                "?x1"
+            ],
+            "pruned_var": [],
+            "beta_var_nodes": [
+                {
+                    "type": "var",
+                    "id": "?x1",
+                    "is_binded": false,
+                    "var_pos": 0,
+                    "vertex": 1,
+                    "key": 28,
+                    "source_file_name": "jet_rules/test_looping_main.jr",
+                    "db_key": 142
+                }
+            ],
+            "children_vertexes": [
+                2,
+                3,
+                5
+            ],
+            "rules": [
+                "jets:State:3"
+            ],
+            "salience": [
+                100
+            ],
+            "subject_key": 28,
+            "predicate_key": 11,
+            "object_key": 13,
+            "db_key": 21
+        },
+        {
+            "type": "antecedent",
+            "isNot": false,
+            "normalizedLabel": "(?x1 jets:loop ?x2).[?x2 <= int(3)]",
+            "filter": {
+                "type": "binary",
+                "lhs": 31,
+                "op": "<=",
+                "rhs": 32,
+                "arg0_key": 3,
+                "arg1_key": 4
+            },
+            "vertex": 2,
+            "parent_vertex": 1,
+            "beta_relation_vars": [
+                "?x1",
+                "?x2"
+            ],
+            "pruned_var": [],
+            "beta_var_nodes": [
+                {
+                    "type": "var",
+                    "id": "?x1",
+                    "is_binded": true,
+                    "var_pos": 0,
+                    "vertex": 2
+                },
+                {
+                    "type": "var",
+                    "id": "?x2",
+                    "is_binded": false,
+                    "var_pos": 2,
+                    "vertex": 2,
+                    "key": 30,
+                    "source_file_name": "jet_rules/test_looping_main.jr",
+                    "db_key": 144
+                }
+            ],
+            "children_vertexes": [],
+            "rules": [
+                "LOOP01"
+            ],
+            "salience": [
+                100
+            ],
+            "subject_key": 29,
+            "predicate_key": 20,
+            "object_key": 30,
+            "filter_expr_key": 5,
+            "db_key": 22
+        },
+        {
+            "type": "antecedent",
+            "isNot": false,
+            "normalizedLabel": "(?x1 jets:loop ?x2)",
+            "vertex": 3,
+            "parent_vertex": 1,
+            "beta_relation_vars": [
+                "?x1",
+                "?x2"
+            ],
+            "pruned_var": [],
+            "beta_var_nodes": [
+                {
+                    "type": "var",
+                    "id": "?x1",
+                    "is_binded": true,
+                    "var_pos": 0,
+                    "vertex": 3
+                },
+                {
+                    "type": "var",
+                    "id": "?x2",
+                    "is_binded": false,
+                    "var_pos": 2,
+                    "vertex": 3,
+                    "key": 34,
+                    "source_file_name": "jet_rules/test_looping_main.jr",
+                    "db_key": 148
+                }
+            ],
+            "children_vertexes": [
+                4
+            ],
+            "subject_key": 33,
+            "predicate_key": 20,
+            "object_key": 34,
+            "db_key": 23
+        },
+        {
+            "type": "antecedent",
+            "isNot": false,
+            "normalizedLabel": "(?x1 newPerson ?x3)",
+            "vertex": 4,
+            "parent_vertex": 3,
+            "beta_relation_vars": [
+                "?x2",
+                "?x3"
+            ],
+            "pruned_var": [
+                "?x1"
+            ],
+            "beta_var_nodes": [
+                {
+                    "type": "var",
+                    "id": "?x2",
+                    "is_binded": true,
+                    "var_pos": 1,
+                    "vertex": 4
+                },
+                {
+                    "type": "var",
+                    "id": "?x3",
+                    "is_binded": false,
+                    "var_pos": 2,
+                    "vertex": 4,
+                    "key": 36,
+                    "source_file_name": "jet_rules/test_looping_main.jr",
+                    "db_key": 150
+                }
+            ],
+            "children_vertexes": [],
+            "rules": [
+                "LOOP02"
+            ],
+            "salience": [
+                100
+            ],
+            "subject_key": 35,
+            "predicate_key": 4,
+            "object_key": 36,
+            "db_key": 24
+        },
+        {
+            "type": "antecedent",
+            "isNot": false,
+            "normalizedLabel": "(?x1 jets:loop int(3))",
+            "vertex": 5,
+            "parent_vertex": 1,
+            "beta_relation_vars": [
+                "?x1"
+            ],
+            "pruned_var": [],
+            "beta_var_nodes": [
+                {
+                    "type": "var",
+                    "id": "?x1",
+                    "is_binded": true,
+                    "var_pos": 0,
+                    "vertex": 5
+                }
+            ],
+            "children_vertexes": [],
+            "rules": [
+                "LOOP03"
+            ],
+            "salience": [
+                100
+            ],
+            "subject_key": 37,
+            "predicate_key": 20,
+            "object_key": 38,
+            "db_key": 25
+        },
+        {
+            "type": "antecedent",
+            "isNot": false,
+            "normalizedLabel": "(?x1 rdf:type jets:Entity)",
+            "vertex": 6,
+            "parent_vertex": 0,
+            "beta_relation_vars": [
+                "?x1"
+            ],
+            "pruned_var": [],
+            "beta_var_nodes": [
+                {
+                    "type": "var",
+                    "id": "?x1",
+                    "is_binded": false,
+                    "var_pos": 0,
+                    "vertex": 6,
+                    "key": 39,
+                    "source_file_name": "jet_rules/test_looping_main.jr",
+                    "db_key": 153
+                }
+            ],
+            "children_vertexes": [],
+            "rules": [
+                "jets:Entity:1"
+            ],
+            "salience": [
+                100
+            ],
+            "subject_key": 39,
+            "predicate_key": 11,
+            "object_key": 5,
+            "db_key": 26
+        },
+        {
+            "type": "antecedent",
+            "isNot": false,
+            "normalizedLabel": "(?x1 rdf:type jets:InputRecord)",
+            "vertex": 7,
+            "parent_vertex": 0,
+            "beta_relation_vars": [
+                "?x1"
+            ],
+            "pruned_var": [],
+            "beta_var_nodes": [
+                {
+                    "type": "var",
+                    "id": "?x1",
+                    "is_binded": false,
+                    "var_pos": 0,
+                    "vertex": 7,
+                    "key": 40,
+                    "source_file_name": "jet_rules/test_looping_main.jr",
+                    "db_key": 154
+                }
+            ],
+            "children_vertexes": [],
+            "rules": [
+                "jets:InputRecord:2"
+            ],
+            "salience": [
+                100
+            ],
+            "subject_key": 40,
+            "predicate_key": 11,
+            "object_key": 12,
+            "db_key": 27
+        },
+        {
+            "type": "antecedent",
+            "isNot": false,
+            "normalizedLabel": "(?x1 rdf:type lp:Person)",
+            "vertex": 8,
+            "parent_vertex": 0,
+            "beta_relation_vars": [
+                "?x1"
+            ],
+            "pruned_var": [],
+            "beta_var_nodes": [
+                {
+                    "type": "var",
+                    "id": "?x1",
+                    "is_binded": false,
+                    "var_pos": 0,
+                    "vertex": 8,
+                    "key": 41,
+                    "source_file_name": "jet_rules/test_looping_main.jr",
+                    "db_key": 155
+                }
+            ],
+            "children_vertexes": [],
+            "rules": [
+                "lp:Person:4"
+            ],
+            "salience": [
+                100
+            ],
+            "subject_key": 41,
+            "predicate_key": 11,
+            "object_key": 26,
+            "db_key": 28
+        },
+        {
+            "type": "consequent",
+            "normalizedLabel": "(?x1 rdf:type owl:Thing)",
+            "vertex": 1,
+            "consequent_seq": 1,
+            "consequent_for_rule": "jets:State:3",
+            "consequent_salience": 100,
+            "subject_key": 42,
+            "predicate_key": 11,
+            "object_key": 6,
+            "db_key": 29
+        },
+        {
+            "type": "consequent",
+            "normalizedLabel": "(?x1 newPerson create_entity int(0))",
+            "vertex": 2,
+            "consequent_seq": 1,
+            "consequent_for_rule": "LOOP01",
+            "consequent_salience": 100,
+            "subject_key": 43,
+            "predicate_key": 4,
+            "obj_expr": {
+                "type": "unary",
+                "op": "create_entity",
+                "arg": 44,
+                "arg0_key": 6
+            },
+            "obj_expr_key": 7,
+            "db_key": 30
+        },
+        {
+            "type": "consequent",
+            "normalizedLabel": "(?x3 rdf:type lp:Person)",
+            "vertex": 4,
+            "consequent_seq": 1,
+            "consequent_for_rule": "LOOP02",
+            "consequent_salience": 100,
+            "subject_key": 45,
+            "predicate_key": 11,
+            "object_key": 26,
+            "db_key": 31
+        },
+        {
+            "type": "consequent",
+            "normalizedLabel": "(?x3 lp:name \"person_\" + ?x2)",
+            "vertex": 4,
+            "consequent_seq": 2,
+            "consequent_for_rule": "LOOP02",
+            "consequent_salience": 100,
+            "subject_key": 46,
+            "predicate_key": 27,
+            "obj_expr": {
+                "type": "binary",
+                "lhs": 47,
+                "op": "+",
+                "rhs": 48,
+                "arg0_key": 8,
+                "arg1_key": 9
+            },
+            "obj_expr_key": 10,
+            "db_key": 32
+        },
+        {
+            "type": "consequent",
+            "normalizedLabel": "(?x1 jets:completed true)",
+            "vertex": 5,
+            "consequent_seq": 1,
+            "consequent_for_rule": "LOOP03",
+            "consequent_salience": 100,
+            "subject_key": 49,
+            "predicate_key": 14,
+            "object_key": 50,
+            "db_key": 33
+        },
+        {
+            "type": "consequent",
+            "normalizedLabel": "(?x1 rdf:type owl:Thing)",
+            "vertex": 6,
+            "consequent_seq": 1,
+            "consequent_for_rule": "jets:Entity:1",
+            "consequent_salience": 100,
+            "subject_key": 51,
+            "predicate_key": 11,
+            "object_key": 6,
+            "db_key": 34
+        },
+        {
+            "type": "consequent",
+            "normalizedLabel": "(?x1 rdf:type owl:Thing)",
+            "vertex": 7,
+            "consequent_seq": 1,
+            "consequent_for_rule": "jets:InputRecord:2",
+            "consequent_salience": 100,
+            "subject_key": 52,
+            "predicate_key": 11,
+            "object_key": 6,
+            "db_key": 35
+        },
+        {
+            "type": "consequent",
+            "normalizedLabel": "(?x1 rdf:type jets:Entity)",
+            "vertex": 8,
+            "consequent_seq": 1,
+            "consequent_for_rule": "lp:Person:4",
+            "consequent_salience": 100,
+            "subject_key": 53,
+            "predicate_key": 11,
+            "object_key": 5,
+            "db_key": 36
+        }
+    ]
+}

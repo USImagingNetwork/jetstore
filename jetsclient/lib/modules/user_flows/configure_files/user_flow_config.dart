@@ -61,6 +61,12 @@ final Map<String, UserFlowConfig> _userFlowConfigurations = {
           Expression(
               lhsStateKey: FSK.scFileTypeOption,
               op: Operator.equals,
+              rhsValue: FSK.scHeaderlessCsvOptionWithSchemaProvider,
+              isRhsStateKey: false,
+              nextState: 'select_single_or_multi_part_file'),
+          Expression(
+              lhsStateKey: FSK.scFileTypeOption,
+              op: Operator.equals,
               rhsValue: FSK.scXlsxOption,
               isRhsStateKey: false,
               nextState: 'edit_xlsx_options'),
@@ -76,6 +82,12 @@ final Map<String, UserFlowConfig> _userFlowConfigurations = {
               rhsValue: FSK.scFixedWidthOption,
               isRhsStateKey: false,
               nextState: 'edit_fixed_width_layout'),
+          Expression(
+              lhsStateKey: FSK.scFileTypeOption,
+              op: Operator.equals,
+              rhsValue: FSK.scFixedWidthOptionWithSchemaProvider,
+              isRhsStateKey: false,
+              nextState: 'select_single_or_multi_part_file'),
           Expression(
               lhsStateKey: FSK.scFileTypeOption,
               op: Operator.equals,
