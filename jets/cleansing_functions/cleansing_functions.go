@@ -456,11 +456,13 @@ func SliceInput(inputValue, argument string, parsedFunctionArguments map[string]
 		}
 	case sliceArg.From != nil && sliceArg.To == nil:
 		lenValues := l - *sliceArg.From
-		values = make([]string, 0, lenValues)
-		for i := range lenValues {
-			index := *sliceArg.From + i
-			if index < l {
-				values = append(values, sliceValues[index])
+		if lenValues > 0 {
+			values = make([]string, 0, lenValues)
+			for i := range lenValues {
+				index := *sliceArg.From + i
+				if index < l {
+					values = append(values, sliceValues[index])
+				}
 			}
 		}
 	default:
@@ -472,6 +474,9 @@ func SliceInput(inputValue, argument string, parsedFunctionArguments map[string]
 				values = append(values, sliceValues[index])
 			}
 		}
+	}
+	if len(values) == 0 {
+		return nil
 	}
 	return values
 }
@@ -493,7 +498,8 @@ func ParseSliceInputFunctionArgument(rawArg string, functionName string, cache m
 	// Case "delimit","v1","v2","v3",...
 	//	- when only delimit is provided, take all values (encoded as nil for values, from and to).
 	//	- when "v1","v2","v3",..., take only the specified element (0-based) (encoded as values, nil for from and to).
-	//	Note: when value is negative, it means len(input) - value (this applies to from and to as well)
+	//*TODO: when value is negative, it means len(input) - value (this applies to from and to as well)
+	//*TODO what if you want the last value only?
 	if rawArg == "" {
 		return nil, fmt.Errorf("unexpected null argument to %s function", functionName)
 	}
@@ -521,6 +527,9 @@ func ParseSliceInputFunctionArgument(rawArg string, functionName string, cache m
 		if err != nil {
 			return nil, fmt.Errorf("error: invalid argument '%s' expecting int value as second argument: %v (%s function)", rawArg, err, functionName)
 		}
+		if v1 < 0 {
+			return nil, fmt.Errorf("error: invalid argument '%s' must have position >= 0 (%s function)", rawArg, functionName)
+		}
 		results = &SliceInputFunctionArg{
 			Delimit: rows[0][0],
 			Values:  &[]int{v1},
@@ -529,6 +538,9 @@ func ParseSliceInputFunctionArgument(rawArg string, functionName string, cache m
 		from, err := strconv.Atoi(strings.TrimSpace(rows[0][1]))
 		if err != nil {
 			return nil, fmt.Errorf("error: invalid argument '%s' expecting from (int) as second argument: %v (%s function)", rawArg, err, functionName)
+		}
+		if from < 0 {
+			return nil, fmt.Errorf("error: invalid argument '%s' must have from > 0 (%s function)", rawArg, functionName)
 		}
 		switch len(rows[0]) {
 		case 3:
@@ -540,6 +552,9 @@ func ParseSliceInputFunctionArgument(rawArg string, functionName string, cache m
 			to, err := strconv.Atoi(strings.TrimSpace(rows[0][3]))
 			if err != nil {
 				return nil, fmt.Errorf("error: invalid argument '%s' expecting to (int) as forth argument: %v (%s function)", rawArg, err, functionName)
+			}
+			if to < 0 || from >= to {
+				return nil, fmt.Errorf("error: invalid argument '%s' must have from and to > 0, and to > from (%s function)", rawArg, functionName)
 			}
 			results = &SliceInputFunctionArg{
 				Delimit: rows[0][0],
@@ -555,6 +570,9 @@ func ParseSliceInputFunctionArgument(rawArg string, functionName string, cache m
 			v, err := strconv.Atoi(strings.TrimSpace(vstr))
 			if err != nil {
 				return nil, fmt.Errorf("error: invalid argument '%s' expecting int value as argument: %v (%s function)", rawArg, err, functionName)
+			}
+			if v < 0 {
+				return nil, fmt.Errorf("error: invalid argument '%s' expecting int value > 0 as argument (%s function)", rawArg, functionName)
 			}
 			values = append(values, v)
 		}
