@@ -19,6 +19,24 @@
   },
   {
     "schemaName": "jetsapi",
+    "tableName": "secret_rotation",
+    "columns": [
+      {
+        "columnName": "secret",
+        "dataType": "text",
+        "isPK": true,
+        "isNotNull": true
+      },
+      {
+        "columnName": "last_update",
+        "dataType": "datetime",
+        "default": "now()",
+        "isNotNull": true
+      }
+    ]
+  },
+  {
+    "schemaName": "jetsapi",
     "tableName": "workspace_version",
     "columns": [
       {
@@ -307,7 +325,7 @@
       },
       {
         "columnName": "domain_key_object_types",
-        "description": "Domain key expected for the source_config",
+        "description": "Domain key expected for the source_config. This column is not used yet, could be for validation.",
         "dataType": "text",
         "isArray": true,
         "default": "'{}'",
@@ -477,6 +495,12 @@
         "isNotNull": true
       },
       {
+        "columnName": "file_size",
+        "dataType": "int64",
+        "default": "0",
+        "isNotNull": true
+      },
+      {
         "columnName": "source_period_key",
         "dataType": "int",
         "isNotNull": true
@@ -564,7 +588,7 @@
       },
       {
         "columnName": "compression",
-        "description": "Compression algo: none, snappy. Applies to format: csv, headerless_csv, fixed_width, parquet?, parquet_select?",
+        "description": "Compression algo: none, snappy. Applies to format: csv, headerless_csv, fixed_width, (parquet and parquet_select is specified in the parquet schema in the file)?",
         "dataType": "text",
         "default": "'none'",
         "isNotNull": true
@@ -1357,6 +1381,27 @@
       {
         "indexName": "pipeline_execution_status_last_update_idx",
         "indexDef": "INDEX pipeline_execution_status_last_update_idx ON jetsapi.pipeline_execution_status (last_update DESC)"
+      },
+      {
+        "indexName": "pipeline_execution_status_status_idx",
+        "indexDef": "INDEX pipeline_execution_status_status_idx ON jetsapi.pipeline_execution_status (status)"
+      }
+    ]
+  },
+  {
+    "schemaName": "jetsapi",
+    "tableName": "pipeline_lock",
+    "columns": [
+      {
+        "columnName": "state_machine_name",
+        "dataType": "text",
+        "isNotNull": true,
+        "isPK": true
+      },
+      {
+        "columnName": "session_id",
+        "dataType": "text",
+        "isNotNull": true
       }
     ]
   },
@@ -1434,6 +1479,10 @@
         "dataType": "int"
       },
       {
+        "columnName": "input_bad_records_count",
+        "dataType": "int"
+      },
+      {
         "columnName": "input_files_size_mb",
         "dataType": "int"
       },
@@ -1473,6 +1522,10 @@
       {
         "indexName": "pipeline_execution_details_pe_key_status_idx",
         "indexDef": "INDEX pipeline_execution_details_pe_key_status_idx ON jetsapi.pipeline_execution_details (pipeline_execution_status_key, status)"
+      },
+      {
+        "indexName": "pipeline_execution_details_pe_key_step_id_idx",
+        "indexDef": "INDEX pipeline_execution_details_pe_key_step_id_idx ON jetsapi.pipeline_execution_details (pipeline_execution_status_key, cpipes_step_id)"
       },
       {
         "indexName": "pipeline_execution_details_last_update_idx",
@@ -1777,6 +1830,11 @@
         "default": "'{}'"
       },
       {
+        "columnName": "input_row_columns_json",
+        "dataType": "text",
+        "default": "'{}'"
+      },
+      {
         "columnName": "sharding_config_json",
         "dataType": "text",
         "isNotNull": true,
@@ -2077,7 +2135,12 @@
       {
         "columnName": "oid",
         "dataType": "uint",
+        "deprecated": true,
         "isNotNull": true
+      },
+      {
+        "columnName": "data",
+        "dataType": "bytea"
       },
       {
         "columnName": "file_name",
@@ -2092,6 +2155,8 @@
       {
         "columnName": "status",
         "dataType": "text",
+        "deprecated": true,
+        "default": "''",
         "isNotNull": true
       },
       {

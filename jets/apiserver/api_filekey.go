@@ -33,10 +33,12 @@ func (server *Server) DoRegisterFileKeyAction(w http.ResponseWriter, r *http.Req
 		ERROR(w, http.StatusUnprocessableEntity, err)
 		return
 	}
-	context := datatable.NewContext(server.dbpool, globalDevMode, *usingSshTunnel, unitTestDir,nbrShards, adminEmail)
+	context := datatable.NewDataTableContext(server.dbpool, globalDevMode, *usingSshTunnel, unitTestDir, adminEmail)
 
 	// Intercept specific dataTable action
 	switch registerFileKeyAction.Action {
+	case "put_schema_event_to_s3":
+		results, code, err = context.PutSchemaEventToS3(&registerFileKeyAction, token)
 	case "register_keys":
 		results, code, err = context.RegisterFileKeys(&registerFileKeyAction, token)
 	case "load_all_files":

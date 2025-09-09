@@ -1,7 +1,6 @@
 package compute_pipes
 
 import (
-	"encoding/csv"
 	"fmt"
 	"io"
 	"log"
@@ -9,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/artisoft-io/jetstore/jets/csv"
 	"github.com/golang/snappy"
 	"github.com/jackc/pgx/v4/pgxpool"
 )
@@ -18,9 +18,10 @@ import (
 // data is the mapping of the looup key -> values
 // columnsMap is the mapping of the return column name -> position in the returned row (values)
 type LookupTableS3 struct {
-	spec       *LookupSpec
-	data       map[string]*[]interface{}
-	columnsMap map[string]int
+	spec         *LookupSpec
+	isEmptyTable bool
+	data         map[string]*[]interface{}
+	columnsMap   map[string]int
 }
 
 func NewLookupTableS3(_ *pgxpool.Pool, spec *LookupSpec, env map[string]interface{}, isVerbose bool) (LookupTable, error) {
@@ -33,55 +34,32 @@ func NewLookupTableS3(_ *pgxpool.Pool, spec *LookupSpec, env map[string]interfac
 		columnsMap: make(map[string]int),
 	}
 
+	csvSource, err := NewCsvSourceS3(spec.CsvSource, env)
+	if err != nil {
+		return nil, fmt.Errorf("while calling NewCsvSourceS3 (NewLookupTableS3): %v", err)
+	}
+	// Check if this is an empty source (no file found and spec indicates not to error out)
+	if csvSource.fileKey == nil {
+		tbl.isEmptyTable = true
+		return tbl, nil
+	}
+
 	// Create a local temp directory to hold the file
 	inFolderPath, err := os.MkdirTemp("", "jetstore")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create local temp directory: %v", err)
 	}
-	defer os.Remove(inFolderPath)
-
-	var fileKey *FileKeyInfo
-	source := spec.CsvSource
-	switch source.Type {
-	case "cpipes":
-		if len(source.ReadStepId) == 0 {
-			return nil, fmt.Errorf("error: s3_csv_lookup of type cpipes must have read_step_id provided in cpipes config")
-		}
-		if len(source.ProcessName) == 0 {
-			source.ProcessName = env["$PROCESS_NAME"].(string)
-		}
-		if len(source.SessionId) == 0 {
-			source.SessionId = env["$SESSIONID"].(string)
-		}
-		if len(source.JetsPartitionLabel) == 0 {
-			source.JetsPartitionLabel = env["$JETS_PARTITION_LABEL"].(string)
-		}
-		if len(source.InputFormat) == 0 {
-			source.InputFormat = "headerless_csv"
-		}
-		if len(source.Compression) == 0 {
-			source.Compression = "snappy"
-		}
-		fileKeys, err := GetS3FileKeys(source.ProcessName, source.SessionId,
-			source.ReadStepId, source.JetsPartitionLabel)
+	defer func ()  {
+		err := os.RemoveAll(inFolderPath)
 		if err != nil {
-			return nil, fmt.Errorf("failed to file keys for s3_csv_lookup of type cpipes: %v", err)
+			log.Printf("WARNING while calling RemoveAll in lookup temp folder:%v", err)
 		}
-		if len(fileKeys) == 0 {
-			return nil, fmt.Errorf(
-				"error: no file keys found for s3_csv_lookup of type cpipes, ReadStepId: %s, JetPartitionLabel: %s",
-				source.ReadStepId, source.JetsPartitionLabel)
-		}
-		fileKey = fileKeys[0]
-	default:
-		return nil, fmt.Errorf("error: unknown s3_csv_lookup type: %s", source.Type)
-	}
-	log.Printf("Got file key %s from s3 as lookup table: %s", fileKey.key, spec.Key)
+	}()
 
 	// Fetch the file from s3, save it locally
 	retry := 0
 do_retry:
-	inFilePath, _, err := DownloadS3Object(fileKey, inFolderPath, 1)
+	inFilePath, _, err := DownloadS3Object("", csvSource.fileKey, inFolderPath, 1)
 	if err != nil {
 		if retry < 6 {
 			time.Sleep(500 * time.Millisecond)
@@ -106,10 +84,16 @@ func (tbl *LookupTableS3) Lookup(key *string) (*[]interface{}, error) {
 	if key == nil {
 		return nil, fmt.Errorf("error: cannot do a lookup with a null key for lookup table %s", tbl.spec.Key)
 	}
+	if tbl.isEmptyTable {
+		return nil, nil
+	}
 	return tbl.data[*key], nil
 }
 
 func (tbl *LookupTableS3) LookupValue(row *[]interface{}, columnName string) (interface{}, error) {
+	if tbl.isEmptyTable {
+		return nil, nil
+	}
 	pos, ok := tbl.columnsMap[columnName]
 	if !ok {
 		return nil, fmt.Errorf("error: column named %s is not a column returned by the lookup table %s",
@@ -120,6 +104,11 @@ func (tbl *LookupTableS3) LookupValue(row *[]interface{}, columnName string) (in
 
 func (tbl *LookupTableS3) ColumnMap() map[string]int {
 	return tbl.columnsMap
+}
+
+// Return true only if there was no files found on s3
+func (tbl *LookupTableS3) IsEmptyTable() bool {
+	return tbl.isEmptyTable
 }
 
 func (tbl *LookupTableS3) readCsvLookup(localFileName string) (int64, error) {
@@ -134,12 +123,6 @@ func (tbl *LookupTableS3) readCsvLookup(localFileName string) (int64, error) {
 		fileHd.Close()
 	}()
 
-	// keep track of the column name and their pos in the returned csv row
-	csvColumnsPos := make(map[string]int)
-	for i := range tbl.spec.Columns {
-		csvColumnsPos[tbl.spec.Columns[i].Name] = i
-	}
-
 	// Keep a mapping of the returned column names to their position in the returned row
 	for i, valueColumn := range tbl.spec.LookupValues {
 		tbl.columnsMap[valueColumn] = i
@@ -147,8 +130,8 @@ func (tbl *LookupTableS3) readCsvLookup(localFileName string) (int64, error) {
 
 	source := tbl.spec.CsvSource
 	sepFlag := ','
-	if len(source.Delimiter) > 0 {
-		sepFlag = []rune(source.Delimiter)[0]
+	if source.Delimiter != 0 {
+		sepFlag = source.Delimiter
 	}
 
 	// Read the csv file and package the lookup table
@@ -156,29 +139,55 @@ func (tbl *LookupTableS3) readCsvLookup(localFileName string) (int64, error) {
 	case "none":
 		csvReader = csv.NewReader(fileHd)
 		csvReader.Comma = sepFlag
-		if source.InputFormat == "csv" {
-			// skip header row (first row)
-			_, err = csvReader.Read()
-		}
 	case "snappy":
 		csvReader = csv.NewReader(snappy.NewReader(fileHd))
 		csvReader.Comma = sepFlag
-		if source.InputFormat == "csv" {
-			// skip header row (first row)
-			_, err = csvReader.Read()
-		}
 	default:
 		return 0, fmt.Errorf("error: unknown compression in readCsvLookup: %s", source.Compression)
 	}
 
-	if err == io.EOF {
-		// empty file
-		return 0, nil
-	}
-	if err != nil {
-		return 0, fmt.Errorf("error while reading first input records in readCsvLookup: %v", err)
+	if source.Format == "csv" {
+		// Make a lookup of the current column spec
+		overrides := make(map[string]*TableColumnSpec)
+		for i := range tbl.spec.Columns {
+			tblSpec := &tbl.spec.Columns[i]
+			overrides[tblSpec.Name] = tblSpec
+		}
+		// get the header row (first row)
+		headers, err := csvReader.Read()
+		if err != nil {
+			if err == io.EOF {
+				// empty file
+				return 0, nil
+			}
+			return 0, fmt.Errorf("while in reading the header row in readCsvLookup: %v", err)
+		}
+		columns := make([]TableColumnSpec, 0, len(headers))
+		for _, h := range headers {
+			override := overrides[h]
+			rdfType := "text"
+			isArray := false
+			if override != nil {
+				rdfType = override.RdfType
+				isArray = override.IsArray
+			}
+			columns = append(columns, TableColumnSpec{
+				Name:    h,
+				RdfType: rdfType,
+				IsArray: isArray,
+			})
+		}
+		// set the column spec
+		tbl.spec.Columns = columns
 	}
 
+	// keep track of the column name and their pos in the returned csv row
+	csvColumnsPos := make(map[string]int)
+	for i := range tbl.spec.Columns {
+		csvColumnsPos[tbl.spec.Columns[i].Name] = i
+	}
+	
+	// Read the file
 	var inputRowCount int64
 	var inRow []string
 	keys := make([]string, len(tbl.spec.LookupKey))

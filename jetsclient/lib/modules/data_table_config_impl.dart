@@ -1,7 +1,9 @@
 import 'package:jetsclient/modules/user_flows/client_registry/data_table_config.dart';
 import 'package:jetsclient/modules/user_flows/configure_files/data_table_config.dart';
 import 'package:jetsclient/modules/user_flows/file_mapping/data_table_config.dart';
+import 'package:jetsclient/modules/user_flows/home_filters/data_table_config.dart';
 import 'package:jetsclient/modules/user_flows/load_files/data_table_config.dart';
+import 'package:jetsclient/modules/user_flows/register_file_key/data_table_config.dart';
 import 'package:jetsclient/modules/user_flows/pipeline_config/data_table_config.dart';
 import 'package:jetsclient/modules/user_flows/start_pipeline/data_table_config.dart';
 import 'package:jetsclient/modules/user_flows/workspace_pull/data_table_config.dart';
@@ -270,6 +272,25 @@ final Map<String, TableConfig> _tableConfigurations = {
           style: ActionStyle.secondary,
           isVisibleWhenCheckboxVisible: null,
           isEnabledWhenHavingSelectedRows: null),
+      ActionConfig(
+          actionType: DataTableActionType.showScreen,
+          key: 'setHomeFilters',
+          label: 'Set Filters',
+          style: ActionStyle.primary,
+          isVisibleWhenCheckboxVisible: null,
+          isEnabledWhenHavingSelectedRows: null,
+          configScreenPath: ufHomeFiltersPath),
+      ActionConfig(
+        actionType: DataTableActionType.clearHomeFilters,
+        key: 'clearHomeFilters',
+        label: 'Clear Filters',
+        style: ActionStyle.primary,
+        isVisibleWhenCheckboxVisible: null,
+        isEnabledWhenHavingSelectedRows: null,
+        isEnabledFnc: (state) =>
+            JetsRouterDelegate().homeFilters != null &&
+            JetsRouterDelegate().homeFilters!.isNotEmpty,
+      ),
     ],
     secondRowActions: [
       ActionConfig(
@@ -308,8 +329,21 @@ final Map<String, TableConfig> _tableConfigurations = {
           isEnabledWhenHavingSelectedRows: true,
           configScreenPath: executionStatsDetailsPath,
           navigationParams: {'session_id': 10}),
+      ActionConfig(
+          actionType: DataTableActionType.doAction,
+          actionName: ActionKeys.resubmitPipeline,
+          key: 'resubmitPipeline',
+          label: 'Resubmit',
+          isVisibleWhenCheckboxVisible: true,
+          isEnabledWhenHavingSelectedRows: true,
+          capability: 'run_pipelines',
+          style: ActionStyle.secondary),
     ],
     formStateConfig: DataTableFormStateConfig(keyColumnIdx: 0, otherColumns: [
+      DataTableFormStateOtherColumnConfig(
+        stateKey: FSK.sessionId,
+        columnIdx: 10,
+      ),
       DataTableFormStateOtherColumnConfig(
         stateKey: FSK.failureDetails,
         columnIdx: 12,
@@ -562,36 +596,42 @@ final Map<String, TableConfig> _tableConfigurations = {
           isNumeric: true),
       ColumnConfig(
           index: 13,
+          name: "input_bad_records_count",
+          label: 'Input Bad Records Count',
+          tooltips: 'Number of bad input records',
+          isNumeric: true),
+      ColumnConfig(
+          index: 14,
           name: "rete_sessions_count",
           label: 'Rete Sessions Count',
           tooltips: 'Number of rete sessions',
           isNumeric: true),
       ColumnConfig(
-          index: 14,
+          index: 15,
           name: "output_records_count",
           label: 'Output Records Count',
           tooltips: 'Number of output records',
           isNumeric: true),
       ColumnConfig(
-          index: 15,
+          index: 16,
           name: "main_input_session_id",
           label: 'Input Session ID',
           tooltips: 'Session ID of main input table',
           isNumeric: false),
       ColumnConfig(
-          index: 16,
+          index: 17,
           name: "session_id",
           label: 'Session ID',
           tooltips: 'Data Pipeline session ID',
           isNumeric: false),
       ColumnConfig(
-          index: 17,
+          index: 18,
           name: "user_email",
           label: 'User',
           tooltips: 'Who started the pipeline',
           isNumeric: false),
       ColumnConfig(
-          index: 18,
+          index: 19,
           name: "last_update",
           label: 'Loaded At',
           tooltips: 'Indicates when the file was loaded',
@@ -1740,11 +1780,15 @@ TableConfig getTableConfig(String key) {
   if (config != null) return config;
   config = getLoadFilesTableConfig(key);
   if (config != null) return config;
+  config = getRegisterFileKeyTableConfig(key);
+  if (config != null) return config;
   config = getStartPipelineTableConfig(key);
   if (config != null) return config;
   config = getWorkspacePullTableConfig(key);
   if (config != null) return config;
   config = getFileMappingTableConfig(key);
+  if (config != null) return config;
+  config = getHomeFiltersTableConfig(key);
   if (config != null) return config;
   throw Exception(
       'ERROR: Invalid program configuration: table configuration $key not found');

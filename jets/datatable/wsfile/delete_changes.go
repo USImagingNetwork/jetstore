@@ -14,11 +14,10 @@ import (
 
 // Function to delete workspace file changes based on rows in workspace_changes
 // Delete the workspace_changes row and the associated large object
-func DeleteFileChange(dbpool *pgxpool.Pool, workspaceChangesKey, workspaceName, fileName, oid string) error {
-	fmt.Println("DeleteWorkspaceChanges: Deleting key", workspaceChangesKey, "file name", fileName)
-	stmt := fmt.Sprintf("SELECT lo_unlink(%s); DELETE FROM jetsapi.workspace_changes WHERE key = %s",	oid, workspaceChangesKey)
-	fmt.Println("DELETE stmt:", stmt)
-	_, err := dbpool.Exec(context.Background(), stmt)
+func DeleteFileChange(dbpool *pgxpool.Pool, workspaceName, fileName string) error {
+	fmt.Println("DeleteWorkspaceChanges: Deleting workspaceName", workspaceName, "file name", fileName)
+	stmt := "DELETE FROM jetsapi.workspace_changes WHERE workspace_name = $1 and file_name = $2"
+	_, err := dbpool.Exec(context.Background(), stmt, workspaceName, fileName)
 	if err != nil {
 		log.Printf("While deleting row in workspace_changes table: %v", err)
 		return fmt.Errorf("while deleting row in workspace_changes table: %v", err)
@@ -56,22 +55,15 @@ func DeleteAllFileChanges(dbpool *pgxpool.Pool, workspaceName string, restaureFr
 	switch {
 	case keepWorkspaceAndLookupDb:
 		stmt = fmt.Sprintf(
-			`SELECT lo_unlink(oid) 
-			 FROM jetsapi.workspace_changes 
-			 WHERE workspace_name = '%s' 
-			   AND file_name NOT IN ('workspace.db', 'lookup.db', 'workspace.tgz', 'reports.tgz'); 
-			 DELETE FROM jetsapi.workspace_changes 
+			`DELETE FROM jetsapi.workspace_changes 
 			 WHERE workspace_name = '%s'
 			   AND file_name NOT IN ('workspace.db', 'lookup.db', 'workspace.tgz', 'reports.tgz');`,
-			workspaceName, workspaceName)
+			workspaceName)
 	default:	
 		stmt = fmt.Sprintf(
-			`SELECT lo_unlink(oid) 
-			 FROM jetsapi.workspace_changes 
-			 WHERE workspace_name = '%s'; 
-			 DELETE FROM jetsapi.workspace_changes 
+			`DELETE FROM jetsapi.workspace_changes 
 			 WHERE workspace_name = '%s'`,
-			workspaceName, workspaceName)
+			workspaceName)
 	}
 	fmt.Println("DELETE stmt:", stmt)
 	_, err := dbpool.Exec(context.Background(), stmt)

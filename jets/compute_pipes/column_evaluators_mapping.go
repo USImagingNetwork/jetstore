@@ -23,8 +23,8 @@ type mapColumnConfig struct {
 	mapConfig    *MapExpression
 }
 
-func (ctx *mapColumnEval) initializeCurrentValue(currentValue *[]interface{}) {}
-func (ctx *mapColumnEval) update(currentValue *[]interface{}, input *[]interface{}) error {
+func (ctx *mapColumnEval) InitializeCurrentValue(currentValue *[]interface{}) {}
+func (ctx *mapColumnEval) Update(currentValue *[]interface{}, input *[]interface{}) error {
 	if currentValue == nil || input == nil {
 		return fmt.Errorf("error mapColumnEval.update cannot have nil currentValue or input")
 	}
@@ -39,34 +39,39 @@ func (ctx *mapColumnEval) update(currentValue *[]interface{}, input *[]interface
 	// - update currentValue using input applying cleansing function and default value
 	// - map inputV to correct rdf type if specified
 	//
-	inputVal := (*input)[ctx.mapConfig.inputPos]
-	var outputVal interface{}
+	var inputVal, outputVal interface{}
 	var inputV, errMsg string
 	var ok bool
 	var err error
+	if ctx.mapConfig.inputPos >= 0 {
+		inputVal = (*input)[ctx.mapConfig.inputPos]
+	}
 	if inputVal != nil {
 		inputV, ok = inputVal.(string)
 		if !ok {
 			// humm, was expecting a string
 			inputV = fmt.Sprintf("%v", inputVal)
 		}
-		if len(inputV) > 0 && ctx.mapConfig.mapConfig.CleansingFunction != nil {
-			outputVal, errMsg =
-				ctx.cleansingCtx.ApplyCleasingFunction(ctx.mapConfig.mapConfig.CleansingFunction,
-					ctx.mapConfig.mapConfig.Argument, &inputV, ctx.mapConfig.inputPos, input)
-			if len(errMsg) > 0 {
-				//*TODO Report error on cleansing function
-				// fmt.Println("*** Error while applying cleansing function:", errMsg)
-				outputVal = nil
+		if len(inputV) > 0 {
+			outputVal = inputV
+			if ctx.mapConfig.mapConfig.CleansingFunction != "" {
+				outputVal, errMsg =
+					ctx.cleansingCtx.ApplyCleasingFunction(ctx.mapConfig.mapConfig.CleansingFunction,
+						ctx.mapConfig.mapConfig.Argument, inputV, ctx.mapConfig.inputPos, input)
+				if len(errMsg) > 0 {
+					//*TODO Report error on cleansing function
+					// fmt.Println("*** Error while applying cleansing function:", errMsg)
+					outputVal = nil
+				}
 			}
 		}
 	}
 	if outputVal == nil {
 		// Apply default if defined
 		outputVal = ctx.mapConfig.defaultValue
-		if outputVal == nil && (ctx.mapConfig.mapConfig.ErrMsg != nil || errMsg != "") {
+		if outputVal == nil && (ctx.mapConfig.mapConfig.ErrMsg != "" || errMsg != "") {
 			if errMsg == "" {
-				errMsg = *ctx.mapConfig.mapConfig.ErrMsg
+				errMsg = ctx.mapConfig.mapConfig.ErrMsg
 			}
 			fmt.Println("TODO Report Error, null on input and have errMsg:", errMsg)
 		}
@@ -81,72 +86,82 @@ func (ctx *mapColumnEval) update(currentValue *[]interface{}, input *[]interface
 	return nil
 }
 
-func (ctx *mapColumnEval) done(currentValue *[]interface{}) error {
+func (ctx *mapColumnEval) Done(currentValue *[]interface{}) error {
 	return nil
 }
 
-func (ctx *BuilderContext) buildMapEvaluator(source *InputChannel, outCh *OutputChannel, spec *TransformationColumnSpec) (TransformationColumnEvaluator, error) {
+func (ctx *BuilderContext) BuildMapTCEvaluator(source *InputChannel, outCh *OutputChannel,
+	spec *TransformationColumnSpec) (TransformationColumnEvaluator, error) {
+
 	if spec == nil || spec.MapExpr == nil {
 		return nil, fmt.Errorf("error: Type map must have MapExpr != nil")
 	}
 	var defaultValue interface{}
 	var err error
+	meRdfType := spec.MapExpr.RdfType
+	meDefault := spec.MapExpr.Default
 	switch {
-	case spec.MapExpr.Default == nil:
+	case meDefault == "":
 		defaultValue = nil
-	case spec.MapExpr.RdfType == "int", spec.MapExpr.RdfType == "bool":
+	case meRdfType == "int", meRdfType == "bool":
 		switch {
-		case *spec.MapExpr.Default == "true" || *spec.MapExpr.Default == "TRUE":
+		case meDefault == "true" || meDefault == "TRUE":
 			defaultValue = 1
-		case *spec.MapExpr.Default == "false" || *spec.MapExpr.Default == "FALSE":
+		case meDefault == "false" || meDefault == "FALSE":
 			defaultValue = 0
 		default:
-			defaultValue, err = strconv.Atoi(*spec.MapExpr.Default)
+			defaultValue, err = strconv.Atoi(meDefault)
 			if err != nil {
 				return nil, err
 			}
 		}
-	case spec.MapExpr.RdfType == "double", spec.MapExpr.RdfType == "float64":
-		defaultValue, err = strconv.ParseFloat(*spec.MapExpr.Default, 64)
+	case meRdfType == "double", meRdfType == "float64":
+		defaultValue, err = strconv.ParseFloat(meDefault, 64)
 		if err != nil {
 			return nil, err
 		}
-	case spec.MapExpr.RdfType == "string", spec.MapExpr.RdfType == "text":
-		defaultValue = *spec.MapExpr.Default
+	case meRdfType == "string", meRdfType == "text":
+		defaultValue = meDefault
 
-	case spec.MapExpr.RdfType == "date":
-		temp, err := ParseDate(*spec.MapExpr.Default)
+	case meRdfType == "date":
+		temp, err := ParseDate(meDefault)
 		if err != nil || temp == nil {
-			fmt.Println("default value is not date:", *spec.MapExpr.Default)
+			fmt.Println("default value is not date:", meDefault)
 			defaultValue = nil
 			err = nil
 		} else {
 			defaultValue = *temp
 		}
-	case spec.MapExpr.RdfType == "datetime":
-		temp, err := ParseDatetime(*spec.MapExpr.Default)
+	case meRdfType == "datetime":
+		temp, err := ParseDatetime(meDefault)
 		if err != nil || temp == nil {
-			fmt.Println("default value is not datetime:", *spec.MapExpr.Default)
+			fmt.Println("default value is not datetime:", meDefault)
 			defaultValue = nil
 			err = nil
 		} else {
 			defaultValue = *temp
 		}
 
-	case spec.MapExpr.RdfType == "int64", spec.MapExpr.RdfType == "long":
-		defaultValue, err = strconv.ParseInt(*spec.MapExpr.Default, 10, 64)
+	case meRdfType == "int64", meRdfType == "long":
+		defaultValue, err = strconv.ParseInt(meDefault, 10, 64)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	inputPos, ok := source.columns[*spec.Expr]
+	inputPos, ok := (*source.columns)[*spec.Expr]
 	if !ok {
-		return nil, fmt.Errorf("mapping column: error column %s not found in input source %s", *spec.Expr, source.config.Name)
+		// Check for special jetstore properties
+		if *spec.Expr == "jets:key" {
+			// Assign to nil when column not on input
+			inputPos = -1
+		} else {
+			return nil, fmt.Errorf("mapping column: error column %s not found in input source %s", *spec.Expr, source.name)
+		}
 	}
-	outputPos, ok := outCh.columns[spec.Name]
+	outputPos, ok := (*outCh.columns)[spec.Name]
 	if !ok {
-		return nil, fmt.Errorf("mapping column: error column %s not found in output source %s", spec.Name, outCh.config.Name)
+		return nil, fmt.Errorf("mapping column: error column %s not found in output source %s", spec.Name, outCh.name)
 	}
 	return &mapColumnEval{
 		mapConfig: &mapColumnConfig{
@@ -161,8 +176,20 @@ func (ctx *BuilderContext) buildMapEvaluator(source *InputChannel, outCh *Output
 // Utility function for casting to specified rdf type
 func CastToRdfType(input interface{}, rdfType string) (interface{}, error) {
 	if input == nil {
-		return nil, nil
+		switch rdfType {
+		case "string", "text":
+			return "", nil
+		case "int", "integer", "int64", "long", "bool":
+			return 0, nil
+		case "float64", "double":
+			return 0.0, nil
+		case "date", "datetime":
+			return nil, nil
+		default:
+			return nil, fmt.Errorf("error: unknown rdf_type %s while mapping column value", rdfType)
+		}
 	}
+
 	var inputV string
 	var inputArr []string
 	switch vv := input.(type) {
@@ -176,6 +203,7 @@ func CastToRdfType(input interface{}, rdfType string) (interface{}, error) {
 			return nil, nil
 		}
 		inputArr = vv
+
 	default:
 		// humm, expecting string or []string
 		inputV = fmt.Sprintf("%v", vv)
@@ -183,7 +211,6 @@ func CastToRdfType(input interface{}, rdfType string) (interface{}, error) {
 	switch rdfType {
 	case "string", "text":
 		return input, nil
-
 	case "int", "integer", "int64", "long":
 		if inputArr == nil {
 			return strconv.Atoi(inputV)

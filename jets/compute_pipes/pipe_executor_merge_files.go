@@ -1,6 +1,9 @@
 package compute_pipes
 
 import (
+	"bufio"
+	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/artisoft-io/jetstore/jets/awsi"
+	"github.com/artisoft-io/jetstore/jets/csv"
 	"github.com/golang/snappy"
 	"github.com/jackc/pgx/v4/pgxpool"
 )
@@ -20,7 +24,7 @@ import (
 // Function to merge the partfiles into a single file by streaming the content
 // to s3 using a channel. This is run in the main thread, so no need to have
 // a result channel back to the caller.
-func (cpCtx *ComputePipesContext) StartMergeFiles(dbpool *pgxpool.Pool) error {
+func (cpCtx *ComputePipesContext) StartMergeFiles(dbpool *pgxpool.Pool) (cpErr error) {
 
 	log.Println("Entering StartMergeFiles")
 
@@ -30,89 +34,260 @@ func (cpCtx *ComputePipesContext) StartMergeFiles(dbpool *pgxpool.Pool) error {
 			var buf strings.Builder
 			buf.WriteString(fmt.Sprintf("StartMergeFiles: recovered error: %v\n", r))
 			buf.WriteString(string(debug.Stack()))
-			cpErr := errors.New(buf.String())
+			cpErr = errors.New(buf.String())
 			log.Println(cpErr)
 			cpCtx.ErrCh <- cpErr
 			close(cpCtx.Done)
 		}
 	}()
+
 	// Validate the pipe config
-	outputFileKey := cpCtx.CpConfig.PipesConfig[0].OutputFile
-	if cpCtx.CpConfig.PipesConfig[0].Type != "merge_files" || outputFileKey == nil {
-		return fmt.Errorf("error: StartMergeFiles called but the PipeConfig does not have a valid merge_files component")
+	pipeSpec := &cpCtx.CpConfig.PipesConfig[0]
+	outputFileKey := pipeSpec.OutputFile
+	if pipeSpec.Type != "merge_files" || outputFileKey == nil {
+		cpErr = fmt.Errorf("error: StartMergeFiles called but the PipeConfig does not have a valid output_file component")
+		return
 	}
-	var outputFileConfig *OutputFileSpec
-	for i := range cpCtx.CpConfig.OutputFiles {
-		if *outputFileKey == cpCtx.CpConfig.OutputFiles[i].Key {
-			outputFileConfig = &cpCtx.CpConfig.OutputFiles[i]
-			break
-		}
-	}
+	outputFileConfig := GetOutputFileConfig(cpCtx.CpConfig, *outputFileKey)
 	if outputFileConfig == nil {
-		return fmt.Errorf("error: OutputFile config not found for key %s in StartMergeFiles", *outputFileKey)
+		cpErr = fmt.Errorf("error: OutputFile config not found for key %s in StartMergeFiles", *outputFileKey)
+		return
 	}
+	// outputFileConfig.OutputLocation may have 3 values:
+	//	- jetstore_s3_input, to indicate to put the output file in JetStore input path.
+	//	- jetstore_s3_output (default), to indicate to put the output file in JetStore output path.
+	//	- custom file path, indicates a custom file key location (path and file name) in this case
+	//    it replaces KeyPrefix and Name attributes.
 	// outputFileConfig.KeyPrefix is the s3 output folder, when empty use:
 	//     <JETS_s3_OUTPUT_PREFIX>/<input file_key dir>/
-	// outputFileConfig.Name is the file name (required)
-	var fileFolder string
-	fileName := outputFileConfig.Name
-	for k, v := range cpCtx.EnvSettings {
-		fileName = strings.ReplaceAll(fileName, k, fmt.Sprintf("%v", v))
+	// outputFileConfig.Name is the file name, defaults to $NAME_FILE_KEY (a file name is required)
+	if outputFileConfig.OutputLocation() == "" {
+		outputFileConfig.SetOutputLocation("jetstore_s3_output")
 	}
-	if len(outputFileConfig.KeyPrefix) > 0 {
-		fileFolder = outputFileConfig.KeyPrefix
-		for k, v := range cpCtx.EnvSettings {
-			fileFolder = strings.ReplaceAll(fileFolder, k, fmt.Sprintf("%v", v))
+	var fileFolder, fileName, outputS3FileKey string
+	switch outputFileConfig.OutputLocation() {
+	case "jetstore_s3_input", "jetstore_s3_output":
+		if len(outputFileConfig.Name()) > 0 {
+			fileName = doSubstitution(outputFileConfig.Name(), "", "", cpCtx.EnvSettings)
+		} else {
+			fileName = doSubstitution("$NAME_FILE_KEY", "", "", cpCtx.EnvSettings)
 		}
-	} else {
-		fileFolder = strings.Replace(cpCtx.CpConfig.CommonRuntimeArgs.FileKey,
-			os.Getenv("JETS_s3_INPUT_PREFIX"), os.Getenv("JETS_s3_OUTPUT_PREFIX"), 1)
+		if len(fileName) == 0 {
+			cpErr = fmt.Errorf("error: OutputFile config is missing file_name in StartMergeFile")
+			return
+		}
+		if len(outputFileConfig.KeyPrefix) > 0 {
+			fileFolder = doSubstitution(outputFileConfig.KeyPrefix, "", outputFileConfig.OutputLocation(),
+				cpCtx.EnvSettings)
+		} else {
+			fileFolder = doSubstitution("$PATH_FILE_KEY", "", outputFileConfig.OutputLocation(),
+				cpCtx.EnvSettings)
+		}
+		outputS3FileKey = fmt.Sprintf("%s/%s", fileFolder, fileName)
+
+	default:
+		outputS3FileKey = doSubstitution(outputFileConfig.OutputLocation(), "", "", cpCtx.EnvSettings)
 	}
-	outputS3FileKey := fmt.Sprintf("%s/%s", fileFolder, fileName)
 
 	// Create a reader to stream the data to s3
-	if len(outputFileConfig.Headers) == 0 {
-		sp := cpCtx.SchemaManager.GetSchemaProvider(outputFileConfig.SchemaProvider)
-		if sp == nil {
-		return fmt.Errorf(
-			"error: merge_files operator using output_file %s has no headers or schema_provider defined", 
-			outputFileConfig.Key)
-		}
-		outputFileConfig.Headers = sp.ColumnNames()
-	}
-	r := cpCtx.NewMergeFileReader(outputFileConfig.Headers)
+	inputChannel := pipeSpec.InputChannel
+	compression := inputChannel.Compression
+	inputSp := cpCtx.SchemaManager.GetSchemaProvider(pipeSpec.InputChannel.SchemaProvider)
 
-	// put content of file to s3
-	if err := awsi.UploadToS3FromReader(outputS3FileKey, r); err != nil {
-		return fmt.Errorf("while copying to s3: %v", err)
+	// Determine if we write the file in the source bucket of the schema provider
+	var externalBucket string
+	switch {
+	case len(outputFileConfig.Bucket) > 0:
+		if outputFileConfig.Bucket != "jetstore_bucket" {
+			externalBucket = outputFileConfig.Bucket
+		}
+	case inputSp != nil && outputFileConfig.OutputLocation() == "jetstore_s3_input":
+		externalBucket = inputSp.Bucket()
 	}
-	if cpCtx.CpConfig.ClusterConfig.IsDebugMode {
-		log.Printf("%s node %d merging files to '%s' completed", cpCtx.SessionId, cpCtx.NodeId, outputS3FileKey)
+	if len(externalBucket) > 0 {
+		externalBucket = doSubstitution(externalBucket, "", "", cpCtx.EnvSettings)
 	}
-	return nil
+
+	// Determine if we put a header row
+	outputSp := cpCtx.SchemaManager.GetSchemaProvider(outputFileConfig.SchemaProvider)
+	writeHeaders := true
+	if outputSp != nil && outputSp.Format() != "csv" {
+		writeHeaders = false
+	}
+	if len(outputFileConfig.Headers) == 0 && writeHeaders {
+		if inputSp != nil {
+			outputFileConfig.Headers = inputSp.ColumnNames()
+		}
+
+		if len(outputFileConfig.Headers) == 0 {
+			// Get the headers from the main input source (as a fallback)
+			// This is for the case where the headers are in the input file
+			inputChannelName := cpCtx.CpConfig.PipesConfig[0].InputChannel.Name
+			if inputChannelName == "input_row" {
+				outputFileConfig.Headers =
+					cpCtx.CpConfig.CommonRuntimeArgs.SourcesConfig.MainInput.InputColumns
+			} else {
+				for i := range cpCtx.CpConfig.Channels {
+					if cpCtx.CpConfig.Channels[i].Name == inputChannelName {
+						outputFileConfig.Headers = cpCtx.CpConfig.Channels[i].Columns
+						break
+					}
+				}
+			}
+		}
+		if len(outputFileConfig.Headers) == 0 {
+			cpErr = fmt.Errorf(
+				"error: merge_files operator using output_file %s, no headers avaliable",
+				outputFileConfig.Key)
+			log.Println(cpErr)
+			return
+		}
+	}
+	inputFormat := inputChannel.Format
+	var delimiter rune = ','
+	if inputChannel.Delimiter > 0 {
+		delimiter = inputChannel.Delimiter
+	}
+	var fileReader io.Reader
+	var err, mergeErr error
+	var nrowsInRec int64
+
+	//*TODO Add support for xlsx
+	// NOTE: Files are not downloaded locally when merging using s3 copy,
+	// DOWNLAOD FILES IF: (inputFormat == "parquet" && len(cpCtx.InputFileKeys) > 1) || (compression=="snappy")
+	// See ComputePipesContext.startDownloadFiles() where this condition is verified.
+	// This is called in ComputePipesContext.DownloadS3Files()
+	switch {
+	case inputFormat == "parquet" && len(cpCtx.InputFileKeys) > 1:
+		// merge parquet files into a single file
+		// Pipe the writer to a reader to content goes directly to s3
+		// log.Printf("*** MERGE %d files to single parquet file\n", len(cpCtx.InputFileKeys))
+		pin, pout := io.Pipe()
+		gotError := func(err error) {
+			mergeErr = err
+			pin.Close()
+		}
+		fileReader = pin
+		go func() {
+			if outputSp != nil {
+				nrowsInRec = outputSp.NbrRowsInRecord()
+			}
+			MergeParquetPartitions(nrowsInRec, outputFileConfig.Headers, pout, cpCtx.FileNamesCh, gotError)
+			pout.Close()
+		}()
+	case len(compression) != 0 && compression != "none":
+		// Gotta be snappy on text file. Not usual, do copy the old way
+		log.Printf("*** MERGE %d files using text format (%s) with compression %s\n",
+			len(cpCtx.InputFileKeys), inputFormat, compression)
+		fileReader, err = cpCtx.NewMergeFileReader(inputFormat, delimiter, outputSp, outputFileConfig.Headers, writeHeaders, compression)
+		if err != nil {
+			cpErr = err
+			return
+		}
+
+	default:
+		// Use s3 multipart file copy
+		log.Printf("*** MERGE %d files using s3 multipart file copy with format %s\n", len(cpCtx.InputFileKeys), inputFormat)
+		s3Client, err := awsi.NewS3Client()
+		if err != nil {
+			cpErr = err
+			return
+		}
+
+		poolSize := cpCtx.CpConfig.ClusterConfig.S3WorkerPoolSize
+		sourceKey := fmt.Sprintf("%s/process_name=%s/session_id=%s/step_id=%s",
+			jetsS3StagePrefix, cpCtx.ProcessName, cpCtx.SessionId, inputChannel.ReadStepId)
+		err = awsi.MultiPartCopy(context.TODO(), s3Client, poolSize, "", sourceKey, externalBucket, outputS3FileKey,
+			cpCtx.CpConfig.ClusterConfig.IsDebugMode)
+		if err != nil {
+			cpErr = fmt.Errorf("%s while merging files using s3 copy: %v", cpCtx.SessionId, err)
+			log.Println(cpErr)
+			return
+		}
+		log.Printf("%s node %d merging files to '%s' using s3 copy completed", cpCtx.SessionId, cpCtx.NodeId, outputS3FileKey)
+		return
+	}
+
+	// put content of file to s3 using a local reader
+	if err := awsi.UploadToS3FromReader(externalBucket, outputS3FileKey, fileReader); err != nil {
+		cpErr = fmt.Errorf("while copying to s3: %v", err)
+		return
+	}
+	if mergeErr != nil {
+		cpErr = fmt.Errorf("%s while merging parquet files: %v", cpCtx.SessionId, mergeErr)
+		return
+	}
+	log.Printf("%s node %d merging files to '%s' completed", cpCtx.SessionId, cpCtx.NodeId, outputS3FileKey)
+	return
+}
+
+// Function to determine if need to download the input files
+// returns true if (inputFormat == "parquet" && len(cpCtx.InputFileKeys) > 1) || (compression=="snappy")
+func (cpCtx *ComputePipesContext) startDownloadFiles() bool {
+	pipeSpec := &cpCtx.CpConfig.PipesConfig[0]
+	if pipeSpec.Type != "merge_files" {
+		return true
+	}
+	inputChannel := pipeSpec.InputChannel
+	compression := inputChannel.Compression
+	inputFormat := inputChannel.Format
+	return (inputFormat == "parquet" && len(cpCtx.InputFileKeys) > 1) || (compression == "snappy")
 }
 
 // MergeFileReader provides a reader that conforms to io.Reader interface
 // that reads content from partfiles and makes it available to the s3 manager
 // via the Read interface
 type MergeFileReader struct {
-	currentFile   FileName
-	currentFileHd *os.File
-	reader        *snappy.Reader
-	headers       []byte
-	cpCtx         *ComputePipesContext
+	currentFile    FileName
+	currentFileHd  *os.File
+	reader         *bufio.Reader
+	headers        []byte
+	compression    string
+	skipHeaderLine bool
+	skipHeaderFlag bool
+	cpCtx          *ComputePipesContext
 }
 
-func (cpCtx *ComputePipesContext) NewMergeFileReader(headers []string) io.Reader {
+// outputSp is needed to determine if we quote all or non fields. It also provided the writeHeaders value.
+func (cpCtx *ComputePipesContext) NewMergeFileReader(inputFormat string, delimiter rune, outputSp SchemaProvider, headers []string,
+	writeHeaders bool, compression string) (io.Reader, error) {
+
 	var h []byte
-	if len(headers) > 0 {
-		v := fmt.Sprintf("%s\n", strings.Join(headers, ","))
-		h = []byte(v)
+	if len(headers) > 0 && writeHeaders {
+		// Write the header into a byte slice. Using a csv.Writer to make sure
+		// the delimiter is escaped correctly
+		var buf bytes.Buffer
+		w := csv.NewWriter(&buf)
+		if outputSp != nil {
+			d := outputSp.Delimiter()
+			if d > 0 {
+				delimiter = d
+			}
+			if outputSp.QuoteAllRecords() {
+				w.QuoteAll = true
+			}
+			if outputSp.NoQuotes() {
+				w.NoQuotes = true
+			}
+		}
+		w.Comma = delimiter
+		err := w.Write(headers)
+		if err != nil {
+			return nil, fmt.Errorf("while writing headers in merge_files op: %v", err)
+		}
+		w.Flush()
+		h = buf.Bytes()
+	}
+	if strings.HasPrefix(inputFormat, "parquet") {
+		// compression does not applies to parquet file
+		compression = ""
 	}
 	return &MergeFileReader{
-		cpCtx:   cpCtx,
-		headers: h,
-	}
+		cpCtx:          cpCtx,
+		headers:        h,
+		compression:    compression,
+		skipHeaderLine: inputFormat == "csv",
+	}, nil
 }
 
 func (r *MergeFileReader) Read(buf []byte) (int, error) {
@@ -134,29 +309,49 @@ func (r *MergeFileReader) Read(buf []byte) (int, error) {
 		if r.currentFile.LocalFileName == "" {
 			return 0, io.EOF
 		}
-
 		// open the reader for currentFile
 		r.currentFileHd, err = os.Open(r.currentFile.LocalFileName)
 		if err != nil {
 			return 0, fmt.Errorf("while opening temp file '%s' (MergeFileReader.Read): %v",
 				r.currentFile.LocalFileName, err)
 		}
-		r.reader = snappy.NewReader(r.currentFileHd)
+		switch r.compression {
+		case "snappy":
+			r.reader = bufio.NewReader(snappy.NewReader(r.currentFileHd))
+		case "none", "":
+			r.reader = bufio.NewReader(r.currentFileHd)
+		default:
+			return 0, fmt.Errorf("error: unknown compression %s (merge_files)", r.compression)
+		}
+		// skip headerline if needed
+		if r.skipHeaderLine {
+			r.skipHeaderFlag = true
+		}
 		// read from file, delegate to itself
 		return r.Read(buf)
 
 	default:
 		// Delegate to the reader
-		n, err2 := r.reader.Read(buf)
-		if err2 == io.EOF {
+		if r.skipHeaderFlag {
+			_, err = r.reader.ReadString('\n')
+			if err != nil && err != io.EOF {
+				return 0, err
+			}
+			r.skipHeaderFlag = false
+		}
+		var n int
+		var err2 error
+		if err == nil {
+			n, err2 = r.reader.Read(buf)
+			if err2 != nil && err2 != io.EOF {
+				return n, err2
+			}
+		}
+		if err == io.EOF || err2 == io.EOF {
 			r.currentFileHd.Close()
 			os.Remove(r.currentFile.LocalFileName)
 			r.currentFileHd = nil
 			r.reader = nil
-		}
-		if err2 != nil && err2 != io.EOF {
-			// Got error while reading file
-			return n, err2
 		}
 		if n == 0 {
 			// check for next file

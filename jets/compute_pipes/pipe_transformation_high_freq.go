@@ -28,17 +28,25 @@ type HighFreqTransformationPipe struct {
 }
 
 // Implementing interface PipeTransformationEvaluator
-func (ctx *HighFreqTransformationPipe) apply(input *[]interface{}) error {
+func (ctx *HighFreqTransformationPipe) Apply(input *[]interface{}) error {
 	if input == nil {
 		return fmt.Errorf("error: unexpected null input arg in HighFreqTransformationPipe")
 	}
+	// Skip invalid row (ie does not have the number of expected columns)
+	inputLen := len(*input)
+	expectedLen := len(ctx.source.config.Columns)
+	if inputLen != expectedLen {
+		// Skip the row
+		return nil
+	}
+
 	if ctx.firstInputRow == nil {
 		ctx.firstInputRow = input
 	}
 	var token string
-	for _, c := range *ctx.spec.HighFreqColumns {
+	for _, c := range ctx.spec.HighFreqColumns {
 		highFreqMap := ctx.highFreqState[c.Name]
-		value := (*input)[ctx.source.columns[c.Name]]
+		value := (*input)[(*ctx.source.columns)[c.Name]]
 		if value != nil {
 			switch vv := value.(type) {
 			case string:
@@ -64,7 +72,7 @@ func (ctx *HighFreqTransformationPipe) apply(input *[]interface{}) error {
 					}
 					highFreqMap[token] = dv
 				}
-				dv.Count += 1	
+				dv.Count += 1
 			}
 		}
 	}
@@ -74,49 +82,51 @@ func (ctx *HighFreqTransformationPipe) apply(input *[]interface{}) error {
 
 // Analysis complete, now send out the results to ctx.outputCh.
 // A row is produced for each column and each high freq value.
-// High freq values are those in top 80 percentile, cap at 500 values
+// High freq values are those in top top_pct percentile
 
-func (ctx *HighFreqTransformationPipe) done() error {
-	// For each tracked columns, send out the top 80 percentile values
-	for _, column := range *ctx.spec.HighFreqColumns {
+func (ctx *HighFreqTransformationPipe) Done() error {
+	// For each tracked columns, send out the top percentile values
+	for _, column := range ctx.spec.HighFreqColumns {
 		highFreqMap := ctx.highFreqState[column.Name]
 		totalCount := 0
-		// log.Printf("HighFreqTransformationPipe.done: sending results for column: %s, got %d distinct values", columnName, len(highFreqMap))
-		dcSlice := make([]*DistinctCount, 0, len(highFreqMap))
+		nbrDistinctValues := len(highFreqMap)
+		dcSlice := make([]*DistinctCount, 0, nbrDistinctValues)
 		for _, dc := range highFreqMap {
 			dcSlice = append(dcSlice, dc)
 			totalCount += dc.Count
 		}
+		log.Printf("HighFreqTransformationPipe.done: sending results for column: %s, got %d distinct values out of %d values\n",
+			column.Name, nbrDistinctValues, totalCount)
 		sort.Slice(dcSlice, func(i, j int) bool {
 			return dcSlice[i].Count > dcSlice[j].Count
 		})
-		var topPctFact float64 = 0.80
+		var topPctFactor float64 = 1
 		if column.TopPercentile > 0 {
-			topPctFact = float64(column.TopPercentile) / 100
+			topPctFactor = float64(column.TopPercentile) / 100
 		}
-		topPct := int(float64(totalCount)*topPctFact + 0.5)
-		var pctCount int
-		maxCount := 100
+		maxTotalCount := int(float64(totalCount)*topPctFactor + 0.5)
+		maxDistinctValueCount := nbrDistinctValues
 		if column.TopRank > 0 {
-			maxCount = column.TopRank
+			topRankFactor := float64(column.TopRank) / 100
+			maxDistinctValueCount = nbrDistinctValues * int(float64(nbrDistinctValues)*topRankFactor+0.5)
+			if maxDistinctValueCount > nbrDistinctValues {
+				maxDistinctValueCount = nbrDistinctValues
+			}
 		}
-		l := len(dcSlice)
-		if l < maxCount {
-			maxCount = l
-		}
-		for i := 0; i < maxCount; i++ {
+		var valueCount int
+		for i := 0; i < maxDistinctValueCount; i++ {
 			// make the output row
-			outputRow := make([]interface{}, len(ctx.outputCh.columns))
-			outputRow[ctx.outputCh.columns["column_name"]] = column.Name
+			outputRow := make([]interface{}, len(*ctx.outputCh.columns))
+			outputRow[(*ctx.outputCh.columns)["column_name"]] = column.Name
 			// The freq count columns
 			dc := dcSlice[i]
-			outputRow[ctx.outputCh.columns["freq_count"]] = dc.Count
-			outputRow[ctx.outputCh.columns["freq_value"]] = dc.Value
+			outputRow[(*ctx.outputCh.columns)["freq_count"]] = dc.Count
+			outputRow[(*ctx.outputCh.columns)["freq_value"]] = dc.Value
 			// Add the carry over select and const values
 			// NOTE there is no initialize and done called on the column evaluators
 			//      since they should be only of type 'select' or 'value'
 			for i := range ctx.columnEvaluators {
-				err := ctx.columnEvaluators[i].update(&outputRow, ctx.firstInputRow)
+				err := ctx.columnEvaluators[i].Update(&outputRow, ctx.firstInputRow)
 				if err != nil {
 					err = fmt.Errorf("while calling column transformation from high_freq operator: %v", err)
 					log.Println(err)
@@ -130,21 +140,21 @@ func (ctx *HighFreqTransformationPipe) done() error {
 				log.Println("HighFreqTransform interrupted")
 			}
 			// see if we have enough value
-			pctCount += dc.Count
-			if pctCount > topPct {
+			valueCount += dc.Count
+			if valueCount > maxTotalCount {
 				break
 			}
 		}
 	}
-	// fmt.Println("**!@@ ** Send Freq Count Result to", ctx.outputCh.config.Name, "DONE")
+	fmt.Println("**!@@ ** Send Freq Count Result to", ctx.outputCh.name, "DONE")
 	return nil
 }
 
-func (ctx *HighFreqTransformationPipe) finally() {}
+func (ctx *HighFreqTransformationPipe) Finally() {}
 
 func (ctx *BuilderContext) NewHighFreqTransformationPipe(source *InputChannel, outputCh *OutputChannel, spec *TransformationSpec) (*HighFreqTransformationPipe, error) {
 	var err error
-	if spec == nil || spec.HighFreqColumns == nil {
+	if spec == nil || len(spec.HighFreqColumns) == 0 {
 		return nil, fmt.Errorf("error: High Freq Pipe Transformation spec is missing columns definition")
 	}
 	if source == nil || outputCh == nil {
@@ -154,7 +164,7 @@ func (ctx *BuilderContext) NewHighFreqTransformationPipe(source *InputChannel, o
 	spec.NewRecord = true
 	// Set up the High Freq State for each input column that are tracked
 	analyzeState := make(map[string]map[string]*DistinctCount)
-	for _, c := range *spec.HighFreqColumns {
+	for _, c := range spec.HighFreqColumns {
 		analyzeState[c.Name] = make(map[string]*DistinctCount)
 		// Compile the key extraction regex
 		if len(c.KeyRe) > 0 {
@@ -168,9 +178,9 @@ func (ctx *BuilderContext) NewHighFreqTransformationPipe(source *InputChannel, o
 	columnEvaluators := make([]TransformationColumnEvaluator, len(spec.Columns))
 	for i := range spec.Columns {
 		// log.Printf("**& build TransformationColumn[%d] of type %s for output %s", i, spec.Type, spec.Output)
-		columnEvaluators[i], err = ctx.buildTransformationColumnEvaluator(source, outputCh, &spec.Columns[i])
+		columnEvaluators[i], err = ctx.BuildTransformationColumnEvaluator(source, outputCh, &spec.Columns[i])
 		if err != nil {
-			err = fmt.Errorf("while buildTransformationColumnEvaluator (in NewHighFreqTransformationPipe) %v", err)
+			err = fmt.Errorf("while BuildTransformationColumnEvaluator (in NewHighFreqTransformationPipe) %v", err)
 			log.Println(err)
 			return nil, err
 		}

@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/artisoft-io/jetstore/jets/dbutils"
+	"github.com/artisoft-io/jetstore/jets/datatable"
 	"github.com/artisoft-io/jetstore/jets/workspace"
 	"github.com/jackc/pgx/v4/pgxpool"
 )
@@ -47,13 +47,12 @@ func CoordinateWorkAndUpdateStatus(ctx context.Context, dbpool *pgxpool.Pool, ca
 
 	// Fetch reports.tgz from overriten workspace files (here we want the reports definitions in particular)
 	// We don't care about /lookup.db and /workspace.db, hence the argument skipSqliteFiles = true
+	// See if it worth to do a check
 	var err error
 	if !devMode {
-		log.Println("Synching reports.tgz from db")
-		err = workspace.SyncWorkspaceFiles(dbpool, wprefix, dbutils.FO_Open, "reports.tgz", true, false)
+		_, err = workspace.SyncRunReportsWorkspace(dbpool)
 		if err != nil {
-			log.Println("Error while synching workspace file from db:", err)
-			return err
+			return fmt.Errorf("error while synching reports.tgz files from db: %v", err)
 		}
 	}
 
@@ -99,7 +98,7 @@ func CoordinateWorkAndUpdateStatus(ctx context.Context, dbpool *pgxpool.Pool, ca
 	case ca.CurrentReportDirectives.OutputS3Prefix != "":
 		// Write output file to a location based on a custom s3 prefix
 		ca.OutputPath = strings.ReplaceAll(ca.OutputPath,
-			jetsS3OutputPrefix,	ca.CurrentReportDirectives.OutputS3Prefix)
+			jetsS3OutputPrefix, ca.CurrentReportDirectives.OutputS3Prefix)
 	case ca.CurrentReportDirectives.OutputPath != "":
 		// Write output file to a specified s3 location
 		ca.OutputPath = ca.CurrentReportDirectives.OutputPath
@@ -127,11 +126,6 @@ func CoordinateWorkAndUpdateStatus(ctx context.Context, dbpool *pgxpool.Pool, ca
 		ca.CurrentReportDirectives.ReportScripts = []string{ca.ReportName}
 	}
 
-	if len(ca.ReportScriptPaths) == 0 {
-		log.Println("No report to execute, exiting silently...")
-		return nil
-	}
-
 	fmt.Println("Reports available for execution:")
 	for i := range ca.ReportScriptPaths {
 		fmt.Println("  -", ca.ReportScriptPaths[i])
@@ -145,6 +139,12 @@ func CoordinateWorkAndUpdateStatus(ctx context.Context, dbpool *pgxpool.Pool, ca
 		} else {
 			ca.SourcePeriodKey = strconv.Itoa(k)
 		}
+	}
+
+	// Get the SchemaProvider from db
+	ca.SchemaProviderJson, err = datatable.GetSchemaProviderJsonFromPipelineSession(dbpool, ca.SessionId)
+	if err != nil && !strings.Contains(err.Error(), "no rows in result set") {
+		return fmt.Errorf("query pipeline_execution_status failed: %v", err)
 	}
 
 	// Do the reports

@@ -77,8 +77,8 @@ func (lce *lceValue) EvalValue(output *[]interface{}, _ *[]interface{}) error {
 	return nil
 }
 
-func (ctx *lookupColumnTransformationEval) initializeCurrentValue(currentValue *[]interface{}) {}
-func (ctx *lookupColumnTransformationEval) update(output *[]interface{}, input *[]interface{}) error {
+func (ctx *lookupColumnTransformationEval) InitializeCurrentValue(currentValue *[]interface{}) {}
+func (ctx *lookupColumnTransformationEval) Update(output *[]interface{}, input *[]interface{}) error {
 	// lookup update
 	// build the lookup key using input row
 	// get the lookup record, update output row with lookup values
@@ -106,6 +106,10 @@ func (ctx *lookupColumnTransformationEval) update(output *[]interface{}, input *
 	if err != nil {
 		return fmt.Errorf("while fetching the lookup row: %v", err)
 	}
+	if row == nil {
+		// No match in the lookup
+		return nil
+	}
 	// Update the output row
 	for i := range ctx.valueEvaluator {
 		err = ctx.valueEvaluator[i].EvalValue(output, row)
@@ -115,28 +119,27 @@ func (ctx *lookupColumnTransformationEval) update(output *[]interface{}, input *
 	}
 	return nil
 }
-func (ctx *lookupColumnTransformationEval) done(currentValue *[]interface{}) error {
+func (ctx *lookupColumnTransformationEval) Done(currentValue *[]interface{}) error {
 	return nil
 }
 
-func (ctx *BuilderContext) buildLookupEvaluator(source *InputChannel, outCh *OutputChannel, spec *TransformationColumnSpec) (TransformationColumnEvaluator, error) {
-	if spec == nil || spec.LookupName == nil || spec.LookupKey == nil || spec.LookupValues == nil {
-		return nil, fmt.Errorf("error: Type lookup must have LookupName, LookupKey and LookupValues not nil")
+func (ctx *BuilderContext) BuildLookupTCEvaluator(source *InputChannel, outCh *OutputChannel,
+	spec *TransformationColumnSpec) (TransformationColumnEvaluator, error) {
+
+	if spec == nil || spec.LookupName == nil || len(spec.LookupKey) == 0 || len(spec.LookupValues) == 0 {
+		return nil, fmt.Errorf("error: Type lookup must have LookupName, LookupKey and LookupValues not empty")
 	}
-	if len(*spec.LookupKey) == 0 || len(*spec.LookupValues) == 0 {
-		return nil, fmt.Errorf("error: Type lookup must have non empty LookupKey and LookupValues")
-	}
-	keyEvaluator := make([]lookupColumnEval, len(*spec.LookupKey))
-	valueEvaluator := make([]lookupColumnEval, len(*spec.LookupValues))
+	keyEvaluator := make([]lookupColumnEval, len(spec.LookupKey))
+	valueEvaluator := make([]lookupColumnEval, len(spec.LookupValues))
 
 	// build the key evaluators
-	for i := range *spec.LookupKey {
-		columnSpec := &(*spec.LookupKey)[i]
+	for i := range spec.LookupKey {
+		columnSpec := &spec.LookupKey[i]
 		switch columnSpec.Type {
 		case "select":
 			keyEvaluator[i] = &lceSelect{
 				lookupName: spec.LookupName,
-				inputPos:   source.columns[*columnSpec.Expr],
+				inputPos:   (*source.columns)[*columnSpec.Expr],
 			}
 		case "value":
 			value, err := ctx.parseValue(columnSpec.Expr)
@@ -154,41 +157,45 @@ func (ctx *BuilderContext) buildLookupEvaluator(source *InputChannel, outCh *Out
 	if !ok {
 		return nil, fmt.Errorf("error: lookup table '%s' not found in lookup table manager", *spec.LookupName)
 	}
-	// build the lookup value evaluators
-	for i := range *spec.LookupValues {
-		columnSpec := &(*spec.LookupValues)[i]
-		switch columnSpec.Type {
-		case "select":
-			inputPos, ok := lookupTable.ColumnMap()[*columnSpec.Expr]
-			if !ok {
-				return nil, fmt.Errorf("error: lookup table '%s' does not have column '%s'",
-					*spec.LookupName, *columnSpec.Expr)
-			}
-			outputPos, ok := outCh.columns[columnSpec.Name]
-			if !ok {
-				return nil, fmt.Errorf("error: output column '%s' is not valid for lookup table '%s' (buildLookupEvaluator)",
-					columnSpec.Name, *spec.LookupName)
-			}
-			valueEvaluator[i] = &lceSelect{
-				lookupName: spec.LookupName,
-				inputPos:   inputPos,
-				outputPos:  outputPos,
-			}
-		case "value":
-			value, err := ctx.parseValue(columnSpec.Expr)
-			if err != nil {
-				return nil, fmt.Errorf("while building lookup value evaluator of type 'value' for lookup %s: %v",
-					*spec.LookupName, err)
-			}
-			outputPos, ok := outCh.columns[columnSpec.Name]
-			if !ok {
-				return nil, fmt.Errorf("error: output column '%s' is not valid for lookup table '%s' (buildLookupEvaluator)",
-					columnSpec.Name, *spec.LookupName)
-			}
-			valueEvaluator[i] = &lceValue{
-				lookupName: spec.LookupName,
-				value:      value,
-				outputPos:  outputPos,
+	// If this is an empty lookup (in the sense that it's a s3 file-based lookup but no files were found
+	// and the spec indicated that it is not an error via csv_source.make_empty_source_when_no_files_found settings)
+	if !lookupTable.IsEmptyTable() {
+		// build the lookup value evaluators
+		for i := range spec.LookupValues {
+			columnSpec := &spec.LookupValues[i]
+			switch columnSpec.Type {
+			case "select":
+				inputPos, ok := lookupTable.ColumnMap()[*columnSpec.Expr]
+				if !ok {
+					return nil, fmt.Errorf("error: lookup table '%s' does not have column '%s'",
+						*spec.LookupName, *columnSpec.Expr)
+				}
+				outputPos, ok := (*outCh.columns)[columnSpec.Name]
+				if !ok {
+					return nil, fmt.Errorf("error: output column '%s' is not valid for lookup table '%s' (buildLookupEvaluator)",
+						columnSpec.Name, *spec.LookupName)
+				}
+				valueEvaluator[i] = &lceSelect{
+					lookupName: spec.LookupName,
+					inputPos:   inputPos,
+					outputPos:  outputPos,
+				}
+			case "value":
+				value, err := ctx.parseValue(columnSpec.Expr)
+				if err != nil {
+					return nil, fmt.Errorf("while building lookup value evaluator of type 'value' for lookup %s: %v",
+						*spec.LookupName, err)
+				}
+				outputPos, ok := (*outCh.columns)[columnSpec.Name]
+				if !ok {
+					return nil, fmt.Errorf("error: output column '%s' is not valid for lookup table '%s' (buildLookupEvaluator)",
+						columnSpec.Name, *spec.LookupName)
+				}
+				valueEvaluator[i] = &lceValue{
+					lookupName: spec.LookupName,
+					value:      value,
+					outputPos:  outputPos,
+				}
 			}
 		}
 	}

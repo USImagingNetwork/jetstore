@@ -29,18 +29,37 @@ type SchemaProvider interface {
 	Initialize(dbpool *pgxpool.Pool, spec *SchemaProviderSpec,
 		envSettings map[string]interface{}, isDebugMode bool) error
 	Key() string
-	SchemaName() string
-	InputFormat() string
+	Env() map[string]any
+	AdjustColumnWidth(width map[string]int) error
+	BadRowsConfig() *BadRowsSpec
+	Bucket() string
+	ColumnNames() []string
+	Columns() []SchemaColumnSpec
 	Compression() string
+	Delimiter() rune
+	DetectEncoding() bool
+	DomainClass() string
+	DomainKeys() map[string]any
+	Encoding() string
+	EnforceRowMaxLength() bool
+	EnforceRowMinLength() bool
+	FixedWidthEncodingInfo() *FixedWidthEncodingInfo
+	FixedWidthFileHeaders() ([]string, string)
+	Format() string
 	InputFormatDataJson() string
 	IsPartFiles() bool
-	Delimiter() rune
+	NbrRowsInRecord() int64
+	NoQuotes() bool
+	ParquetSchema() *ParquetSchemaInfo
+	QuoteAllRecords() bool
+	ReadBatchSize() int64
+	ReadDateLayout() string
+	SchemaName() string
 	TrimColumns() bool
-	Columns() []SchemaColumnSpec
-	ColumnNames() []string
-	FixedWidthFileHeaders() ([]string, string)
-	FixedWidthEncodingInfo() *FixedWidthEncodingInfo
-	Env() map[string]string
+	UseLazyQuotes() bool
+	UseLazyQuotesSpecial() bool
+	VariableFieldsPerRecord() bool
+	WriteDateLayout() string
 }
 
 // columnNames is the list of file headers for fixed_width
@@ -89,14 +108,17 @@ func (sp *DefaultSchemaProvider) Initialize(_ *pgxpool.Pool, spec *SchemaProvide
 	if sp.spec.Compression == "" {
 		sp.spec.Compression = "none"
 	}
-	if spec.InputFormat == "fixed_width" {
+	if spec.Format == "fixed_width" {
 		return sp.initializeFixedWidthInfo()
 	}
-	if len(sp.spec.Columns) > 0 {
+	switch {
+	case len(sp.spec.Columns) > 0:
 		sp.columnNames = make([]string, 0, len(sp.spec.Columns))
 		for i := range sp.spec.Columns {
 			sp.columnNames = append(sp.columnNames, sp.spec.Columns[i].Name)
 		}
+	case len(sp.spec.Headers) > 0:
+		sp.columnNames = sp.spec.Headers
 	}
 	return nil
 }
@@ -106,6 +128,24 @@ func (sp *DefaultSchemaProvider) FixedWidthFileHeaders() ([]string, string) {
 		return nil, ""
 	}
 	return sp.columnNames, sp.fwColumnPrefix
+}
+
+func (sp *DefaultSchemaProvider) AdjustColumnWidth(width map[string]int) error {
+	if sp == nil || width == nil {
+		return fmt.Errorf("error: schema provider or argument to AdjustColumnWidth is nil")
+	}
+	if len(sp.spec.Columns) == 0 {
+		return fmt.Errorf("error: Cannot adjust column width of Schema Provider without column info")
+	}
+	for i := range sp.spec.Columns {
+		c := &sp.spec.Columns[i]
+		w, ok := width[c.Name]
+		if ok {
+			c.Length = w
+		}
+	}
+	sp.spec.FixedWidthColumnsCsv = ""
+	return sp.initializeFixedWidthInfo()
 }
 
 func (sp *DefaultSchemaProvider) FixedWidthEncodingInfo() *FixedWidthEncodingInfo {
@@ -122,7 +162,14 @@ func (sp *DefaultSchemaProvider) Key() string {
 	return sp.spec.Key
 }
 
-func (sp *DefaultSchemaProvider) Env() map[string]string {
+func (sp *DefaultSchemaProvider) Bucket() string {
+	if sp == nil {
+		return ""
+	}
+	return sp.spec.Bucket
+}
+
+func (sp *DefaultSchemaProvider) Env() map[string]any {
 	if sp == nil {
 		return nil
 	}
@@ -136,11 +183,39 @@ func (sp *DefaultSchemaProvider) SchemaName() string {
 	return sp.spec.SchemaName
 }
 
-func (sp *DefaultSchemaProvider) InputFormat() string {
+func (sp *DefaultSchemaProvider) Format() string {
 	if sp == nil {
 		return ""
 	}
-	return sp.spec.InputFormat
+	return sp.spec.Format
+}
+
+func (sp *DefaultSchemaProvider) NbrRowsInRecord() int64 {
+	if sp == nil {
+		return 0
+	}
+	return sp.spec.NbrRowsInRecord
+}
+
+func (sp *DefaultSchemaProvider) ParquetSchema() *ParquetSchemaInfo {
+	if sp == nil {
+		return nil
+	}
+	return sp.spec.ParquetSchema
+}
+
+func (sp *DefaultSchemaProvider) ReadBatchSize() int64 {
+	if sp == nil {
+		return 0
+	}
+	return sp.spec.ReadBatchSize
+}
+
+func (sp *DefaultSchemaProvider) Encoding() string {
+	if sp == nil {
+		return ""
+	}
+	return sp.spec.Encoding
 }
 
 func (sp *DefaultSchemaProvider) Compression() string {
@@ -150,11 +225,32 @@ func (sp *DefaultSchemaProvider) Compression() string {
 	return sp.spec.Compression
 }
 
+func (sp *DefaultSchemaProvider) DetectEncoding() bool {
+	if sp == nil {
+		return false
+	}
+	return sp.spec.DetectEncoding
+}
+
 func (sp *DefaultSchemaProvider) InputFormatDataJson() string {
 	if sp == nil {
 		return ""
 	}
 	return sp.spec.InputFormatDataJson
+}
+
+func (sp *DefaultSchemaProvider) DomainClass() string {
+	if sp == nil {
+		return ""
+	}
+	return sp.spec.DomainClass
+}
+
+func (sp *DefaultSchemaProvider) DomainKeys() map[string]any {
+	if sp == nil {
+		return nil
+	}
+	return sp.spec.DomainKeys
 }
 
 func (sp *DefaultSchemaProvider) IsPartFiles() bool {
@@ -168,10 +264,63 @@ func (sp *DefaultSchemaProvider) Delimiter() rune {
 	if sp == nil {
 		return 0
 	}
-	if sp.spec.Delimiter == "" {
-		return '€'
+	return sp.spec.Delimiter
+}
+
+func (sp *DefaultSchemaProvider) UseLazyQuotes() bool {
+	if sp == nil {
+		return false
 	}
-	return []rune(sp.spec.Delimiter)[0]
+	return sp.spec.UseLazyQuotes
+}
+
+func (sp *DefaultSchemaProvider) UseLazyQuotesSpecial() bool {
+	if sp == nil {
+		return false
+	}
+	return sp.spec.UseLazyQuotesSpecial
+}
+
+func (sp *DefaultSchemaProvider) VariableFieldsPerRecord() bool {
+	if sp == nil {
+		return false
+	}
+	return sp.spec.VariableFieldsPerRecord
+}
+
+func (sp *DefaultSchemaProvider) EnforceRowMinLength() bool {
+	if sp == nil {
+		return false
+	}
+	return sp.spec.EnforceRowMinLength
+}
+
+func (sp *DefaultSchemaProvider) EnforceRowMaxLength() bool {
+	if sp == nil {
+		return false
+	}
+	return sp.spec.EnforceRowMaxLength
+}
+
+func (sp *DefaultSchemaProvider) BadRowsConfig() *BadRowsSpec {
+	if sp == nil {
+		return nil
+	}
+	return sp.spec.BadRowsConfig
+}
+
+func (sp *DefaultSchemaProvider) QuoteAllRecords() bool {
+	if sp == nil {
+		return false
+	}
+	return sp.spec.QuoteAllRecords
+}
+
+func (sp *DefaultSchemaProvider) NoQuotes() bool {
+	if sp == nil {
+		return false
+	}
+	return sp.spec.NoQuotes
 }
 
 func (sp *DefaultSchemaProvider) TrimColumns() bool {
@@ -193,4 +342,18 @@ func (sp *DefaultSchemaProvider) ColumnNames() []string {
 		return nil
 	}
 	return sp.columnNames
+}
+
+func (sp *DefaultSchemaProvider) ReadDateLayout() string {
+	if sp == nil {
+		return ""
+	}
+	return sp.spec.ReadDateLayout
+}
+
+func (sp *DefaultSchemaProvider) WriteDateLayout() string {
+	if sp == nil {
+		return ""
+	}
+	return sp.spec.WriteDateLayout
 }

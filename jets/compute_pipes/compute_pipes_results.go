@@ -20,17 +20,29 @@ type LoadFromS3FilesResult struct {
 	BadRowCount  int64
 	Err          error
 }
+type JetrulesWorkerResult struct {
+	ReteSessionCount int64
+	ErrorsCount      int64
+	Err              error
+}
+type ClusteringResult struct {
+	Err          error
+}
 
 // ChannelResults holds the channel reporting back results.
 // LoadFromS3FilesResultCh: results from loading files (row count)
 // Copy2DbResultCh: results of records written to JetStore DB (row count)
 // WritePartitionsResultCh: report on rows output to s3 (row count)
 // S3PutObjectResultCh: reports on nbr of files put to s3 (file count)
+// JetrulesWorkerResultCh: reports on nbr of rete session and errors
+// ClusteringResultCh: reports on nbr of clusters identified and errors
 type ChannelResults struct {
 	LoadFromS3FilesResultCh chan LoadFromS3FilesResult
 	Copy2DbResultCh         chan chan ComputePipesResult
 	WritePartitionsResultCh chan chan ComputePipesResult
 	S3PutObjectResultCh     chan ComputePipesResult
+	JetrulesWorkerResultCh  chan chan JetrulesWorkerResult
+	ClusteringResultCh      chan chan ClusteringResult
 }
 
 type SaveResultsContext struct {
@@ -39,6 +51,7 @@ type SaveResultsContext struct {
 	NodeId        int
 	SessionId     string
 }
+
 func NewSaveResultsContext(dbpool *pgxpool.Pool) *SaveResultsContext {
 	return &SaveResultsContext{dbpool: dbpool}
 }

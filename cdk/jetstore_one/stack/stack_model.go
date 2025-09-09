@@ -2,6 +2,7 @@ package stack
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"strings"
 
@@ -10,7 +11,7 @@ import (
 	"github.com/aws/aws-cdk-go/awscdk/v2/awsecs"
 	awselb "github.com/aws/aws-cdk-go/awscdk/v2/awselasticloadbalancingv2"
 	"github.com/aws/aws-cdk-go/awscdk/v2/awsiam"
-	"github.com/aws/aws-cdk-go/awscdk/v2/awslambda"
+	"github.com/aws/aws-cdk-go/awscdk/v2/awskms"
 	"github.com/aws/aws-cdk-go/awscdk/v2/awsrds"
 	"github.com/aws/aws-cdk-go/awscdk/v2/awss3"
 	awssm "github.com/aws/aws-cdk-go/awscdk/v2/awssecretsmanager"
@@ -29,7 +30,6 @@ type JetstoreOneStackProps struct {
 	SnsAlarmTopicArn             *string
 	NbrShards                    string
 	MaxConcurrency               float64
-	JetsApiUrl                   string
 }
 
 func (props *JetstoreOneStackProps) MkId(name string) *string {
@@ -52,7 +52,10 @@ type JetStoreStackComponents struct {
 	AdminPwdSecret      awssm.Secret
 	EncryptionKeySecret awssm.Secret
 
-	SourceBucket            awss3.IBucket
+	SourceBucket    awss3.IBucket
+	ExternalBuckets []awss3.IBucket
+	ExternalKmsKey  awskms.IKey
+
 	Vpc                     awsec2.Vpc
 	PublicSubnetSelection   *awsec2.SubnetSelection
 	PrivateSubnetSelection  *awsec2.SubnetSelection
@@ -79,18 +82,18 @@ type JetStoreStackComponents struct {
 	UiTaskContainer         awsecs.ContainerDefinition
 	EcsUiService            awsecs.FargateService
 
-	UiLoadBalancer      awselb.ApplicationLoadBalancer
-	ServiceLoadBalancer awselb.ApplicationLoadBalancer
-	ApiLoadBalancer     awselb.ApplicationLoadBalancer
+	UiLoadBalancer awselb.ApplicationLoadBalancer
 
 	StatusUpdateLambda        awslambdago.GoFunction
+	SecretRotationLambda      awslambdago.GoFunction
 	RunReportsLambda          awslambdago.GoFunction
+	CpipesRunReportsLambda    awslambdago.GoFunction
 	PurgeDataLambda           awslambdago.GoFunction
 	serverv2NodeLambda        awslambdago.GoFunction
 	CpipesNodeLambda          awslambdago.GoFunction
 	CpipesStartShardingLambda awslambdago.GoFunction
 	CpipesStartReducingLambda awslambdago.GoFunction
-	RegisterKeyLambda         awslambda.Function
+	RegisterKeyV2Lambda       awslambdago.GoFunction
 	SqsRegisterKeyLambda      awslambdago.GoFunction
 
 	LoaderSM    sfn.StateMachine
@@ -114,4 +117,47 @@ func GetS3StagePrefix() string {
 		return stage
 	}
 	return strings.Replace(os.Getenv("JETS_s3_INPUT_PREFIX"), "/input", "/stage", 1)
+}
+
+func GetS3SchemaTriggersPrefix() string {
+	prefix := os.Getenv("JETS_s3_SCHEMA_TRIGGERS")
+	if prefix != "" {
+		return prefix
+	}
+	return strings.Replace(os.Getenv("JETS_s3_INPUT_PREFIX"), "/input", "/schema_triggers", 1)
+}
+
+func (jsComp *JetStoreStackComponents) ResolveExternalBuckets(stack awscdk.Stack) {
+	externalBuckets := os.Getenv("EXTERNAL_BUCKETS")
+	if externalBuckets == "" {
+		return
+	}
+	bucketNames := strings.Split(externalBuckets, ",")
+	jsComp.ExternalBuckets = make([]awss3.IBucket, 0)
+	for i, bucketName := range bucketNames {
+		b := awss3.Bucket_FromBucketName(stack, jsii.String(fmt.Sprintf("ExternalBucket%d", i)), jsii.String(bucketName))
+		if b != nil {
+			jsComp.ExternalBuckets = append(jsComp.ExternalBuckets, b)
+			log.Printf("Resolved external bucket '%s'\n", *b.BucketArn())
+		} else {
+			log.Printf("WARNING: External bucket '%s' not found, skipping\n", bucketName)
+		}
+	}
+}
+
+func (jsComp *JetStoreStackComponents) ResolveExternalKmsKey(stack awscdk.Stack) {
+	kmsArn := os.Getenv("JETS_S3_KMS_KEY_ARN")
+	if len(kmsArn) > 0 {
+		// Provide the ability to use the kms key
+		jsComp.ExternalKmsKey = awskms.Key_FromKeyArn(stack, jsii.String("existingKmsKey"), jsii.String(kmsArn))
+	}
+}
+
+func (jsComp *JetStoreStackComponents) GrantReadWriteFromExternalBuckets(stack awscdk.Stack, identity awsiam.IGrantable) {
+	if jsComp.ExternalBuckets == nil {
+		return
+	}
+	for _, ibucket := range jsComp.ExternalBuckets {
+		ibucket.GrantReadWrite(identity, nil)
+	}
 }

@@ -2,7 +2,9 @@ package rdf
 
 import (
 	"errors"
+	"fmt"
 	"log"
+	"sort"
 )
 
 // RDFGraph is a fully indexed rdf graph with type (*Node, *Node, *Node)
@@ -41,6 +43,10 @@ func NewMetaRdfGraph(rootRm *ResourceManager) *RdfGraph {
 
 func (g *RdfGraph) Size() int {
 	return g.spoGraph.Size()
+}
+
+func (g *RdfGraph) IsLocked() bool {
+	return g.isLocked
 }
 
 func (g *RdfGraph) Contains(s, p, o *Node) bool {
@@ -189,4 +195,15 @@ func (g *RdfGraph) Retract(s, p, o *Node) (bool, error) {
 		g.CallbackMgr.TripleDeleted(s, p, o)
 	}
 	return erased, nil
+}
+
+func (g *RdfGraph) ToTriples() []string {
+	triples := make([]string, 0)
+	t3Itor := g.Find()
+	for t3 := range t3Itor.Itor {
+		triples = append(triples, fmt.Sprintf("(%s, %s, %s)", t3[0], t3[1], t3[2]))
+	}
+	t3Itor.Done()
+	sort.Slice(triples, func(i, j int) bool { return triples[i] < triples[j] })
+	return triples
 }
