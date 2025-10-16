@@ -245,7 +245,7 @@ func (ri *ReteInputContext) assertInputTextRecord(reteSession *bridgego.ReteSess
 	v, _ = reteSession.NewTextLiteral(aJetRow.processInput.organization)
 	reteSession.Insert(subject, ri.jets__org, v)
 	// Set the column name to pos according to aJetRow.processInput
-	ri.cleansingFunctionContext = ri.cleansingFunctionContext.With(aJetRow.processInput.inputColumnName2Pos)
+	ri.cleansingFunctionContext = ri.cleansingFunctionContext.With(&aJetRow.processInput.inputColumnName2Pos)
 	// Assert domain columns of the row
 	for icol := 0; icol < ncol; icol++ {
 		// asserting input row with mapping spec
@@ -259,8 +259,8 @@ func (ri *ReteInputContext) assertInputTextRecord(reteSession *bridgego.ReteSess
 			if inputColumnSpec.functionName.Valid {
 				// Apply cleansing function
 				obj, errMsg =
-					ri.cleansingFunctionContext.ApplyCleasingFunction(&inputColumnSpec.functionName.String,
-						&inputColumnSpec.argument.String, &row[icol].String, icol, &aJetRow.rowData)
+					ri.cleansingFunctionContext.ApplyCleasingFunction(inputColumnSpec.functionName.String,
+						inputColumnSpec.argument.String, row[icol].String, icol, &aJetRow.rowData)
 			} else {
 				if len(row[icol].String) > 0 {
 					obj = row[icol].String

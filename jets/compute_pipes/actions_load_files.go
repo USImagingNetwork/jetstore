@@ -3,18 +3,18 @@ package compute_pipes
 import (
 	"bufio"
 	"context"
-	"encoding/csv"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"runtime/debug"
-	"strconv"
+	"slices"
 	"strings"
 	"time"
 
-	goparquet "github.com/fraugster/parquet-go"
+	"github.com/artisoft-io/jetstore/jets/csv"
 	"github.com/golang/snappy"
 	"github.com/jackc/pgx/v4/pgxpool"
 )
@@ -25,11 +25,18 @@ var (
 	ComputePipesStart = time.Now()
 )
 
+type ReaderAtSeeker interface {
+	io.Reader
+	io.ReaderAt
+	io.Seeker
+}
+
 func (cpCtx *ComputePipesContext) LoadFiles(ctx context.Context, dbpool *pgxpool.Pool) (err error) {
 
 	// Create a channel to use as a buffer between the file loader and the copy to db
 	// This gives the opportunity to use Compute Pipes to transform the data before writing to the db
-	computePipesInputCh := make(chan []interface{}, 10)
+	computePipesInputCh := make(chan []any, 5)
+	var inputSchemaCh chan ParquetSchemaInfo
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -39,476 +46,596 @@ func (cpCtx *ComputePipesContext) LoadFiles(ctx context.Context, dbpool *pgxpool
 			err = errors.New(buf.String())
 			log.Println(err)
 		}
+		if inputSchemaCh != nil {
+			close(inputSchemaCh)
+			inputSchemaCh = nil
+		}
 		close(computePipesInputCh)
 		close(cpCtx.ChResults.LoadFromS3FilesResultCh)
+		if err != nil {
+			log.Printf("LoadFile: terminating with err %v, closing done channel\n", err)
+			cpCtx.ErrCh <- err
+			// Avoid closing a closed channel
+			select {
+			case <-cpCtx.Done:
+				log.Println("LoadFile: done channel already closed")
+			default:
+				close(cpCtx.Done)
+			}
+		}
 	}()
 
+	inputChannelConfig := &cpCtx.CpConfig.PipesConfig[0].InputChannel
+	inputFormat := inputChannelConfig.Format
+	sp := cpCtx.SchemaManager.GetSchemaProvider(inputChannelConfig.SchemaProvider)
+	if strings.HasPrefix(inputFormat, "parquet") && cpCtx.CpConfig.CommonRuntimeArgs.CpipesMode == "sharding" {
+		// Save the parquet schema
+		inputSchemaCh = make(chan ParquetSchemaInfo, 1)
+	}
+	var mainInputDomainClass string
+	if inputChannelConfig.Name == "input_row" {
+		mainInputDomainClass = cpCtx.CpConfig.CommonRuntimeArgs.SourcesConfig.MainInput.DomainClass
+	} else {
+		channelInfo := GetChannelSpec(cpCtx.CpConfig.Channels, inputChannelConfig.Name)
+		if channelInfo == nil {
+			log.Panicf("unexpected error: Channel info not found for channel '%s'", inputChannelConfig.Name)
+		}
+		mainInputDomainClass = channelInfo.ClassName
+	}
+
+	// Prepare the S3DeviceManager
+	err = cpCtx.NewS3DeviceManager()
+	if err != nil {
+		return
+	}
+
 	// Start the Compute Pipes async
-	go cpCtx.StartComputePipes(dbpool, computePipesInputCh)
+	go cpCtx.StartComputePipes(dbpool, inputSchemaCh, computePipesInputCh)
+
+	// Start BadRow Channel if configured
+	var badRowChannel *BadRowsChannel
+	if inputChannelConfig.BadRowsConfig != nil {
+		// s3 partitioning, write the partition files in the JetStore's stage path defined by the env var JETS_s3_STAGE_PREFIX
+		// baseOutputPath structure is: <JETS_s3_STAGE_PREFIX>/process_name=QcProcess/session_id=123456789/step_id=reduce01/jets_partition=22p/
+		// NOTE: All partitions for bad rows are written to partion '0p' so we can use merge_files operator
+		//       (otherwise use cpCtx.JetsPartitionLabel so save in current partition)
+		baseOutputPath := fmt.Sprintf("%s/process_name=%s/session_id=%s/step_id=%s/jets_partition=%s",
+			jetsS3StagePrefix, cpCtx.ProcessName, cpCtx.SessionId, inputChannelConfig.BadRowsConfig.BadRowsStepId, "0p")
+
+		badRowChannel = NewBadRowChannel(cpCtx.S3DeviceMgr, baseOutputPath,
+			cpCtx.Done, cpCtx.ErrCh)
+		defer badRowChannel.Done()
+		go badRowChannel.Write(cpCtx.NodeId)
+	}
 
 	// Load the files
-	var count, totalRowCount int64
-	inputFormat := cpCtx.CpConfig.CommonRuntimeArgs.SourcesConfig.MainInput.InputFormat
-	compression := cpCtx.CpConfig.CommonRuntimeArgs.SourcesConfig.MainInput.Compression
-	shardOffset := cpCtx.CpConfig.ClusterConfig.ShardOffset
-	schemaProvider := cpCtx.CpConfig.CommonRuntimeArgs.SourcesConfig.MainInput.SchemaProvider
-	for localInFile := range cpCtx.FileNamesCh {
-		if cpCtx.CpConfig.ClusterConfig.IsDebugMode {
-			// log.Printf("%s node %d Loading file '%s'", cpCtx.SessionId, cpCtx.NodeId, localInFile.InFileKeyInfo.key)
-		}
-		switch inputFormat {
-		case "csv", "headerless_csv":
-			count, err = cpCtx.ReadCsvFile(&localInFile, inputFormat, compression, shardOffset, schemaProvider, computePipesInputCh)
-		case "parquet", "parquet_select":
-			count, err = cpCtx.ReadParquetFile(&localInFile, computePipesInputCh)
-		case "fixed_width":
-			count, err = cpCtx.ReadFixedWidthFile(&localInFile, shardOffset, schemaProvider, computePipesInputCh)
-		default:
-			log.Println(cpCtx.SessionId, "node", cpCtx.NodeId, "error: unsupported file format: %s", inputFormat)
-			cpCtx.ChResults.LoadFromS3FilesResultCh <- LoadFromS3FilesResult{LoadRowCount: totalRowCount, BadRowCount: 0, Err: err}
-			return
-		}
-		totalRowCount += count
+	var castToRdfTxtTypeFncs []CastToRdfTxtFnc
+	if len(mainInputDomainClass) > 0 {
+		castToRdfTxtTypeFncs, err = BuildCastToRdfTxtFunctions(mainInputDomainClass,
+			cpCtx.CpConfig.CommonRuntimeArgs.SourcesConfig.MainInput.InputColumns)
 		if err != nil {
-			log.Println(cpCtx.SessionId, "node", cpCtx.NodeId, "loadFile2Db returned error", err)
-			cpCtx.ChResults.LoadFromS3FilesResultCh <- LoadFromS3FilesResult{LoadRowCount: totalRowCount, BadRowCount: 0, Err: err}
+			cpCtx.ChResults.LoadFromS3FilesResultCh <- LoadFromS3FilesResult{LoadRowCount: 0, BadRowCount: 0, Err: err}
 			return
 		}
 	}
-	cpCtx.ChResults.LoadFromS3FilesResultCh <- LoadFromS3FilesResult{LoadRowCount: totalRowCount, BadRowCount: 0}
+
+	// Get the FixedWidthEncodingInfo from the schema provider in case it is modified
+	// downstream (aka anonymize operator)
+	var fwEncodingInfo *FixedWidthEncodingInfo
+	if sp != nil {
+		fwEncodingInfo = sp.FixedWidthEncodingInfo()
+	}
+
+	samplingMaxCount := int64(inputChannelConfig.SamplingMaxCount)
+	readBatchSize := inputChannelConfig.ReadBatchSize
+	var count, totalRowCount int64
+	var badRowcount, totalBadRowCount int64
+	gotMaxRecordCount := false
+	for localInFile := range cpCtx.FileNamesCh {
+		if gotMaxRecordCount {
+			// Don't read more records
+			os.Remove(localInFile.LocalFileName)
+			continue
+		}
+		if cpCtx.CpConfig.ClusterConfig.IsDebugMode {
+			log.Printf("%s node %d Loading file '%s'", cpCtx.SessionId, cpCtx.NodeId, localInFile.InFileKeyInfo.key)
+		}
+		// Encapsulte the switch so to factor out file handling
+		err = func() (err error) {
+			fileHd, err := os.Open(localInFile.LocalFileName)
+			if err != nil {
+				return fmt.Errorf("while opening temp file '%s' (LoadFiles): %v", localInFile.LocalFileName, err)
+			}
+			defer func() {
+				fileHd.Close()
+				os.Remove(localInFile.LocalFileName)
+			}()
+
+			switch inputFormat {
+			//*TODO Read xlsx files
+			case "csv", "headerless_csv":
+				count, badRowcount, err = cpCtx.ReadCsvFile(
+					&localInFile, fileHd, castToRdfTxtTypeFncs, computePipesInputCh, badRowChannel)
+
+			case "parquet", "parquet_select":
+				count, err = cpCtx.ReadParquetFileV2(
+					&localInFile, fileHd, readBatchSize, castToRdfTxtTypeFncs, inputSchemaCh, computePipesInputCh)
+				if inputSchemaCh != nil {
+					close(inputSchemaCh)
+					inputSchemaCh = nil
+				}
+				badRowcount = 0
+
+			case "fixed_width":
+				count, badRowcount, err = cpCtx.ReadFixedWidthFile(
+					&localInFile, fileHd, fwEncodingInfo, castToRdfTxtTypeFncs, computePipesInputCh, badRowChannel)
+
+			default:
+				err = fmt.Errorf("%s node %d, error: unsupported file format: %s", cpCtx.SessionId, cpCtx.NodeId, inputFormat)
+				log.Println(err)
+				cpCtx.ChResults.LoadFromS3FilesResultCh <- LoadFromS3FilesResult{LoadRowCount: totalRowCount, BadRowCount: totalBadRowCount, Err: err}
+				return
+			}
+			return
+		}()
+		totalRowCount += count
+		totalBadRowCount += badRowcount
+		if err != nil {
+			log.Println(cpCtx.SessionId, "node", cpCtx.NodeId, "LoadFile returned error", err)
+			cpCtx.ChResults.LoadFromS3FilesResultCh <- LoadFromS3FilesResult{LoadRowCount: totalRowCount, BadRowCount: totalBadRowCount, Err: err}
+			return
+		}
+		if samplingMaxCount > 0 && totalRowCount >= samplingMaxCount {
+			gotMaxRecordCount = true
+		}
+	}
+	cpCtx.ChResults.LoadFromS3FilesResultCh <- LoadFromS3FilesResult{LoadRowCount: totalRowCount, BadRowCount: totalBadRowCount}
 	return
 }
 
-func (cpCtx *ComputePipesContext) ReadParquetFile(filePath *FileName, computePipesInputCh chan<- []interface{}) (int64, error) {
-	var fileHd *os.File
-	var parquetReader *goparquet.FileReader
-	var err error
-	samplingRate := cpCtx.CpConfig.PipesConfig[0].InputChannel.SamplingRate
-	samplingMaxCount := cpCtx.CpConfig.PipesConfig[0].InputChannel.SamplingMaxCount
-
-	fileHd, err = os.Open(filePath.LocalFileName)
-	if err != nil {
-		return 0, fmt.Errorf("while opening temp file '%s' (loadFiles): %v", filePath.LocalFileName, err)
+func checkIncorrectDelimiter(singleColumnCount, inputRowCount int64, delimiter rune) (err error) {
+	if float64(singleColumnCount) > 0.9*float64(inputRowCount) {
+		// Got a single column while expecting multiple, must have invalid delimiter
+		err = fmt.Errorf("error: got single column row while expecting file with multiple columns, is the delimiter '%s' the correct one?", string(delimiter))
+		log.Println(err.Error())
 	}
-	defer func() {
-		fileHd.Close()
-		os.Remove(filePath.LocalFileName)
-	}()
-
-	// log.Println("**!@@",cpCtx.SessionId,"partfile_key_component GOT",len(cpCtx.PartFileKeyComponents))
-	nbrColumns := len(cpCtx.CpConfig.CommonRuntimeArgs.SourcesConfig.MainInput.InputColumns)
-	inputColumns := cpCtx.CpConfig.CommonRuntimeArgs.SourcesConfig.MainInput.InputColumns[:nbrColumns-len(cpCtx.PartFileKeyComponents)]
-	parquetReader, err = goparquet.NewFileReader(fileHd, inputColumns...)
-	if err != nil {
-		return 0, err
-	}
-	// Prepare the extended columns from partfile_key_component
-	var extColumns []string
-	if len(cpCtx.PartFileKeyComponents) > 0 {
-		extColumns = make([]string, len(cpCtx.PartFileKeyComponents))
-		for i := range cpCtx.PartFileKeyComponents {
-			result := cpCtx.PartFileKeyComponents[i].Regex.FindStringSubmatch(filePath.InFileKeyInfo.key)
-			if len(result) > 0 {
-				extColumns[i] = result[1]
-			}
-		}
-	}
-
-	var inputRowCount int64
-	var record []interface{}
-	isShardingMode := cpCtx.CpConfig.CommonRuntimeArgs.CpipesMode == "sharding"
-	for {
-		// read and put the rows into computePipesInputCh
-		err = nil
-		var parquetRow map[string]interface{}
-		parquetRow, err = parquetReader.NextRow()
-		if err == nil {
-			cpCtx.SamplingCount += 1
-			if samplingRate > 0 && cpCtx.SamplingCount < samplingRate {
-				continue
-			}
-			if samplingMaxCount > 0 && inputRowCount >= int64(samplingMaxCount) {
-				continue
-			}
-			cpCtx.SamplingCount = 0
-			record = make([]interface{}, nbrColumns)
-			for i := range inputColumns {
-				rawValue := parquetRow[inputColumns[i]]
-				if isShardingMode {
-					if rawValue != nil {
-						// Read all fields as string
-						switch vv := rawValue.(type) {
-						case string:
-							if len(vv) > 0 {
-								record[i] = vv
-							}
-						case []byte:
-							if len(vv) > 0 {
-								record[i] = string(vv)
-							}
-						case int:
-							record[i] = strconv.Itoa(vv)
-						case int32:
-							record[i] = strconv.FormatInt(int64(vv), 10)
-						case int64:
-							record[i] = strconv.FormatInt(vv, 10)
-						case float64:
-							record[i] = strconv.FormatFloat(vv, 'G', -1, 64)
-						case float32:
-							record[i] = strconv.FormatFloat(float64(vv), 'G', -1, 32)
-						case bool:
-							if vv {
-								record[i] = "1"
-							} else {
-								record[i] = "0"
-							}
-						default:
-							record[i] = fmt.Sprintf("%v", rawValue)
-						}
-					}
-				} else {
-					// Read fields and preserve their types
-					// NOTES: Dates are saved as strings, must be converted to dates as needed downstream
-					switch vv := rawValue.(type) {
-					case []byte:
-						record[i] = string(vv)
-					case float32:
-						record[i] = float64(vv)
-					default:
-						record[i] = vv
-					}
-				}
-			}
-			// Add the columns from the partfile_key_component
-			if len(extColumns) > 0 {
-				offset := len(inputColumns)
-				// log.Println("**!@@",cpCtx.SessionId,"partfile_key_component GOT[0]",cpCtx.PartFileKeyComponents[0].ColumnName,"offset",offset,"InputColumn",cpCtx.InputColumns[offset])
-				for i := range extColumns {
-					record[offset+i] = extColumns[i]
-				}
-			}
-		}
-
-		// Kill Switch - prevent lambda timeout
-		if cpCtx.CpConfig.ClusterConfig.KillSwitchMin > 0 &&
-			time.Since(ComputePipesStart).Minutes() >= float64(cpCtx.CpConfig.ClusterConfig.KillSwitchMin) {
-			return inputRowCount, ErrKillSwitch
-		}
-
-		switch {
-		case err == io.EOF:
-			// expected exit route
-			// ---------------------------------------------------
-			return inputRowCount, nil
-
-		case err != nil:
-			return 0, fmt.Errorf("error while reading input records (ReadParquetFile): %v", err)
-
-		default:
-			// // Remove invalid utf-8 sequence from input record
-			// for i := range record {
-			// 	record[i] = strings.ToValidUTF8(record[i], "")
-			// }
-			// log.Println(cpCtx.SessionId,"node",cpCtx.NodeId, "push record to computePipesInputCh with",len(record),"columns")
-			select {
-			case computePipesInputCh <- record:
-			case <-cpCtx.Done:
-				log.Println(cpCtx.SessionId, "node", cpCtx.NodeId, "loading input row from file interrupted")
-				return inputRowCount, nil
-			}
-			inputRowCount += 1
-		}
-	}
+	return
 }
 
-func (cpCtx *ComputePipesContext) ReadCsvFile(filePath *FileName,
-	inputFormat, compression string, shardOffset int, schemaProvider string,
-	computePipesInputCh chan<- []interface{}) (int64, error) {
+func (cpCtx *ComputePipesContext) ReadCsvFile(
+	filePath *FileName, fileReader ReaderAtSeeker, castToRdfTxtTypeFncs []CastToRdfTxtFnc,
+	computePipesInputCh chan<- []any, badRowChannel *BadRowsChannel) (int64, int64, error) {
 
-	var fileHd *os.File
 	var csvReader *csv.Reader
 	var err error
-	samplingRate := cpCtx.CpConfig.PipesConfig[0].InputChannel.SamplingRate
-	samplingMaxCount := cpCtx.CpConfig.PipesConfig[0].InputChannel.SamplingMaxCount
+	inputChannelConfig := cpCtx.CpConfig.PipesConfig[0].InputChannel
+	samplingRate := inputChannelConfig.SamplingRate
+	samplingMaxCount := int64(inputChannelConfig.SamplingMaxCount)
+	inputFormat := inputChannelConfig.Format
+	shardOffset := cpCtx.CpConfig.ClusterConfig.ShardOffset
+	multiColumns := inputChannelConfig.MultiColumnsInput
 
-	fileHd, err = os.Open(filePath.LocalFileName)
-	if err != nil {
-		return 0, fmt.Errorf("while opening temp file '%s' (ReadCsvFile): %v", filePath.LocalFileName, err)
-	}
-	defer func() {
-		fileHd.Close()
-		os.Remove(filePath.LocalFileName)
-	}()
-
-	// log.Println("**!@@",cpCtx.SessionId,"partfile_key_component GOT",len(cpCtx.PartFileKeyComponents))
-	nbrColumns := len(cpCtx.CpConfig.CommonRuntimeArgs.SourcesConfig.MainInput.InputColumns)
-	var inputColumns []string
 	var extColumns []string
+	var enforceRowMinLength, enforceRowMaxLength bool
+	var expectedNbrColumnsInFile int
+	// Get the encoding and csv delimiter (from the schema provider), if delimiter is not specified assume it's ',' for reducing
+	encoding := inputChannelConfig.Encoding
+	noQuote := inputChannelConfig.NoQuotes
+	delimiter := inputChannelConfig.Delimiter
+	var eolByte byte
+	compression := inputChannelConfig.Compression
+	log.Printf("ReadCsvFile: got delimiter '%v' or '%s', encoding '%s', noQuote '%v', multiColumns? %v\n", delimiter, string(delimiter), encoding, noQuote, multiColumns)
+
 	switch cpCtx.CpConfig.CommonRuntimeArgs.CpipesMode {
 	case "sharding":
-		// input columns include the partfile_key_component
-		inputColumns =
-			cpCtx.CpConfig.CommonRuntimeArgs.SourcesConfig.MainInput.InputColumns[:nbrColumns-len(cpCtx.PartFileKeyComponents)]
 		// Prepare the extended columns from partfile_key_component
 		if len(cpCtx.PartFileKeyComponents) > 0 {
 			extColumns = make([]string, len(cpCtx.PartFileKeyComponents))
 			for i := range cpCtx.PartFileKeyComponents {
 				result := cpCtx.PartFileKeyComponents[i].Regex.FindStringSubmatch(filePath.InFileKeyInfo.key)
-				if len(result) > 0 {
+				if len(result) > 1 {
 					extColumns[i] = result[1]
 				}
 			}
 		}
+		// Check if we enforce the row length - done only at sharding step
+		enforceRowMinLength = inputChannelConfig.EnforceRowMinLength
+		enforceRowMaxLength = inputChannelConfig.EnforceRowMaxLength
+		// Determine the expected row length comming from file (i.e. excluding part file key component and added
+		// columns on input_row channel)
+		expectedNbrColumnsInFile = len(cpCtx.CpConfig.CommonRuntimeArgs.SourcesConfig.MainInput.InputColumns) -
+			len(cpCtx.AddionalInputHeaders) - len(cpCtx.PartFileKeyComponents)
+		eolByte = inputChannelConfig.EolByte
 	case "reducing":
-		inputColumns = cpCtx.CpConfig.CommonRuntimeArgs.SourcesConfig.MainInput.InputColumns
-	default:
-		return 0, fmt.Errorf("error: unknown cpipes mode in ReadCsvFile: %s", cpCtx.CpConfig.CommonRuntimeArgs.CpipesMode)
+		// Bad Rows are identified during the sharding phase only
+		badRowChannel = nil
 	}
-	// Get the csv delimiter from the schema provider, if no schema provider exist assume it's ','
-	var sepFlag rune = ','
-	var sp SchemaProvider
-	if len(schemaProvider) > 0 {
-		sp = cpCtx.SchemaManager.GetSchemaProvider(schemaProvider)
-		if sp != nil {
-			sepFlag = sp.Delimiter()
-		}
-	}
+	// log.Printf("*** ReadCsvFile: read file from %d to %d of file size %d\n", filePath.InFileKeyInfo.start, filePath.InFileKeyInfo.end, filePath.InFileKeyInfo.size)
 
 	switch compression {
-	case "none":
+
+	case "none", "":
 		// CHECK FOR OFFSET POSITIONING
 		if filePath.InFileKeyInfo.start > 0 && shardOffset > 0 {
+			beOffset := 0
+			if strings.Contains(encoding, "BE") {
+				beOffset = -1
+			}
 			buf := make([]byte, shardOffset)
-			n, err := fileHd.Read(buf)
-			if n != shardOffset || err != nil {
-				return 0, fmt.Errorf("error while reading shard offset bytes in ReadCsvFile: %v", err)
+			n, err := fileReader.Read(buf)
+			if n == 0 || err != nil {
+				return 0, 0, fmt.Errorf("error while reading shard offset bytes in ReadCsvFile, got %d bytes, expecting %d: %v",
+					n, shardOffset, err)
 			}
-			str := string(buf)
-			// if str ends with '\n', remove the last one
-			if strings.HasSuffix(str, "\n") {
-				str = str[:n-1]
+			if buf[n-1] == '\n' {
+				// log.Printf("*** removed the last \\n!!")
+				buf = buf[:n-1]
+			} else {
+				buf = buf[:n]
 			}
-			l := strings.LastIndex(str, "\n")
+			// log.Printf("*** OFFSET POSITIONING buf resized to %d\n", len(buf))
+			// Get to the last \n
+			l := LastIndexByte(buf, '\n')
 			if l < 0 {
-				return 0, fmt.Errorf("error: could not find end of previous record in ReadCsvFile: key %s", filePath.InFileKeyInfo.key)
+				return 0, 0, fmt.Errorf("error: could not find end of previous record in ReadCsvFile: key %s", filePath.InFileKeyInfo.key)
 			}
 			// seek to first character after the last '\n'
-			_, err = fileHd.Seek(int64(l+1), 0)
+			// log.Printf("*** OFFSET POSITIONING SEEKING to pos %d\n", l+beOffset)
+			_, err = fileReader.Seek(int64(l+beOffset), 0)
 			if err != nil {
-				return 0, fmt.Errorf("error while seeking to start of shard in ReadCsvFile: %v", err)
+				return 0, 0, fmt.Errorf("error while seeking to start of shard in ReadCsvFile: %v", err)
 			}
 		}
-		csvReader = csv.NewReader(fileHd)
+
+		utfReader, err := WrapReaderWithDecoder(fileReader, encoding)
+		if err != nil {
+			return 0, 0, fmt.Errorf("while2 WrapReaderWithDecoder for encoding '%s': %v", encoding, err)
+		}
+		csvReader = csv.NewReader(utfReader)
+
 	case "snappy":
 		// No support for sharding on read when compressed.
-		csvReader = csv.NewReader(snappy.NewReader(fileHd))
+		utfReader, err := WrapReaderWithDecoder(snappy.NewReader(fileReader), encoding)
+		if err != nil {
+			return 0, 0, fmt.Errorf("while3 WrapReaderWithDecoder for encoding '%s': %v", encoding, err)
+		}
+		csvReader = csv.NewReader(utfReader)
 	default:
-		return 0, fmt.Errorf("error: unknown compression in ReadCsvFile: %s", compression)
+		return 0, 0, fmt.Errorf("error: unknown compression in ReadCsvFile: %s", compression)
 	}
-	// csvReader.ReuseRecord = true
-	csvReader.Comma = sepFlag
+	csvReader.Comma = delimiter
+	csvReader.NoQuotes = noQuote
+	if eolByte > 0 {
+		csvReader.EolByte = eolByte
+	}
+	// Defaults for LazyQuotes and VariableFieldsPerRecord is false, from inputChannelConfig
+	csvReader.LazyQuotes = inputChannelConfig.UseLazyQuotes
+	csvReader.LazyQuotesSpecial = inputChannelConfig.UseLazyQuotesSpecial
+	if inputChannelConfig.VariableFieldsPerRecord {
+		csvReader.FieldsPerRecord = -1
+	}
+	if badRowChannel != nil {
+		// Keeps the raw records, this is used when having a bad row
+		csvReader.KeepRawRecord = true
+	}
+	var headers []string
 	if inputFormat == "csv" && filePath.InFileKeyInfo.start == 0 {
 		// skip header row (first row)
-		_, err = csvReader.Read()
+		headers, err = csvReader.Read()
+		// log.Printf("*** ReadCsvFile: skip header row using delimiter %d: %v (%d headers), err?: %v\n", csvReader.Comma, headers, len(headers), err)
+		// b, _ := json.Marshal(string(csvReader.LastRawRecord()))
+		// log.Printf("*** ReadCsvFile: header from LastRawRecord as json: %v\n", string(b))
 		switch {
 		case err == io.EOF: // empty file
-			return 0, nil
-
+			return 0, 0, nil
 		case err != nil:
-			return 0, fmt.Errorf("error while reading input record header line (ReadCsvFile): %v", err)
+			err = fmt.Errorf("while reading input record header line (ReadCsvFile): %v", err)
+			b, _ := json.Marshal(string(csvReader.LastRawRecord()))
+			log.Printf("%v: raw record as json string:\n%s", err, string(b))
+			return 0, 0, err
 		}
 	}
 
-	var inputRowCount int64
+	var inputRowCount, badRowCount, singleColumnCount int64
 	var nextInRow, inRow []string
-	var record []interface{}
+	var rawNextInRow []byte
+	var nextInRowErr error
+	var value any
+	var record []any
+
+	// Determine if trim the columns
+	trimColumns := false
+	if cpCtx.CpConfig.CommonRuntimeArgs.CpipesMode == "sharding" {
+		trimColumns = inputChannelConfig.TrimColumns
+	}
+
 	// CHECK FOR OFFSET POSITIONING -- check if we drop the last record
 	dropLastRow := false
 	if filePath.InFileKeyInfo.end > 0 && filePath.InFileKeyInfo.end < filePath.InFileKeyInfo.size {
 		dropLastRow = true
 		// Read first record
 		inRow, err = csvReader.Read()
+		// log.Printf("*** Read First Row -dropLast contains %d columns, err?: %v\n", len(inRow), err)
 		switch {
 		case err == io.EOF: // empty file
-			return 0, nil
+			return 0, 0, nil
 		case err != nil:
-			return 0, fmt.Errorf("error while reading first input record (ReadCsvFile): %v", err)
+			// Not expected to have a partial record as first row when ShardSizeMb and ShardMaxSizeMb is properly set
+			return 0, 0, fmt.Errorf("error while reading first input record (ReadCsvFile), got %d fields in records with %d headers: %v",
+				len(inRow), len(headers), err)
 		}
-		// log.Println("**First Row -dropLast", inRow)
 	}
-	// Determine if trim the columns
-	trimColumns := false
-	if cpCtx.CpConfig.CommonRuntimeArgs.CpipesMode == "sharding" && sp != nil {
-		trimColumns = sp.TrimColumns()
-	}
-	lastLineFlag := false
 	for {
 		// read and put the rows into computePipesInputCh
 		if dropLastRow {
 			nextInRow, err = csvReader.Read()
-			// log.Println("**Next Row -dropLast", nextInRow, "err:", err)
-			if errors.Is(err, csv.ErrFieldCount) && !lastLineFlag {
-				// Got a partial read, the next read will give the io.EOF
+			if err != io.EOF && multiColumns && len(nextInRow) < 2 {
+				singleColumnCount++
+			}
+			// log.Printf("***Read Next Row -dropLast, err?: %v\n", err)
+			switch {
+			case err == io.EOF:
+				// exit route when droping last row or when use VariableFieldsPerRecord or UseLazyQuotes
+				err = checkIncorrectDelimiter(singleColumnCount, inputRowCount, delimiter)
+				return inputRowCount, badRowCount, err
+			case (errors.Is(err, csv.ErrFieldCount) || errors.Is(err, csv.ErrQuote) || errors.Is(err, csv.ErrBareQuote)) && nextInRowErr == nil:
+				nextInRowErr = err
+				rawNextInRow = slices.Clone(csvReader.LastRawRecord())
 				err = nil
-				lastLineFlag = true
+				// Next read should give io.EOF, otherwise nextInRow is a bad row
+				// log.Printf("***Next read should give io.EOF\n")
+			case nextInRowErr != nil ||
+				(enforceRowMinLength && len(nextInRow) < expectedNbrColumnsInFile) ||
+				(enforceRowMaxLength && len(nextInRow) > expectedNbrColumnsInFile):
+				// Was expecting io.EOF but got another read or is not of expected length, nextInRow is a bad row
+				if badRowChannel != nil {
+					select {
+					case badRowChannel.OutputCh <- rawNextInRow:
+					case <-cpCtx.Done:
+						log.Println("Sending bad input row interrupted")
+						return inputRowCount, badRowCount, nil
+					}
+					badRowCount += 1
+				} else {
+					if nextInRowErr == nil {
+						nextInRowErr = fmt.Errorf("error: row length is %d, expected is %d, length is enforced", len(nextInRow), expectedNbrColumnsInFile)
+					}
+					return inputRowCount, badRowCount + 1,
+						fmt.Errorf("while reading input records (ReadCsvFile): %v", nextInRowErr)
+				}
+				nextInRowErr = err
+				inRow = nextInRow
+				if err != nil {
+					// May have got the last row (partial read)
+					rawNextInRow = slices.Clone(csvReader.LastRawRecord())
+					err = nil
+					// Next read should give io.EOF, otherwise nextInRow is a bad row
+				}
+				continue
+			case err != nil:
+				// Got unexpected error - err out
+				return inputRowCount, badRowCount,
+					fmt.Errorf("unexpected error while reading input records (ReadCsvFile): %v", err)
 			}
 		} else {
+
 			inRow, err = csvReader.Read()
-			// log.Println("**Row", inRow)
-		}
-		if err == nil && inputRowCount > 0 && samplingRate > 0 {
-			cpCtx.SamplingCount += 1
-			if inputRowCount > 0 && samplingRate > 0 && cpCtx.SamplingCount < samplingRate {
-				continue
+			if err != io.EOF && multiColumns && len(inRow) < 2 {
+				singleColumnCount++
 			}
-			if samplingMaxCount > 0 && inputRowCount >= int64(samplingMaxCount) {
-				continue
-			}
-		}
-		if err == nil {
-			// log.Println("** Processing inRow", inRow)
-			cpCtx.SamplingCount = 0
-			record = make([]interface{}, nbrColumns)
-			for i := range inputColumns {
-				if len(inRow[i]) == 0 {
-					record[i] = nil
+			switch {
+			case err == io.EOF:
+				// expected exit route when not droping the last row
+				err = checkIncorrectDelimiter(singleColumnCount, inputRowCount, delimiter)
+				return inputRowCount, badRowCount, err
+
+			case errors.Is(err, csv.ErrFieldCount) || errors.Is(err, csv.ErrQuote) || errors.Is(err, csv.ErrBareQuote) ||
+				(enforceRowMinLength && len(inRow) < expectedNbrColumnsInFile) ||
+				(enforceRowMaxLength && len(inRow) > expectedNbrColumnsInFile):
+				// Got a bad row or row is not of expected length and length is enforced
+				if badRowChannel != nil {
+					select {
+					case badRowChannel.OutputCh <- slices.Clone(csvReader.LastRawRecord()):
+					case <-cpCtx.Done:
+						log.Println("Sending bad input row interrupted (ReadCsvFile-2)")
+						return inputRowCount, badRowCount, nil
+					}
+					badRowCount += 1
 				} else {
-					if trimColumns {
-						record[i] = strings.TrimSpace(inRow[i])
-					} else {
-						record[i] = inRow[i]
+					if err == nil {
+						err = fmt.Errorf("error: got a bad row or row is not of expected length and length is enforced")
+					}
+					return inputRowCount, badRowCount + 1,
+						fmt.Errorf("while reading input records (ReadCsvFile-2): %v", err)
+				}
+				// Read next row
+				err = nil
+				continue
+
+			case err != nil:
+				// Got unexpected error - err out
+				return inputRowCount, badRowCount,
+					fmt.Errorf("unexpected error while reading input records (ReadCsvFile-2): %v", err)
+			}
+		}
+		if inputRowCount > 0 {
+			if samplingRate > 0 {
+				cpCtx.SamplingCount += 1
+				if cpCtx.SamplingCount < samplingRate {
+					continue
+				}
+			}
+			if samplingMaxCount > 0 && inputRowCount >= samplingMaxCount {
+				// No need to continue, reach max sampling count
+				err = checkIncorrectDelimiter(singleColumnCount, inputRowCount, delimiter)
+				return inputRowCount, badRowCount, err
+			}
+		}
+		cpCtx.SamplingCount = 0
+		// log.Println("*** CSV.READ:", inRow)
+		record = make([]any, 0, len(inRow)+len(extColumns))
+		var errCol error
+		for i := range inRow {
+			if trimColumns {
+				inRow[i] = strings.TrimSpace(inRow[i])
+			}
+			value = inRow[i]
+			if len(inRow[i]) == 0 {
+				value = nil
+			} else {
+				if castToRdfTxtTypeFncs != nil && castToRdfTxtTypeFncs[i] != nil {
+					value, errCol = castToRdfTxtTypeFncs[i](inRow[i])
+					if errCol != nil {
+						// Got a bad conversion, make it a bad row? - need to capture the error message...
+						// This is not expected since the cast function are based on the expected data type
+						return 0, 0, fmt.Errorf("error while applying castToRdfTxtTypeFncs (ReadCsvFile): %v", err)
 					}
 				}
 			}
-			// Add the columns from the partfile_key_component
-			if len(extColumns) > 0 {
-				offset := len(inputColumns)
-				// log.Println("**!@@",cpCtx.SessionId,"partfile_key_component GOT[0]",cpCtx.PartFileKeyComponents[0].ColumnName,"offset",offset,"InputColumn",cpCtx.InputColumns[offset])
-				for i := range extColumns {
-					record[offset+i] = extColumns[i]
-				}
-			}
-			inRow = nextInRow
+			record = append(record, value)
 		}
+		// Add the columns from the partfile_key_component
+		if len(extColumns) > 0 {
+			// log.Println("**!@@",cpCtx.SessionId,"partfile_key_component GOT[0]",cpCtx.PartFileKeyComponents[0].ColumnName,"offset",offset,"InputColumn",cpCtx.InputColumns[offset])
+			for i := range extColumns {
+				record = append(record, extColumns[i])
+			}
+		}
+		// log.Println("*** Casted to RDF TYPE:", record)
+		// Add placeholders for the additional input headers/columns
+		if len(cpCtx.AddionalInputHeaders) > 0 {
+			for range cpCtx.AddionalInputHeaders {
+				record = append(record, nil)
+			}
+		}
+		inRow = nextInRow
 
 		// Kill Switch - prevent lambda timeout
 		if cpCtx.CpConfig.ClusterConfig.KillSwitchMin > 0 &&
 			time.Since(ComputePipesStart).Minutes() >= float64(cpCtx.CpConfig.ClusterConfig.KillSwitchMin) {
-			return inputRowCount, ErrKillSwitch
+			return inputRowCount, badRowCount, ErrKillSwitch
 		}
 
-		switch {
-		case err == io.EOF:
-			// expected exit route
-			// ---------------------------------------------------
-			return inputRowCount, nil
-
-		case err != nil:
-			return 0, fmt.Errorf("error while reading input records (ReadCsvFile): %v", err)
-
-		default:
-			// // Remove invalid utf-8 sequence from input record
-			// for i := range record {
-			// 	record[i] = strings.ToValidUTF8(record[i], "")
-			// }
-			// log.Println(cpCtx.SessionId,"node",cpCtx.NodeId, "push record to computePipesInputCh with",len(record),"columns")
-			// log.Println("*Sending Record:",record)
-			select {
-			case computePipesInputCh <- record:
-			case <-cpCtx.Done:
-				log.Println("loading input row from file interrupted")
-				return inputRowCount, nil
-			}
-			inputRowCount += 1
+		// // Remove invalid utf-8 sequence from input record
+		// for i := range record {
+		// 	record[i] = strings.ToValidUTF8(record[i], "")
+		// }
+		// log.Println(cpCtx.SessionId,"node",cpCtx.NodeId, "push record to computePipesInputCh with",len(record),"columns")
+		// log.Println("*Sending Record:",record)
+		select {
+		case computePipesInputCh <- record:
+		case <-cpCtx.Done:
+			log.Println("loading input row from file interrupted")
+			return inputRowCount, badRowCount, nil
 		}
+		inputRowCount += 1
 	}
 }
 
-func (cpCtx *ComputePipesContext) ReadFixedWidthFile(filePath *FileName, shardOffset int,
-	schemaProvider string, computePipesInputCh chan<- []interface{}) (int64, error) {
+func LastIndexByte(s []byte, c byte) int {
+	for i := len(s) - 1; i >= 0; i-- {
+		if s[i] == c {
+			return i
+		}
+	}
+	return -1
+}
 
-	var fileHd *os.File
+func (cpCtx *ComputePipesContext) ReadFixedWidthFile(
+	filePath *FileName, fileReader ReaderAtSeeker,
+	fwEncodingInfo *FixedWidthEncodingInfo, castToRdfTxtTypeFncs []CastToRdfTxtFnc,
+	computePipesInputCh chan<- []any, badRowChannel *BadRowsChannel) (int64, int64, error) {
+
 	var fwScanner *bufio.Scanner
 	var err error
-	samplingRate := cpCtx.CpConfig.PipesConfig[0].InputChannel.SamplingRate
-	samplingMaxCount := cpCtx.CpConfig.PipesConfig[0].InputChannel.SamplingMaxCount
-
-	fileHd, err = os.Open(filePath.LocalFileName)
-	if err != nil {
-		return 0, fmt.Errorf("while opening temp file '%s' (ReadFixedWidthFile): %v", filePath.LocalFileName, err)
-	}
-	defer func() {
-		fileHd.Close()
-		os.Remove(filePath.LocalFileName)
-	}()
-
+	inputChannelConfig := cpCtx.CpConfig.PipesConfig[0].InputChannel
+	samplingRate := inputChannelConfig.SamplingRate
+	samplingMaxCount := int64(inputChannelConfig.SamplingMaxCount)
+	encoding := inputChannelConfig.Encoding
 	nbrColumns := len(cpCtx.CpConfig.CommonRuntimeArgs.SourcesConfig.MainInput.InputColumns)
+	shardOffset := cpCtx.CpConfig.ClusterConfig.ShardOffset
 	var inputColumns []string
 	var extColumns []string
+	var enforceRowMinLength, enforceRowMaxLength bool
 	switch cpCtx.CpConfig.CommonRuntimeArgs.CpipesMode {
 	case "sharding":
-		// input columns include the partfile_key_component
+		// input columns include the partfile_key_component and the add'l ones from input channel
 		inputColumns =
-			cpCtx.CpConfig.CommonRuntimeArgs.SourcesConfig.MainInput.InputColumns[:nbrColumns-len(cpCtx.PartFileKeyComponents)]
+			cpCtx.CpConfig.CommonRuntimeArgs.SourcesConfig.MainInput.InputColumns[:nbrColumns-len(cpCtx.PartFileKeyComponents)-
+				len(cpCtx.AddionalInputHeaders)]
 		// Prepare the extended columns from partfile_key_component
 		if len(cpCtx.PartFileKeyComponents) > 0 {
 			extColumns = make([]string, len(cpCtx.PartFileKeyComponents))
 			for i := range cpCtx.PartFileKeyComponents {
 				result := cpCtx.PartFileKeyComponents[i].Regex.FindStringSubmatch(filePath.InFileKeyInfo.key)
-				if len(result) > 0 {
+				if len(result) > 1 {
 					extColumns[i] = result[1]
 				}
+			}
+		}
+		// Check if we enforce the row length
+		enforceRowMinLength = inputChannelConfig.EnforceRowMinLength
+		enforceRowMaxLength = inputChannelConfig.EnforceRowMaxLength
+		if cpCtx.CpConfig.ClusterConfig.IsDebugMode {
+			if enforceRowMinLength {
+				log.Println("Enforcing row min length for fixed_width file")
+			}
+			if enforceRowMaxLength {
+				log.Println("Enforcing row max length for fixed_width file")
 			}
 		}
 	case "reducing":
 		inputColumns = cpCtx.CpConfig.CommonRuntimeArgs.SourcesConfig.MainInput.InputColumns
 	default:
-		return 0, fmt.Errorf("error: unknown cpipes mode in ReadFixedWidthFile: %s", cpCtx.CpConfig.CommonRuntimeArgs.CpipesMode)
+		return 0, 0, fmt.Errorf("error: unknown cpipes mode in ReadFixedWidthFile: %s", cpCtx.CpConfig.CommonRuntimeArgs.CpipesMode)
 	}
-	// Get the FixedWidthEncodingInfo from the schema provider
-	var fwEncodingInfo *FixedWidthEncodingInfo
-	if len(schemaProvider) > 0 {
-		sp := cpCtx.SchemaManager.GetSchemaProvider(schemaProvider)
-		if sp != nil {
-			fwEncodingInfo = sp.FixedWidthEncodingInfo()
-		}
-	}
+
 	if fwEncodingInfo == nil {
-		return 0, fmt.Errorf("error: loading fixed_width file, no encodeding info available")
+		return 0, 0, fmt.Errorf("error: loading fixed_width file, no encodeding info available")
 	}
-	// // Remove the Byte Order Mark (BOM) at beggining of the file if present
-	// sr, enc := utfbom.Skip(fileHd)
-	// fmt.Printf("Detected encoding: %s\n", enc)
 	// Setup a fixed-width reader
-	//* Note: No compression supported for fixed_width files
+	//* TODO: No compression supported for fixed_width files, add support for it
+
 	// CHECK FOR OFFSET POSITIONING
 	// log.Println("*** InFileKeyInfo",filePath.InFileKeyInfo,"shard offset",shardOffset)
+	var utfReader io.Reader = fileReader
 	if filePath.InFileKeyInfo.start > 0 && shardOffset > 0 {
+		beOffset := 0
+		if strings.Contains(encoding, "BE") {
+			beOffset = -1
+		}
 		buf := make([]byte, shardOffset)
-		n, err := fileHd.Read(buf)
-		if n != shardOffset || err != nil {
-			return 0, fmt.Errorf("error while reading shard offset bytes in ReadFixedWidthFile: %v", err)
+		n, err := utfReader.Read(buf)
+		if n == 0 || err != nil {
+			return 0, 0, fmt.Errorf("error while reading shard offset bytes in ReadFixedWidthFile: %v", err)
 		}
-		str := string(buf)
-		// if str ends with '\n', remove the last one
-		if strings.HasSuffix(str, "\n") {
-			str = str[:n-1]
+		if buf[n-1] == '\n' {
+			// log.Printf("*** removed the last \\n!!")
+			buf = buf[:n-1]
+		} else {
+			buf = buf[:n]
 		}
-		l := strings.LastIndex(str, "\n")
+		// log.Printf("*** OFFSET POSITIONING buf resized to %d\n", len(buf))
+		// Get to the last \n
+		l := LastIndexByte(buf, '\n')
 		if l < 0 {
-			return 0, fmt.Errorf("error: could not find end of previous record in ReadFixedWidthFile: key %s", filePath.InFileKeyInfo.key)
+			return 0, 0, fmt.Errorf("error: could not find end of previous record in ReadFixedWidthFile: key %s", filePath.InFileKeyInfo.key)
 		}
 		// seek to first character after the last '\n'
-		// log.Println("SEEKING TO FIRST LINE @", l+1,":: start at",filePath.InFileKeyInfo.start,"which is", filePath.InFileKeyInfo.start+l+1)
-		_, err = fileHd.Seek(int64(l+1), 0)
+		// log.Printf("*** OFFSET POSITIONING SEEKING to pos %d\n", l+beOffset+1)
+		_, err = fileReader.Seek(int64(l+beOffset+1), 0)
 		if err != nil {
-			return 0, fmt.Errorf("error while seeking to start of shard in ReadFixedWidthFile: %v", err)
+			return 0, 0, fmt.Errorf("error while seeking to start of shard in ReadCsvFile: %v", err)
 		}
 	}
-	fwScanner = bufio.NewScanner(fileHd)
+	utfReader, err = WrapReaderWithDecoder(fileReader, encoding)
+	if err != nil {
+		return 0, 0, fmt.Errorf("while4 WrapReaderWithDecoder for encoding '%s': %v", encoding, err)
+	}
+	fwScanner = bufio.NewScanner(utfReader)
 
-	var inputRowCount int64
-	var record []interface{}
+	var inputRowCount, badRowCount int64
+	var record []any
 	var line, nextLine string
 	var recordTypeOffset int
 	// CHECK FOR OFFSET POSITIONING -- check if we drop the last record
@@ -524,14 +651,15 @@ func (cpCtx *ComputePipesContext) ReadFixedWidthFile(filePath *FileName, shardOf
 			}
 			switch {
 			case err == io.EOF: // empty file
-				return 0, nil
+				return 0, 0, nil
 			case err != nil:
-				return 0, fmt.Errorf("error while reading first input record (ReadFixedWidthFile): %v", err)
+				return 0, 0, fmt.Errorf("error while reading first input record (ReadFixedWidthFile): %v", err)
 			}
 		}
 		line = fwScanner.Text()
-		// log.Println("FIRST LINE:", line,"size:",len(line))
+		// log.Println("***FIRST LINE:", line[0:int(math.Min(40, float64(len(line))))],"size:",len(line))
 	}
+loop_record:
 	for {
 		// read and put the rows into computePipesInputCh
 		ok := fwScanner.Scan()
@@ -540,18 +668,18 @@ func (cpCtx *ComputePipesContext) ReadFixedWidthFile(filePath *FileName, shardOf
 			if inputRowCount > 0 && samplingRate > 0 && cpCtx.SamplingCount < samplingRate {
 				continue
 			}
-			if samplingMaxCount > 0 && inputRowCount >= int64(samplingMaxCount) {
+			if samplingMaxCount > 0 && inputRowCount >= samplingMaxCount {
 				continue
 			}
 			cpCtx.SamplingCount = 0
-			record = make([]interface{}, nbrColumns)
+			record = make([]any, nbrColumns)
 			if dropLastRow {
 				nextLine = fwScanner.Text()
 				// log.Println("NEXT LINE:", nextLine,"size:",len(nextLine))
 			} else {
 				line = fwScanner.Text()
 			}
-			// log.Println("CURRENT LINE:", line,"size:",len(line))
+			// log.Println("***CURRENT LINE:", line[:int(math.Min(40, float64(len(line))))],"size:",len(line))
 			ll := len(line)
 			// split the line into the record according to the record type
 			var recordType string
@@ -564,26 +692,73 @@ func (cpCtx *ComputePipesContext) ReadFixedWidthFile(filePath *FileName, shardOf
 			}
 			columnsInfo, ok := fwEncodingInfo.ColumnsMap[recordType]
 			if !ok || columnsInfo == nil {
-				return 0, fmt.Errorf("error: No record info for record type '%s' in read fixed_width record", recordType)
+				return 0, 0, fmt.Errorf("error: No record info for record type '%s' in read fixed_width record", recordType)
 			} else {
 				recordTypeOffset, ok = fwEncodingInfo.ColumnsOffsetMap[recordType]
 				if !ok {
-					return 0, fmt.Errorf("error: bad fixed-width record: unknown record type '%s'", recordType)
-				} else {
-					for i := range *columnsInfo {
-						columnInfo := (*columnsInfo)[i]
-						if columnInfo.Start < ll && columnInfo.End <= ll {
-							s := strings.TrimSpace(line[columnInfo.Start:columnInfo.End])
-							if len(s) == 0 {
-								record[recordTypeOffset+i] = nil
-							} else {
-								record[recordTypeOffset+i] = s
+					return 0, 0, fmt.Errorf("error: bad fixed-width record: unknown record type '%s'", recordType)
+				}
+				var errCol error
+				var maxEnd int
+				for i := range *columnsInfo {
+					columnInfo := (*columnsInfo)[i]
+					if columnInfo.End > maxEnd {
+						maxEnd = columnInfo.End
+					}
+					switch {
+					case columnInfo.Start < ll && columnInfo.End <= ll:
+						s := strings.TrimSpace(line[columnInfo.Start:columnInfo.End])
+						switch {
+						case len(s) == 0:
+							record[recordTypeOffset+i] = nil
+						case castToRdfTxtTypeFncs != nil && castToRdfTxtTypeFncs[i] != nil:
+							record[recordTypeOffset+i], errCol = castToRdfTxtTypeFncs[i](s)
+							if errCol != nil {
+								err = errCol
 							}
+						default:
+							record[recordTypeOffset+i] = s
 						}
-						// if cpCtx.CpConfig.ClusterConfig.IsDebugMode {
-						// 	fmt.Printf("*** record[%d] = %s, idx %d:%d, record type: %s, offset: %d\n",
-						// 		recordTypeOffset+i, record[recordTypeOffset+i], columnInfo.Start, columnInfo.End, recordType, recordTypeOffset)
-						// }
+					case enforceRowMinLength:
+						// Input line is too short - got a bad row
+						// fmt.Printf("***TOO SHORT %d/%d **%s\n", len(line), maxEnd, line[:int(math.Min(40, float64(len(line))))])
+						if badRowChannel != nil {
+							select {
+							case badRowChannel.OutputCh <- []byte(line + "\n"):
+							case <-cpCtx.Done:
+								log.Println("Sending bad input row interrupted (ReadFixedWidthFile-1)")
+								return inputRowCount, badRowCount, nil
+							}
+							badRowCount += 1
+							line = nextLine
+							continue loop_record
+						} else {
+							return inputRowCount, badRowCount + 1,
+								fmt.Errorf("while reading input records (ReadFixedWidthFile): Line too short")
+						}
+					}
+					// if cpCtx.CpConfig.ClusterConfig.IsDebugMode {
+					// 	fmt.Printf("*** record[%d] = %s, idx %d:%d, record type: %s, offset: %d\n",
+					// 		recordTypeOffset+i, record[recordTypeOffset+i], columnInfo.Start, columnInfo.End, recordType, recordTypeOffset)
+					// }
+				}
+				if maxEnd < ll && enforceRowMaxLength {
+					// Input line is too long, did not used all the input characters
+					// Got a bad row
+					// fmt.Printf("***TOO LONG %d/%d **%s\n", len(line), maxEnd, line[:int(math.Min(40, float64(len(line))))])
+					if badRowChannel != nil {
+						select {
+						case badRowChannel.OutputCh <- []byte(line + "\n"):
+						case <-cpCtx.Done:
+							log.Println("Sending bad input row interrupted (ReadFixedWidthFile-2)")
+							return inputRowCount, badRowCount, nil
+						}
+						badRowCount += 1
+						line = nextLine
+						continue loop_record
+					} else {
+						return inputRowCount, badRowCount + 1,
+							fmt.Errorf("while reading input records (ReadFixedWidthFile): Line too long")
 					}
 				}
 			}
@@ -603,21 +778,27 @@ func (cpCtx *ComputePipesContext) ReadFixedWidthFile(filePath *FileName, shardOf
 				record[offset+i] = extColumns[i]
 			}
 		}
+		// // Add placeholders for the additional input headers/columns
+		// if len(cpCtx.AddionalInputHeaders) > 0 {
+		// 	for range cpCtx.AddionalInputHeaders {
+		// 		record = append(record, nil)
+		// 	}
+		// }
 
 		// Kill Switch - prevent lambda timeout
 		if cpCtx.CpConfig.ClusterConfig.KillSwitchMin > 0 &&
 			time.Since(ComputePipesStart).Minutes() >= float64(cpCtx.CpConfig.ClusterConfig.KillSwitchMin) {
-			return inputRowCount, ErrKillSwitch
+			return inputRowCount, badRowCount, ErrKillSwitch
 		}
 
 		switch {
 		case err == io.EOF:
 			// expected exit route
 			// ---------------------------------------------------
-			return inputRowCount, nil
+			return inputRowCount, badRowCount, nil
 
 		case err != nil:
-			return 0, fmt.Errorf("error while reading input fixed_width records: %v", err)
+			return 0, 0, fmt.Errorf("error while reading input fixed_width records: %v", err)
 
 		default:
 			// // Remove invalid utf-8 sequence from input record
@@ -630,7 +811,7 @@ func (cpCtx *ComputePipesContext) ReadFixedWidthFile(filePath *FileName, shardOf
 			case computePipesInputCh <- record:
 			case <-cpCtx.Done:
 				log.Println("loading input fixed_width row from file interrupted")
-				return inputRowCount, nil
+				return inputRowCount, badRowCount, nil
 			}
 			inputRowCount += 1
 		}

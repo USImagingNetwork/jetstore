@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 
+	"github.com/artisoft-io/jetstore/jets/workspace"
 	"github.com/jackc/pgx/v4/pgxpool"
 )
 
@@ -17,7 +18,7 @@ type ServerNodeArgs struct {
 	NodeId          int `json:"id"`
 }
 
-func (args *ServerNodeArgs) RunServer(ctx context.Context, dsn string, dbpool *pgxpool.Pool) error {
+func (args *ServerNodeArgs) RunServer(ctx context.Context, dbpool *pgxpool.Pool) error {
 
 	// validate command line arguments
 	hasErr := false
@@ -25,10 +26,6 @@ func (args *ServerNodeArgs) RunServer(ctx context.Context, dsn string, dbpool *p
 	if args.PipelineExecKey < 0 {
 		hasErr = true
 		errMsg = append(errMsg, "Pipeline execution status key (-peKey) must be provided.")
-	}
-	if dsn == "" {
-		hasErr = true
-		errMsg = append(errMsg, "Connection string must be provided.")
 	}
 	if os.Getenv("JETS_REGION") == "" {
 		hasErr = true
@@ -69,12 +66,19 @@ func (args *ServerNodeArgs) RunServer(ctx context.Context, dsn string, dbpool *p
 		panic(errMsg)
 	}
 	_, devMode := os.LookupEnv("JETSTORE_DEV_MODE")
+	if !devMode {
+		// Check if we need to sync the workspace files
+		_, err := workspace.SyncComputePipesWorkspace(dbpool)
+		if err != nil {
+			log.Panicf("error while synching workspace files from db: %v", err)
+		}
+	}
 
 	ca := &CommandArguments{
 		AwsRegion:       os.Getenv("JETS_REGION"),
 		LookupDb:        fmt.Sprintf("%s/%s/lookup.db", os.Getenv("WORKSPACES_HOME"), os.Getenv("WORKSPACE")),
 		PipelineExecKey: args.PipelineExecKey,
-		PoolSize:        10,
+		PoolSize:        10, // execute rules workers pool size
 		Limit:           -1,
 		NbrShards:       nbrShardsFromEnv,
 		ShardId:         args.NodeId,

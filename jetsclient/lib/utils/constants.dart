@@ -148,9 +148,11 @@ class ScreenKeys {
   static const ufClientRegistry = "clientRegistryScreenUF";
   static const ufSourceConfig = "sourceConfigScreenUF";
   static const ufFileMapping = "fileMappingScreenUF";
+  static const ufHomeFilters = "homeFiltersScreenUF";
   static const ufMappingForm = "ufMappingFormScreenUF";
   static const ufPipelineConfig = "pipelineConfigScreenUF";
   static const ufLoadFiles = "ufLoadFilesScreenUF";
+  static const ufRegisterFileKey = "ufRegisterFileKey";
   static const ufStartPipeline = "ufStartPipelineScreenUF";
   static const ufPullWorkspace = "ufPullWorkspaceScreenUF";
   static const ufLoadConfig = "ufLoadConfigScreenUF";
@@ -235,6 +237,13 @@ class FormKeys {
   static const scEditCodeValueMappingUF = "scEditCodeValueMappingUF";
   static const scEditAutomatedModeUF = "scEditAutomatedModeUF";
   static const scSummaryUF = "scSummaryUF";
+  // Home Filters UF Forms
+  static const hfSelectProcessUF = "hfSelectProcessUF";
+  static const hfSelectStatusUF = "hfSelectStatusUF";
+  static const hfSelectFileKeyFilterUF = "hfSelectFileKeyFilterUF";
+  static const hfDoneHomeFiltersUF = "hfDoneHomeFiltersUF";
+  static const hfSelectTimeWindowUF = "hfSelectTimeWindowUF";
+  static const hfViewStatusTableUF = "hfViewStatusTableUF";
   // File Mapping UF Forms
   static const fmStartFileMappingUF = "fmStartFileMappingUF";
   static const fmSelectSourceConfigUF = "fmSelectSourceConfigUF";
@@ -259,6 +268,8 @@ class FormKeys {
   // Load Files UF Forms
   static const lfSelectSourceConfigUF = "lfSelectSourceConfigUF";
   static const lfSelectFileKeysUF = "lfSelectFileKeysUF";
+  // Register File Key UF Forms
+  static const rfkSubmitSchemaEvent = "rfkSubmitSchemaEvent";
   // Start Pipeline UF Forms
   static const spSelectPipelineConfigUF = "spSelectPipelineConfigUF";
   static const spSelectMainDataSourceUF = "spSelectMainDataSourceUF";
@@ -460,9 +471,11 @@ class FSK {
   static const scFileTypeOption = "input_format";
   static const scCsvOption = "csv";
   static const scHeaderlessCsvOption = "headerless_csv";
-  static const scHeaderlessCsvOptionWithSchemaProvider = "headerless_csv_with_schema_provider";
+  static const scHeaderlessCsvOptionWithSchemaProvider =
+      "headerless_csv_with_schema_provider";
   static const scFixedWidthOption = "fixed_width";
-  static const scFixedWidthOptionWithSchemaProvider = "fixed_width_with_schema_provider";
+  static const scFixedWidthOptionWithSchemaProvider =
+      "fixed_width_with_schema_provider";
   static const scParquetOption = "parquet";
   static const scParquetSelectOption = "parquet_select";
   static const scXlsxOption = "xlsx";
@@ -482,8 +495,19 @@ class FSK {
   static const updateDbClients = "updateDbClients";
   static const wpClientListRO = "wpClientListRO";
 
+  // Register File Key / Schema Event
+  static const schemaEventJson = "schemaEventJson";
+
   // Start Pipeline UF
   static const spAllDataSourceKeys = "spAllDataSourceKeys";
+
+  // Home Filters UF
+  static const hfFileKeyMatchType = "hfFileKeyMatchType";
+  static const hfFileKeySubstring = "hfFileKeySubstring";
+  static const hfStartTime = "hfStartTime";
+  static const hfStartOffset = "hfStartOffset";
+  static const hfEndTime = "hfEndTime";
+  static const hfEndOffset = "hfEndOffset";
 
   // reserved keys for cache
 
@@ -592,6 +616,9 @@ class ActionKeys {
 
   // for pipeline execution dialogs
   static const startPipelineOk = "startPipeline.ok";
+  
+  // for pipeline re-submit table action button
+  static const resubmitPipeline = "resubmitPipeline";
 
   // for process_error data table
   static const setupShowInputRecords = "setupShowInputRecords";
@@ -643,6 +670,13 @@ class ActionKeys {
   static const fmStartUF = "fmStartUF";
   static const fmSelectSourceConfigUF = "fmSelectSourceConfigUF";
 
+  // Home Filters UF ActionKeys
+  static const hfStartUF = "hfStartUF";
+  static const hfSelectProcessUF = "hfSelectProcessUF";
+  static const hfSelectStatusUF = "hfSelectStatusUF";
+  static const hfSelectFileKeyFilterUF = "hfSelectFileKeyFilterUF";
+  static const hfSelectTimeWindowUF = "hfSelectTimeWindowUF";
+
   // Pipeline Config ActionKeys
   static const pcAddPipelineConfigUF = "pcAddPipelineConfigUF";
   static const pcSelectPipelineConfigUF = "pcSelectPipelineConfigUF";
@@ -668,6 +702,9 @@ class ActionKeys {
   static const lfDropTable = "lfDropTable";
   static const lfSyncFileKey = "lfSyncFileKey";
 
+  // Register File Key UF
+  static const rfkSubmitSchemaEventUF = "rfkSubmitSchemaEventUF";
+
   // Start Pipeline UF ActionKeys
   static const spPipelineSelected = "spPipelineSelected";
   static const spStartPipelineUF = "spStartPipelineUF";
@@ -690,9 +727,11 @@ class UserFlowKeys {
   static const clientRegistryUF = "clientRegistryUF";
   static const sourceConfigUF = "sourceConfigUF";
   static const fileMappingUF = "fileMappingUF";
+  static const homeFiltersUF = "homeFiltersUF";
   static const mapFileUF = "mapFileUF";
   static const pipelineConfigUF = "pipelineConfigUF";
   static const loadFilesUF = "loadFilesUF";
+  static const registerFileKeyUF = "registerFileKeyUF";
   static const startPipelineUF = "startPipelineUF";
   static const workspacePullUF = "workspacePullUF";
   static const loadConfigUF = "loadConfigUF";
@@ -790,6 +829,11 @@ class DTKeys {
   static const fmInputSourceMappingUF = "fmInputSourceMappingUF";
   // Table listing the mapping
   static const fmFileMappingTableUF = "fmFileMappingTableUF";
+
+  // Home Filters Tables
+  static const hfProcessTableUF = "hfProcessTableUF";
+  static const hfStatusTableUF = "hfStatusTableUF";
+  static const hfFileKeyFilterTypeTableUF = "hfFileKeyFilterTypeTableUF";
 
   // Pipeline Config UF DTKeys
   static const pcPipelineConfigTable = "pcPipelineConfigTable";

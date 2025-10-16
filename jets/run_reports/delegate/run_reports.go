@@ -66,9 +66,12 @@ type ReportDirectives struct {
 	RegisterReports      []RegisterReportSpec         `json:"registerReport"`
 }
 
+// Type: report, script, function
+// case function, use a deployment-specific function
 type ReportProperty struct {
-	ReportOrScript string            `json:"reportOrScript"`
-	RunWhen        []RunWhenCriteria `json:"runWhen"`
+	Type            string            `json:"reportOrScript"`
+	UpdatedFileKeys []string          `json:"updatedFileKeys"`
+	RunWhen         []RunWhenCriteria `json:"runWhen"`
 }
 
 type StatementProperty struct {
@@ -92,6 +95,9 @@ type RegisterReportSpec struct {
 	SourceType string `json:"source_type"`
 }
 
+type InstallationSpecificReportFunc func(dbpool *pgxpool.Pool, ca *CommandArguments,
+	tempDir, functionName string, updatedKeys *[]string) error
+
 type CommandArguments struct {
 	WorkspaceName           string
 	Client                  string
@@ -109,12 +115,15 @@ type CommandArguments struct {
 	CurrentReportDirectives *ReportDirectives
 	BucketName              string
 	RegionName              string
+	SkipCompileWorkspace    bool
 	FileKeyComponents       map[string]interface{}
+	SchemaProviderJson      string
+	InstallSpecificFunc     map[string]InstallationSpecificReportFunc
 }
 
 // Main Functions
 // --------------------------------------------------------------------------------------
-func (ca *CommandArguments) RunReports(dbpool *pgxpool.Pool) (err error) {
+func (ca *CommandArguments) RunReports(dbpool *pgxpool.Pool) (returnedErr error) {
 
 	// Create temp directory for the local temp files
 	tempDir, err := os.MkdirTemp("", "jetstore")
@@ -132,22 +141,52 @@ func (ca *CommandArguments) RunReports(dbpool *pgxpool.Pool) (err error) {
 		os.RemoveAll(tempDir)
 	}()
 
+	// Start the Report Commands async
+	log.Println("Start the Report Commands async")
+	errCh := make(chan error, 100)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() {
+		// Check if there was any error while executing the commands.
+		// This will make RunReport to return when the command execution is completed.
+		log.Println("Report done, checking for errCh")
+		jobCancelled := false
+		for err := range errCh {
+			if err != nil {
+				if !jobCancelled {
+					cancel()
+				}
+				jobCancelled = true
+				if returnedErr != nil {
+					returnedErr = fmt.Errorf("%v, %v", returnedErr, err)
+				} else {
+					returnedErr = err
+				}
+			}
+		}
+		if !jobCancelled {
+			cancel()
+		}
+		log.Println("Report done, returnErr:", returnedErr)
+	}()
+	go ca.RunSchemaProviderReportsCmds(ctx, dbpool, errCh)
+
 	// Keep track of files (reports) written to s3 (use case UpdateLookupTables)
 	updatedKeys := make([]string, 0)
-	reportDirectives := *ca.CurrentReportDirectives
+	reportDirectives := ca.CurrentReportDirectives
 
 	// Run the reports
 	var dbRecordCount, outputRecordCount int64
 	gotRecordCount := false
 	didAnyReport := false
-	for i := range ca.ReportScriptPaths {
-		reportProps := reportDirectives.ReportProperties[reportDirectives.ReportScripts[i]]
+	for is := range reportDirectives.ReportScripts {
+		reportScript := reportDirectives.ReportScripts[is]
+		reportProps := reportDirectives.ReportProperties[reportScript]
 		doIt := true
-		for i := range reportProps.RunWhen {
-			value, ok := ca.FileKeyComponents[reportProps.RunWhen[i].FileKeyComponent].(string)
+		for iw := range reportProps.RunWhen {
+			value, ok := ca.FileKeyComponents[reportProps.RunWhen[iw].FileKeyComponent].(string)
 			if ok {
-				hasValue := reportProps.RunWhen[i].HasValue
-				hasNotValue := reportProps.RunWhen[i].HasNotValue
+				hasValue := reportProps.RunWhen[iw].HasValue
+				hasNotValue := reportProps.RunWhen[iw].HasNotValue
 				switch {
 				case len(hasValue) > 0 && value != hasValue:
 					doIt = false
@@ -157,15 +196,15 @@ func (ca *CommandArguments) RunReports(dbpool *pgxpool.Pool) (err error) {
 			} else {
 				doIt = false
 			}
-			if reportProps.RunWhen[i].HasNonZeroOutputRecords {
+			if reportProps.RunWhen[iw].HasNonZeroOutputRecords {
 				if !gotRecordCount {
-					dbRecordCount, outputRecordCount = GetOutputRecordCount(dbpool, ca.SessionId)	
+					dbRecordCount, outputRecordCount = GetOutputRecordCount(dbpool, ca.SessionId)
 					gotRecordCount = true
 				}
 				if dbRecordCount > 0 && outputRecordCount == 0 {
 					log.Println("This report is requiring having non zero output records and no output records are found, skipping report")
 					doIt = false
-				}		
+				}
 			}
 			if !doIt {
 				break
@@ -176,14 +215,30 @@ func (ca *CommandArguments) RunReports(dbpool *pgxpool.Pool) (err error) {
 		}
 		// Determine if the file is a sql reports or a sql script, sql script are executed in one go
 		// while sql report are executed statement by statement with results generally saved to s3 (most common)
-		if reportProps.ReportOrScript == "script" {
+		reportFnc := ca.InstallSpecificFunc[reportScript]
+		switch {
+		case reportFnc != nil:
+			// case reportScript is a registered function:
+			err = reportFnc(dbpool, ca, tempDir, reportScript, &updatedKeys)
+			if err != nil {
+				return fmt.Errorf("while calling report function %s: %v", reportScript, err)
+			}
+
+		case reportProps.Type == "script":
 			// Running as sql script
-			log.Println("Running sql script:", ca.ReportScriptPaths[i])
-			err = ca.runSqlScriptDelegate(dbpool, ca.ReportScriptPaths[i])
-		} else {
+			log.Println("Running sql script:", ca.ReportScriptPaths[is])
+			err = ca.runSqlScriptDelegate(dbpool, ca.ReportScriptPaths[is])
+			if len(reportProps.UpdatedFileKeys) > 0 {
+				basePath := reportDirectives.OutputPath + "/"
+				for i := range reportProps.UpdatedFileKeys {
+					updatedKeys = append(updatedKeys, basePath+reportProps.UpdatedFileKeys[i])
+				}
+			}
+
+		default:
 			// Running as sql report by default
-			log.Println("Running report:", ca.ReportScriptPaths[i])
-			err = ca.runReportsDelegate(dbpool, tempDir, ca.ReportScriptPaths[i], &updatedKeys)
+			log.Println("Running report:", ca.ReportScriptPaths[is])
+			err = ca.runReportsDelegate(dbpool, tempDir, ca.ReportScriptPaths[is], &updatedKeys)
 		}
 		if err != nil {
 			return err
@@ -194,7 +249,7 @@ func (ca *CommandArguments) RunReports(dbpool *pgxpool.Pool) (err error) {
 	if !didAnyReport {
 		// Did no report, bailing out
 		log.Println("Done no reports, bailing out")
-		return
+		return nil
 	}
 
 	// Register reports
@@ -232,10 +287,12 @@ func (ca *CommandArguments) RunReports(dbpool *pgxpool.Pool) (err error) {
 			}
 		}
 
-		version := strconv.FormatInt(time.Now().Unix(), 10)
-		_, err = workspace.CompileWorkspace(dbpool, ca.WorkspaceName, version)
-		if err != nil {
-			return err
+		if !ca.SkipCompileWorkspace {
+			version := strconv.FormatInt(time.Now().Unix(), 10)
+			_, err = workspace.CompileWorkspace(dbpool, ca.WorkspaceName, version)
+			if err != nil {
+				return err
+			}
 		}
 	}
 
@@ -272,7 +329,7 @@ func (ca *CommandArguments) RunReports(dbpool *pgxpool.Pool) (err error) {
 			return err
 		}
 	}
-	return
+	return nil
 }
 
 // Support Functions
@@ -320,7 +377,7 @@ func (ca *CommandArguments) runReportsDelegate(dbpool *pgxpool.Pool, tempDir str
 	file, err := os.Open(reportScriptPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			log.Printf("Report definitions file %s does not exist, exiting silently", reportScriptPath)
+			log.Printf("Report definitions file %s does not exist, skipping", reportScriptPath)
 			return nil
 		}
 		return fmt.Errorf("error while opening report definitions file %s: %v", reportScriptPath, err)

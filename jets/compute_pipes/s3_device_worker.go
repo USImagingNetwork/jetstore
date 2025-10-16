@@ -32,6 +32,7 @@ func NewS3DeviceWorker(s3Uploader *manager.Uploader, done chan struct{}, errCh c
 
 func (ctx *S3DeviceWorker) DoWork(mgr *S3DeviceManager, resultCh chan ComputePipesResult) {
 	var count int64
+	// log.Printf("S3Device Worker Entering DoWork")
 	for task := range mgr.WorkersTaskCh {
 		err := ctx.processTask(&task, mgr, resultCh)
 		if err != nil {
@@ -47,7 +48,7 @@ func (ctx *S3DeviceWorker) processTask(task *S3Object, _ *S3DeviceManager, resul
 	var putObjInput *s3.PutObjectInput
 	var retry int
 
-	// log.Println("S3DeviceWorker: Put file to s3 key:",task.FileKey)
+	// log.Printf("*** S3DeviceWorker: Put s3 key %s, from local file %s\n",task.FileKey, task.LocalFilePath)
 	// open the local temp file for the writer
 	fileHd, err := os.Open(task.LocalFilePath)
 	if err != nil {
@@ -59,8 +60,11 @@ func (ctx *S3DeviceWorker) processTask(task *S3Object, _ *S3DeviceManager, resul
 		os.Remove(task.LocalFilePath)
 	}()
 
+	if task.ExternalBucket == "" {
+		task.ExternalBucket = bucketName
+	}
 	putObjInput = &s3.PutObjectInput{
-		Bucket: &bucketName,
+		Bucket: &task.ExternalBucket,
 		Key:    &task.FileKey,
 		Body:   bufio.NewReader(fileHd),
 	}

@@ -15,12 +15,13 @@ func (cpCtx *ComputePipesContext) ProcessFilesAndReportStatus(ctx context.Contex
 	inFolderPath string) error {
 
 	cpCtx.ChResults = &ChannelResults{
-		// NOTE: 101 is the limit of nbr of output table
-		// NOTE: 10 is the limit of nbr of splitter operators
-		LoadFromS3FilesResultCh: make(chan LoadFromS3FilesResult, 1),
-		Copy2DbResultCh:         make(chan chan ComputePipesResult, 101),
-		WritePartitionsResultCh: make(chan chan ComputePipesResult, 10),
-		S3PutObjectResultCh:     make(chan ComputePipesResult, 1),
+		// NOTE 2025/06/29: Removing unneccessary limits, otherwise this will hang when collecting results
+		LoadFromS3FilesResultCh: make(chan LoadFromS3FilesResult, 10000),
+		Copy2DbResultCh:         make(chan chan ComputePipesResult, 10000),
+		WritePartitionsResultCh: make(chan chan ComputePipesResult, 10000),
+		S3PutObjectResultCh:     make(chan ComputePipesResult, 10000),
+		JetrulesWorkerResultCh:  make(chan chan JetrulesWorkerResult, 10000),
+		ClusteringResultCh:      make(chan chan ClusteringResult, 10000),
 	}
 
 	key, err := cpCtx.InsertPipelineExecutionStatus(dbpool)
@@ -39,6 +40,8 @@ func (cpCtx *ComputePipesContext) ProcessFilesAndReportStatus(ctx context.Contex
 		close(cpCtx.ChResults.Copy2DbResultCh)
 		close(cpCtx.ChResults.WritePartitionsResultCh)
 		close(cpCtx.ChResults.S3PutObjectResultCh)
+		close(cpCtx.ChResults.JetrulesWorkerResultCh)
+		close(cpCtx.ChResults.ClusteringResultCh)
 		err = cpCtx.StartMergeFiles(dbpool)
 	} else {
 		err = cpCtx.LoadFiles(ctx, dbpool)
@@ -53,15 +56,15 @@ func (cpCtx *ComputePipesContext) ProcessFilesAndReportStatus(ctx context.Contex
 	// saveResultsCtx.NodeId = cpCtx.NodeId
 	// saveResultsCtx.SessionId = cpCtx.SessionId
 
-	// if cpCtx.CpConfig.ClusterConfig.IsDebugMode {
-	// 	log.Println(cpCtx.SessionId, "**!@@ CP RESULT = Downloaded from s3:")
-	// }
+	if cpCtx.CpConfig.ClusterConfig.IsDebugMode {
+		log.Println(cpCtx.SessionId, "**!@@ CP RESULT = Downloaded from s3:")
+	}
 	var totalInputFileSize int64
 	var totalInputFileCount int
 	for downloadResult := range cpCtx.DownloadS3ResultCh {
 		if cpCtx.CpConfig.ClusterConfig.IsDebugMode {
 			log.Println(cpCtx.SessionId, "node", cpCtx.NodeId, "Downloaded", downloadResult.InputFilesCount,
-				"files from s3, total size:", downloadResult.TotalFilesSize/1024/1024, "MB, err:", downloadResult.Err)
+				"files from s3, total size:", float64(downloadResult.TotalFilesSize)/1024/1024, "MB, err:", downloadResult.Err)
 		}
 		totalInputFileSize += downloadResult.TotalFilesSize
 		totalInputFileCount += downloadResult.InputFilesCount
@@ -78,8 +81,11 @@ func (cpCtx *ComputePipesContext) ProcessFilesAndReportStatus(ctx context.Contex
 		}
 	}
 
-	// log.Println("**!@@ CP RESULT = Loaded from s3:")
-	var loadedRowCount int
+	if cpCtx.CpConfig.ClusterConfig.IsDebugMode {
+		log.Println("**@= CP RESULT = Loaded from s3:")
+	}
+	var loadedRowCount int64
+	var badRowCount int64
 	for loadFromS3FilesResult := range cpCtx.ChResults.LoadFromS3FilesResultCh {
 		if cpCtx.CpConfig.ClusterConfig.IsDebugMode {
 			log.Println(cpCtx.SessionId, "node", cpCtx.NodeId, "Loaded", loadFromS3FilesResult.LoadRowCount,
@@ -91,7 +97,8 @@ func (cpCtx *ComputePipesContext) ProcessFilesAndReportStatus(ctx context.Contex
 		// 	Err:          loadFromS3FilesResult.Err,
 		// }
 		// saveResultsCtx.Save("S3 Readers", r)
-		loadedRowCount += int(loadFromS3FilesResult.LoadRowCount)
+		loadedRowCount += loadFromS3FilesResult.LoadRowCount
+		badRowCount += loadFromS3FilesResult.BadRowCount
 		if loadFromS3FilesResult.Err != nil {
 			processingErrors = append(processingErrors, loadFromS3FilesResult.Err.Error())
 			if err == nil {
@@ -99,15 +106,62 @@ func (cpCtx *ComputePipesContext) ProcessFilesAndReportStatus(ctx context.Contex
 			}
 		}
 	}
-	// log.Println("**!@@ CP RESULT = Loaded from s3: DONE")
-	// log.Println("**!@@ CP RESULT = Copy2DbResultCh:")
+	if loadedRowCount == 0 && badRowCount > 0 {
+		loadErr := fmt.Errorf("error: node %d loaded no valid rows and got %d bad rows",
+			cpCtx.NodeId, badRowCount)
+		processingErrors = append(processingErrors, loadErr.Error())
+		if err == nil {
+			err = loadErr
+		}
+	}
+	if cpCtx.CpConfig.ClusterConfig.IsDebugMode {
+		log.Println("**@= CHECKING jetrules results from JetrulesWorkerResultCh:")
+	}
+	// get jetrules results from JetrulesWorkerResultCh
+	var reteSessionCount int64
+	var reteSessionErrors int64
+	for workerResultCh := range cpCtx.ChResults.JetrulesWorkerResultCh {
+		for jrResults := range workerResultCh {
+			reteSessionCount += jrResults.ReteSessionCount
+			reteSessionErrors += jrResults.ErrorsCount
+			if jrResults.Err != nil {
+				processingErrors = append(processingErrors, jrResults.Err.Error())
+				if err == nil {
+					err = jrResults.Err
+				}
+			}
+		}
+	}
+	if reteSessionErrors > 0 {
+		log.Printf("WARNING: rete session got %d data errors\n", reteSessionErrors)
+	}
+
+	if cpCtx.CpConfig.ClusterConfig.IsDebugMode {
+		log.Println("**@= CHECKING clustering results from ClusteringResultCh:")
+	}
+	// get clustering results from ClusteringResultCh
+	for clusteringResultCh := range cpCtx.ChResults.ClusteringResultCh {
+		for clusteringResult := range clusteringResultCh {
+			if clusteringResult.Err != nil {
+				processingErrors = append(processingErrors, clusteringResult.Err.Error())
+				if err == nil {
+					err = clusteringResult.Err
+				}
+			}
+		}
+	}
+	// log.Println("** CHECKING clustering results DONE :: err?", err)
+
+	if cpCtx.CpConfig.ClusterConfig.IsDebugMode {
+		log.Println("**@= CP RESULT = Copy2DbResultCh:")
+	}
 	var outputRowCount int64
 	for table := range cpCtx.ChResults.Copy2DbResultCh {
-		// log.Println("**!@@ Read table results:")
+		// log.Println("**@= Write DB table results:")
 		for copy2DbResult := range table {
 			outputRowCount += copy2DbResult.CopyRowCount
 			// saveResultsCtx.Save("DB Inserts", &copy2DbResult)
-			// log.Println("**!@@ Inserted", copy2DbResult.CopyRowCount, "rows in table", copy2DbResult.TableName, "::", copy2DbResult.Err)
+			// log.Println("**@= Inserted", copy2DbResult.CopyRowCount, "rows in table", copy2DbResult.TableName, "::", copy2DbResult.Err)
 			if copy2DbResult.Err != nil {
 				processingErrors = append(processingErrors, copy2DbResult.Err.Error())
 				if err == nil {
@@ -116,15 +170,17 @@ func (cpCtx *ComputePipesContext) ProcessFilesAndReportStatus(ctx context.Contex
 			}
 		}
 	}
-	// log.Println("**!@@ CP RESULT = Copy2DbResultCh: DONE")
+	// log.Println("**@= CP RESULT = Copy2DbResultCh: DONE")
 
-	// log.Println("**!@@ CP RESULT = WritePartitionsResultCh:")
+	if cpCtx.CpConfig.ClusterConfig.IsDebugMode {
+		log.Println("**@= CP RESULT = WritePartitionsResultCh:")
+	}
 	for splitter := range cpCtx.ChResults.WritePartitionsResultCh {
-		// log.Println("**!@@ Read SPLITTER ComputePipesResult from writePartitionsResultCh:")
+		// log.Println("**@= Read SPLITTER ComputePipesResult from writePartitionsResultCh:")
 		for partitionWriterResult := range splitter {
 			// saveResultsCtx.Save("Jets Partition Writer", &partitionWriterResult)
 			outputRowCount += partitionWriterResult.CopyRowCount
-			// log.Println("**!@@ Wrote", partitionWriterResult.CopyRowCount, "rows in", partitionWriterResult.PartsCount, "partfiles for", partitionWriterResult.TableName, "::", partitionWriterResult.Err)
+			// log.Println("**@= Wrote", partitionWriterResult.CopyRowCount, "rows in", partitionWriterResult.PartsCount, "partfiles for", partitionWriterResult.TableName, "::", partitionWriterResult.Err)
 			if partitionWriterResult.Err != nil {
 				processingErrors = append(processingErrors, partitionWriterResult.Err.Error())
 				if err == nil {
@@ -133,13 +189,22 @@ func (cpCtx *ComputePipesContext) ProcessFilesAndReportStatus(ctx context.Contex
 			}
 		}
 	}
-	// log.Println("**!@@ CP RESULT = WritePartitionsResultCh: DONE")
+	// log.Println("**@= CP RESULT = WritePartitionsResultCh: DONE")
 
 	// Get the result from S3DeviceManager
 	// cpCtx.S3DeviceMgr == nil when cpCtx.ComputePipesArgs.MergeFiles == true
 	if cpCtx.S3DeviceMgr != nil {
+		if cpCtx.CpConfig.ClusterConfig.IsDebugMode {
+			log.Println("**@= Waiting on S3DeviceMgr.ClientsWg.Wait")
+		}
 		cpCtx.S3DeviceMgr.ClientsWg.Wait()
 		close(cpCtx.S3DeviceMgr.WorkersTaskCh)
+		if cpCtx.CpConfig.ClusterConfig.IsDebugMode {
+			log.Println("**@= Waiting on S3DeviceMgr.ClientsWg.Wait DONE")
+		}
+	}
+	if cpCtx.CpConfig.ClusterConfig.IsDebugMode {
+		log.Println("**@= CP RESULT = S3PutObjectResultCh:")
 	}
 	for s3DeviceManagerResult := range cpCtx.ChResults.S3PutObjectResultCh {
 		if cpCtx.CpConfig.ClusterConfig.IsDebugMode {
@@ -152,6 +217,7 @@ func (cpCtx *ComputePipesContext) ProcessFilesAndReportStatus(ctx context.Contex
 			}
 		}
 	}
+	// log.Println("**@= CP RESULT = S3PutObjectResultCh DONE")
 
 	// Check for error from compute pipes
 	close(cpCtx.ErrCh)
@@ -168,14 +234,14 @@ func (cpCtx *ComputePipesContext) ProcessFilesAndReportStatus(ctx context.Contex
 		// saveResultsCtx.Save("CP Errors", r)
 		processingErrors = append(processingErrors, fmt.Sprintf("got error from Compute Pipes processing: %v", cpErr))
 	}
-	
+
 	// registering the load
 	// ---------------------------------------
 	var status string
-	switch {
-	case err == nil:
+	switch err {
+	case nil:
 		status = "completed"
-	case err == ErrKillSwitch:
+	case ErrKillSwitch:
 		status = "interrupted"
 	default:
 		status = "failed"
@@ -188,8 +254,8 @@ func (cpCtx *ComputePipesContext) ProcessFilesAndReportStatus(ctx context.Contex
 
 	// Register the result of this shard with pipeline_execution_details
 	err2 := cpCtx.UpdatePipelineExecutionStatus(dbpool, key,
-		loadedRowCount, int(totalInputFileSize/1024/1024), totalInputFileCount,
-		int(outputRowCount), cpCtx.MainInputStepId, status, errMessage)
+		int(loadedRowCount), int(badRowCount), int(totalInputFileSize/1024/1024), totalInputFileCount,
+		int(reteSessionCount), int(outputRowCount), cpCtx.MainInputStepId, status, errMessage)
 	if err2 != nil {
 		return fmt.Errorf("error while registering the load (cpipesSM): %v", err2)
 	}
@@ -207,22 +273,26 @@ func (cpCtx *ComputePipesContext) InsertPipelineExecutionStatus(dbpool *pgxpool.
 							RETURNING key`
 	var key int
 	err := dbpool.QueryRow(context.Background(), stmt,
-		cpCtx.PipelineConfigKey, cpCtx.PipelineExecKey, cpCtx.Client, cpCtx.ProcessName, cpCtx.InputSessionId, cpCtx.SessionId, cpCtx.SourcePeriodKey,
+		cpCtx.PipelineConfigKey, cpCtx.PipelineExecKey, cpCtx.Client, cpCtx.ProcessName,
+		cpCtx.InputSessionId, cpCtx.SessionId, cpCtx.SourcePeriodKey,
 		cpCtx.NodeId, cpCtx.JetsPartitionLabel, cpCtx.UserEmail).Scan(&key)
 	if err != nil {
 		return 0, fmt.Errorf("error inserting in jetsapi.pipeline_execution_details table: %v", err)
 	}
 	return key, nil
 }
-func (cpCtx *ComputePipesContext) UpdatePipelineExecutionStatus(dbpool *pgxpool.Pool, key int, inputRowCount, totalFilesSizeMb, inputFilesCount, outputRowCount int,
+func (cpCtx *ComputePipesContext) UpdatePipelineExecutionStatus(
+	dbpool *pgxpool.Pool, key int,
+	inputRowCount, badRowCount, totalFilesSizeMb, inputFilesCount, reteSessionCount, outputRowCount int,
 	cpipesStepId, status, errMessage string) error {
 	// log.Printf("Updating status '%s' to pipeline_execution_details table", status)
 	stmt := `UPDATE jetsapi.pipeline_execution_details SET (
-							cpipes_step_id, status, error_message, input_records_count, 
+							cpipes_step_id, status, error_message, input_records_count, input_bad_records_count,
 							input_files_size_mb, input_files_count, rete_sessions_count, output_records_count) 
-							= ($1, $2, $3, $4, $5, $6, $7, $8) WHERE key = $9`
+							= ($1, $2, $3, $4, $5, $6, $7, $8, $9) WHERE key = $10`
 	_, err := dbpool.Exec(context.Background(), stmt,
-		cpipesStepId, status, errMessage, inputRowCount, totalFilesSizeMb, inputFilesCount, 0, outputRowCount, key)
+		cpipesStepId, status, errMessage, inputRowCount, badRowCount, totalFilesSizeMb, inputFilesCount,
+		reteSessionCount, outputRowCount, key)
 	if err != nil {
 		return fmt.Errorf("error updating in jetsapi.pipeline_execution_details table: %v", err)
 	}

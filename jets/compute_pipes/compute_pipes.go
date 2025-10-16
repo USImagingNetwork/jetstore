@@ -1,6 +1,7 @@
 package compute_pipes
 
 import (
+	"context"
 	"encoding/gob"
 	"encoding/json"
 	"errors"
@@ -20,7 +21,8 @@ func init() {
 }
 
 // Function to write transformed row to database
-func (cpCtx *ComputePipesContext) StartComputePipes(dbpool *pgxpool.Pool, computePipesInputCh <-chan []interface{}) {
+func (cpCtx *ComputePipesContext) StartComputePipes(dbpool *pgxpool.Pool,
+	inputSchemaCh <-chan ParquetSchemaInfo, computePipesInputCh <-chan []any) {
 
 	// log.Println("Entering StartComputePipes")
 
@@ -52,6 +54,7 @@ func (cpCtx *ComputePipesContext) StartComputePipes(dbpool *pgxpool.Pool, comput
 	var channelsSpec map[string]*ChannelSpec
 	var channelsInUse map[string]*ChannelSpec
 	var outputChannels []*OutputChannelConfig
+	var domainKeysByClass map[string]*DomainKeysSpec
 
 	// Create the LookupTableManager and prepare the lookups async
 	lookupManager := NewLookupTableManager(cpCtx.CpConfig.LookupTables, cpCtx.EnvSettings,
@@ -69,25 +72,60 @@ func (cpCtx *ComputePipesContext) StartComputePipes(dbpool *pgxpool.Pool, comput
 
 	// Prepare the channel registry
 	// ----------------------------
+	mainInput := cpCtx.CpConfig.CommonRuntimeArgs.SourcesConfig.MainInput
+	// log.Printf("*** StartComputePipes: mainInput.DomainKeys: %v, mainInput.DomainClass: %v\n", *mainInput.DomainKeys, mainInput.DomainClass)
+	inputParquetSchema := mainInput.InputParquetSchema
+	if inputSchemaCh != nil {
+		// Get the parquet schema from the channel as it is being extracted from the
+		// first input file
+		is := <-inputSchemaCh
+		inputParquetSchema = &is
+	}
 	inputChannelName = cpCtx.CpConfig.PipesConfig[0].InputChannel.Name
 	if inputChannelName == "input_row" {
 		// case sharding or reducing
 		// Setup the input channel for input_row
 		headersPosMap := make(map[string]int)
-		for i, c := range cpCtx.CpConfig.CommonRuntimeArgs.SourcesConfig.MainInput.InputColumns {
+		if len(mainInput.InputColumns) == 0 && inputParquetSchema != nil {
+			// Get the columns from the schema
+			mainInput.InputColumns = inputParquetSchema.Columns()
+			mainInput.InputColumns = append(mainInput.InputColumns, cpCtx.AddionalInputHeaders...)
+			// Add the headers from the partfile_key_component
+			for i := range cpCtx.CpConfig.Context {
+				if cpCtx.CpConfig.Context[i].Type == "partfile_key_component" {
+					mainInput.InputColumns = append(mainInput.InputColumns, cpCtx.CpConfig.Context[i].Key)
+				}
+			}
+			// Save the columns to db!
+			inputRowColumnsJson, _ := json.Marshal(InputRowColumns{
+				MainInput: mainInput.InputColumns,
+			})
+			// Update in cpipes_execution_status
+			stmt := `UPDATE jetsapi.cpipes_execution_status SET input_row_columns_json = $1 WHERE session_id = $2`
+			_, err2 := dbpool.Exec(context.TODO(), stmt, string(inputRowColumnsJson), cpCtx.ComputePipesCommonArgs.SessionId)
+			if err2 != nil {
+				cpErr = fmt.Errorf("error inserting in jetsapi.cpipes_execution_status table: %v", err2)
+				goto gotError
+			}
+			log.Println("GETTING COLUMNS FROM SCHEMA:", mainInput.InputColumns)
+		}
+		for i, c := range mainInput.InputColumns {
 			headersPosMap[c] = i
 		}
 		inputRowChSpec = &ChannelSpec{
-			Name:    "input_row",
-			Columns: cpCtx.CpConfig.CommonRuntimeArgs.SourcesConfig.MainInput.InputColumns,
+			Name:           "input_row",
+			Columns:        mainInput.InputColumns,
+			ClassName:      mainInput.DomainClass,
+			DomainKeysInfo: mainInput.DomainKeys,
+			columnsMap:     &headersPosMap,
 		}
 		inputRowChannel = &InputChannel{
-			channel: computePipesInputCh,
-			columns: headersPosMap,
-			config: &ChannelSpec{
-				Name:    "input_row",
-				Columns: inputRowChSpec.Columns,
-			},
+			name:           "input_row",
+			channel:        computePipesInputCh,
+			columns:        &headersPosMap,
+			domainKeySpec:  inputRowChSpec.DomainKeysInfo,
+			config:         inputRowChSpec,
+			hasGroupedRows: cpCtx.CpConfig.PipesConfig[0].InputChannel.HasGroupedRows,
 		}
 	}
 	// Collect all the channel that are in use in PipeConfig, looking at PipeConfig.TransformationSpec.OutputChannel
@@ -96,8 +134,20 @@ func (cpCtx *ComputePipesContext) StartComputePipes(dbpool *pgxpool.Pool, comput
 	// Get the channels in used based on transformation pipe config, prime the channels using the provided channel spec
 	channelsInUse = make(map[string]*ChannelSpec)
 	for i := range cpCtx.CpConfig.Channels {
-		channelsSpec[cpCtx.CpConfig.Channels[i].Name] = &cpCtx.CpConfig.Channels[i]
-		channelsInUse[cpCtx.CpConfig.Channels[i].Name] = &cpCtx.CpConfig.Channels[i]
+		chSpec := &cpCtx.CpConfig.Channels[i]
+		if chSpec.Name == "input_row" {
+			// Skip this one since this input_row is to indicate columns to add to the input file which is done
+			// in start_sharding step
+			continue
+		}
+		// Make the lookup of column name to pos
+		cm := make(map[string]int)
+		for j, c := range chSpec.Columns {
+			cm[c] = j
+		}
+		chSpec.columnsMap = &cm
+		channelsSpec[cpCtx.CpConfig.Channels[i].Name] = chSpec
+		channelsInUse[cpCtx.CpConfig.Channels[i].Name] = chSpec
 	}
 	if inputRowChSpec != nil {
 		channelsSpec[inputRowChSpec.Name] = inputRowChSpec
@@ -106,11 +156,25 @@ func (cpCtx *ComputePipesContext) StartComputePipes(dbpool *pgxpool.Pool, comput
 	outputChannels = make([]*OutputChannelConfig, 0)
 	for i := range cpCtx.CpConfig.PipesConfig {
 		for j := range cpCtx.CpConfig.PipesConfig[i].Apply {
-			outputChannel := &cpCtx.CpConfig.PipesConfig[i].Apply[j].OutputChannel
-			outputChannels = append(outputChannels, outputChannel)
 			switch cpCtx.CpConfig.PipesConfig[i].Apply[j].Type {
 			case "anonymize":
-				outputChannel := &cpCtx.CpConfig.PipesConfig[i].Apply[j].AnonymizeConfig.KeysOutputChannel
+				outputChannel := &cpCtx.CpConfig.PipesConfig[i].Apply[j].OutputChannel
+				outputChannels = append(outputChannels, outputChannel)
+				outputChannel = &cpCtx.CpConfig.PipesConfig[i].Apply[j].AnonymizeConfig.KeysOutputChannel
+				outputChannels = append(outputChannels, outputChannel)
+			case "jetrules":
+				// Jetrules config overrides the outputChannel
+				for k := range cpCtx.CpConfig.PipesConfig[i].Apply[j].JetrulesConfig.OutputChannels {
+					outputChannel := &cpCtx.CpConfig.PipesConfig[i].Apply[j].JetrulesConfig.OutputChannels[k]
+					outputChannels = append(outputChannels, outputChannel)
+				}
+			case "clustering":
+				outputChannel := &cpCtx.CpConfig.PipesConfig[i].Apply[j].OutputChannel
+				outputChannels = append(outputChannels, outputChannel)
+				outputChannel = cpCtx.CpConfig.PipesConfig[i].Apply[j].ClusteringConfig.CorrelationOutputChannel
+				outputChannels = append(outputChannels, outputChannel)
+			default:
+				outputChannel := &cpCtx.CpConfig.PipesConfig[i].Apply[j].OutputChannel
 				outputChannels = append(outputChannels, outputChannel)
 			}
 		}
@@ -122,11 +186,9 @@ func (cpCtx *ComputePipesContext) StartComputePipes(dbpool *pgxpool.Pool, comput
 			cpErr = fmt.Errorf("channel spec %s not found in Channel Registry", outputChannel.SpecName)
 			goto gotError
 		}
-		channelsInUse[outputChannel.Name] = &ChannelSpec{
-			Name:    outputChannel.Name,
-			Columns: spec.Columns,
-		}
+		channelsInUse[outputChannel.Name] = spec
 	}
+	domainKeysByClass = cpCtx.ComputePipesCommonArgs.DomainKeysSpecByClass
 	// Use the channelsInUse map to create the Channel Registry
 	channelRegistry = &ChannelRegistry{
 		inputRowChannel:      inputRowChannel,
@@ -136,14 +198,19 @@ func (cpCtx *ComputePipesContext) StartComputePipes(dbpool *pgxpool.Pool, comput
 		distributionChannels: make(map[string]*[]string),
 	}
 	for name, spec := range channelsInUse {
-		cm := make(map[string]int)
-		for j, c := range spec.Columns {
-			cm[c] = j
-		}
 		channelRegistry.computeChannels[name] = &Channel{
-			channel: make(chan []interface{}),
-			columns: cm,
-			config:  spec,
+			name:          name,
+			channel:       make(chan []interface{}),
+			columns:       spec.columnsMap,
+			domainKeySpec: spec.DomainKeysInfo,
+			config:        spec,
+		}
+		if len(spec.ClassName) > 0 {
+			// log.Printf("*** Channel '%s' for domain class %s, domain_keys: %v\n",
+			// 	name, spec.ClassName, domainKeysByClass[spec.ClassName])
+			if spec.DomainKeysInfo == nil && domainKeysByClass != nil {
+				channelRegistry.computeChannels[name].domainKeySpec = domainKeysByClass[spec.ClassName]
+			}
 		}
 	}
 	if inputChannelName != "input_row" {
@@ -156,12 +223,12 @@ func (cpCtx *ComputePipesContext) StartComputePipes(dbpool *pgxpool.Pool, comput
 			goto gotError
 		}
 		inputRowChannel = &InputChannel{
-			channel: computePipesInputCh,
-			columns: inChannel.columns,
-			config: &ChannelSpec{
-				Name:    "input_row",
-				Columns: inChannel.config.Columns,
-			},
+			name:           "input_row",
+			channel:        computePipesInputCh,
+			columns:        inChannel.columns,
+			domainKeySpec:  inChannel.domainKeySpec,
+			config:         inChannel.config,
+			hasGroupedRows: cpCtx.CpConfig.PipesConfig[0].InputChannel.HasGroupedRows,
 		}
 		cpCtx.CpConfig.PipesConfig[0].InputChannel.Name = "input_row"
 		channelRegistry.inputRowChannel = inputRowChannel
@@ -174,7 +241,9 @@ func (cpCtx *ComputePipesContext) StartComputePipes(dbpool *pgxpool.Pool, comput
 	// Prepare the output tables
 	for i := range cpCtx.CpConfig.OutputTables {
 		tableName := cpCtx.CpConfig.OutputTables[i].Name
-		if strings.Contains(tableName, "$") {
+		lc := 0
+		for strings.Contains(tableName, "$") && lc < 5 && cpCtx.EnvSettings != nil {
+			lc += 1
 			for k, v := range cpCtx.EnvSettings {
 				value, ok := v.(string)
 				if ok {
@@ -187,14 +256,20 @@ func (cpCtx *ComputePipesContext) StartComputePipes(dbpool *pgxpool.Pool, comput
 			cpErr = fmt.Errorf("while splitting table name: %s", err)
 			goto gotError
 		}
-		outChannel = channelRegistry.computeChannels[cpCtx.CpConfig.OutputTables[i].Key]
-		if outChannel == nil {
-			cpErr = fmt.Errorf("error: invalid Compute Pipes configuration: Output table %s does not have a channel configuration",
+		if len(cpCtx.CpConfig.OutputTables[i].ChannelSpecName) == 0 {
+			cpErr = fmt.Errorf("error: invalid Compute Pipes configuration: channel_spec_name missing for Output table %s",
 				cpCtx.CpConfig.OutputTables[i].Name)
 			goto gotError
 		}
-		channelRegistry.outputTableChannels = append(channelRegistry.outputTableChannels, cpCtx.CpConfig.OutputTables[i].Key)
-		// log.Println("*** Channel for Output Table", tableIdentifier, "is:", outChannel.config.Name)
+		outChannel = channelRegistry.computeChannels[cpCtx.CpConfig.OutputTables[i].ChannelSpecName]
+		if outChannel == nil {
+			cpErr = fmt.Errorf("error: invalid Compute Pipes configuration: channel_spec_name '%s' not found for Output table %s",
+				cpCtx.CpConfig.OutputTables[i].ChannelSpecName,
+				cpCtx.CpConfig.OutputTables[i].Name)
+			goto gotError
+		}
+		channelRegistry.outputTableChannels = append(channelRegistry.outputTableChannels, cpCtx.CpConfig.OutputTables[i].ChannelSpecName)
+		// log.Println("*** Channel for Output Table", tableIdentifier, "is:", outChannel.name)
 		wt = WriteTableSource{
 			source:          outChannel.channel,
 			tableIdentifier: tableIdentifier,
@@ -204,7 +279,9 @@ func (cpCtx *ComputePipesContext) StartComputePipes(dbpool *pgxpool.Pool, comput
 		cpCtx.ChResults.Copy2DbResultCh <- table
 		go wt.WriteTable(dbpool, cpCtx.Done, table)
 	}
-	// log.Println("*** Compute Pipes output tables ready")
+	if cpCtx.CpConfig.ClusterConfig.IsDebugMode {
+		log.Println("Compute Pipes output tables ready")
+	}
 
 	ctx = &BuilderContext{
 		dbpool:             dbpool,
@@ -214,20 +291,15 @@ func (cpCtx *ComputePipesContext) StartComputePipes(dbpool *pgxpool.Pool, comput
 		processName:        cpCtx.ProcessName,
 		channelRegistry:    channelRegistry,
 		lookupTableManager: lookupManager,
+		s3DeviceManager:    cpCtx.S3DeviceMgr,
 		schemaManager:      cpCtx.SchemaManager,
+		inputParquetSchema: inputParquetSchema,
 		done:               cpCtx.Done,
 		errCh:              cpCtx.ErrCh,
 		chResults:          cpCtx.ChResults,
 		env:                cpCtx.EnvSettings,
 		nodeId:             cpCtx.NodeId,
 	}
-	err = ctx.NewS3DeviceManager()
-	if err != nil {
-		cpErr = err
-		goto gotError
-	}
-	// Set the S3DeviceManager to ComputePipesContext so it's avail when cpipes wind down
-	cpCtx.S3DeviceMgr = ctx.s3DeviceManager
 
 	// Start the metric reporting goroutine
 	if cpCtx.CpConfig.MetricsConfig != nil && ctx.cpConfig.MetricsConfig.ReportInterval > 0 {
@@ -248,17 +320,19 @@ func (cpCtx *ComputePipesContext) StartComputePipes(dbpool *pgxpool.Pool, comput
 	// Wait until the lookup tables are ready
 	managersWg.Wait()
 
-	// log.Println("Calling ctx.buildComputeGraph()")
-	err = ctx.buildComputeGraph()
+	// log.Println("Calling ctx.BuildComputeGraph()")
+	err = ctx.BuildComputeGraph()
 	if err != nil {
 		cpErr = fmt.Errorf("while building the compute graph: %s", err)
 		goto gotError
 	}
-	// log.Println("Calling ctx.buildComputeGraph() completed")
+	// log.Println("Calling ctx.BuildComputeGraph() completed")
 
 	// All done!
 	close(cpCtx.ChResults.Copy2DbResultCh)
 	close(cpCtx.ChResults.WritePartitionsResultCh)
+	close(cpCtx.ChResults.JetrulesWorkerResultCh)
+	close(cpCtx.ChResults.ClusteringResultCh)
 	return
 
 gotError:
@@ -267,6 +341,12 @@ gotError:
 	close(cpCtx.Done)
 	close(cpCtx.ChResults.Copy2DbResultCh)
 	close(cpCtx.ChResults.WritePartitionsResultCh)
+	close(cpCtx.ChResults.JetrulesWorkerResultCh)
+	close(cpCtx.ChResults.ClusteringResultCh)
+	if cpCtx.S3DeviceMgr == nil {
+		// Got error before the s3 device manager was created, close the chan manually
+		close(cpCtx.ChResults.S3PutObjectResultCh)
+	}
 }
 
 func UnmarshalComputePipesConfig(computePipesJson *string) (*ComputePipesConfig, error) {

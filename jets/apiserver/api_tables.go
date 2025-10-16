@@ -1,16 +1,13 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"log"
 	"net/http"
 	"os"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/artisoft-io/jetstore/jets/datatable"
@@ -37,29 +34,66 @@ func (server *Server) DoDataTableAction(w http.ResponseWriter, r *http.Request) 
 		ERROR(w, http.StatusUnprocessableEntity, err)
 		return
 	}
-	context := datatable.NewContext(server.dbpool, globalDevMode, *usingSshTunnel, unitTestDir, nbrShards, adminEmail)
+	ctx := datatable.NewDataTableContext(server.dbpool, globalDevMode, *usingSshTunnel, unitTestDir, adminEmail)
 	// Intercept specific dataTable action
 	switch dataTableAction.Action {
 	case "raw_query", "raw_query_tool":
-		results, code, err = context.ExecRawQuery(&dataTableAction, token)
+		results, code, err = ctx.ExecRawQuery(&dataTableAction, token)
 	case "exec_ddl":
-		results, code, err = context.ExecDataManagementStatement(&dataTableAction, token)
+		results, code, err = ctx.ExecDataManagementStatement(&dataTableAction, token)
 	case "raw_query_map":
-		results, code, err = context.ExecRawQueryMap(&dataTableAction, token)
+		results, code, err = ctx.ExecRawQueryMap(&dataTableAction, token)
 	case "insert_raw_rows":
-		results, code, err = context.InsertRawRows(&dataTableAction, token)
+		results, code, err = ctx.InsertRawRows(&dataTableAction, token)
 	case "insert_rows":
-		results, code, err = context.InsertRows(&dataTableAction, token)
+		results, code, err = ctx.InsertRows(&dataTableAction, token)
 	case "test_pipeline":
 		results = &map[string]interface{}{}
 		code = 200
-		datatable.UnitTestWorkspaceAction(context, &dataTableAction, token)
+		datatable.UnitTestWorkspaceAction(ctx, &dataTableAction, token)
+	case "resubmit_pipeline":
+		results = &map[string]interface{}{}
+		code = 200
+		sid, ok := dataTableAction.Data[0]["session_id"].(string)
+		if !ok {
+			err = fmt.Errorf("error: session_id must be string in resubmit_pipeline")
+			log.Printf("Error: %v", err)
+			ERROR(w, 400, err)
+			return
+		}
+		newSessionId, err := datatable.ReserveSessionId(server.dbpool)
+		if err != nil {
+			log.Printf("Error: %v", err)
+			ERROR(w, 400, err)
+			return
+		}
+		stmt := `INSERT INTO jetsapi.pipeline_execution_status (
+								pipeline_config_key, main_input_registry_key, main_input_file_key, 
+								client, process_name, main_object_type, input_session_id, session_id, source_period_key, status, user_email) 
+							(SELECT 
+								pipeline_config_key, main_input_registry_key, main_input_file_key, 
+								client, process_name, main_object_type, input_session_id, $1, source_period_key, 'pending', $2 
+							FROM jetsapi.pipeline_execution_status WHERE session_id = $3 )`
+		_, err = server.dbpool.Exec(context.TODO(), stmt, newSessionId, user, sid)
+		if err != nil {
+			err = fmt.Errorf("error: failed resubmit to database: %v", err)
+			log.Printf("Error: %v", err)
+			ERROR(w, 400, err)
+			return
+		}
+		// Start the pending task and check for timeouts
+		err = ctx.StartPendingTasks("cpipesSM")
+		if err != nil {
+			log.Printf("Error: %v", err)
+			ERROR(w, 400, err)
+			return
+		}
 
 	case "workspace_insert_rows":
-		results, code, err = context.WorkspaceInsertRows(&dataTableAction, token)
+		results, code, err = ctx.WorkspaceInsertRows(&dataTableAction, token)
 	case "workspace_query_structure":
 		// This function returns encoded json ready to return to client
-		resultsB, code, err := context.WorkspaceQueryStructure(&dataTableAction, token)
+		resultsB, code, err := ctx.WorkspaceQueryStructure(&dataTableAction, token)
 		if err != nil {
 			log.Printf("Error: %v", err)
 			ERROR(w, code, err)
@@ -69,7 +103,7 @@ func (server *Server) DoDataTableAction(w http.ResponseWriter, r *http.Request) 
 		return
 
 	case "add_workspace_file":
-		resultsB, code, err := context.AddWorkspaceFile(&dataTableAction, token)
+		resultsB, code, err := ctx.AddWorkspaceFile(&dataTableAction, token)
 		if err != nil {
 			log.Printf("Error: %v", err)
 			ERROR(w, code, err)
@@ -79,7 +113,7 @@ func (server *Server) DoDataTableAction(w http.ResponseWriter, r *http.Request) 
 		return
 
 	case "delete_workspace_files":
-		resultsB, code, err := context.DeleteWorkspaceFile(&dataTableAction, token)
+		resultsB, code, err := ctx.DeleteWorkspaceFile(&dataTableAction, token)
 		if err != nil {
 			log.Printf("Error: %v", err)
 			ERROR(w, code, err)
@@ -89,26 +123,26 @@ func (server *Server) DoDataTableAction(w http.ResponseWriter, r *http.Request) 
 		return
 
 	case "get_workspace_file_content":
-		results, code, err = context.GetWorkspaceFileContent(&dataTableAction, token)
+		results, code, err = ctx.GetWorkspaceFileContent(&dataTableAction, token)
 	case "save_workspace_file_content":
-		results, code, err = context.SaveWorkspaceFileContent(&dataTableAction, token)
+		results, code, err = ctx.SaveWorkspaceFileContent(&dataTableAction, token)
 	case "delete_workspace_changes":
-		results, code, err = context.DeleteWorkspaceChanges(&dataTableAction, token)
+		results, code, err = ctx.DeleteWorkspaceChanges(&dataTableAction, token)
 	case "delete_all_workspace_changes":
-		results, code, err = context.DeleteAllWorkspaceChanges(&dataTableAction, token)
+		results, code, err = ctx.DeleteAllWorkspaceChanges(&dataTableAction, token)
 
 	case "workspace_read":
-		results, code, err = context.DoWorkspaceReadAction(&dataTableAction, token)
+		results, code, err = ctx.DoWorkspaceReadAction(&dataTableAction, token)
 
 	case "save_workspace_client_config":
-		results, code, err = context.SaveWorkspaceClientConfig(&dataTableAction, token)
+		results, code, err = ctx.SaveWorkspaceClientConfig(&dataTableAction, token)
 
 	case "read":
-		results, code, err = context.DoReadAction(&dataTableAction, token)
+		results, code, err = ctx.DoReadAction(&dataTableAction, token)
 	case "preview_file":
-		results, code, err = context.DoPreviewFileAction(&dataTableAction, token)
+		results, code, err = ctx.DoPreviewFileAction(&dataTableAction, token)
 	case "drop_table":
-		results, code, err = context.DropTable(&dataTableAction, token)
+		results, code, err = ctx.DropTable(&dataTableAction, token)
 	case "refresh_token":
 		results = &map[string]interface{}{}
 		code = http.StatusOK
@@ -132,70 +166,6 @@ func (server *Server) DoDataTableAction(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	addToken(r, results)
-	JSON(w, http.StatusOK, results)
-}
-
-func (server *Server) readLocalFiles(w http.ResponseWriter, r *http.Request, dataTableAction *datatable.DataTableAction) {
-	fileSystem := os.DirFS(*unitTestDir)
-	dirData := make([]map[string]string, 0)
-	key := 1
-	err := fs.WalkDir(fileSystem, ".", func(path string, info fs.DirEntry, err error) error {
-		if err != nil {
-			log.Printf("ERROR while walking unit test directory %q: %v", path, err)
-			return err
-		}
-		if info.IsDir() {
-			// fmt.Printf("visiting directory: %+v \n", info.Name())
-			return nil
-		}
-		// fmt.Printf("visited file: %q\n", path)
-		pathSplit := strings.Split(path, "/")
-		if len(pathSplit) != 3 {
-			log.Printf("Invalid path found while walking unit test directory %q: skipping it", path)
-			return nil
-		}
-		if strings.HasPrefix(pathSplit[2], "err_") {
-			// log.Printf("Found loader error file while walking unit test directory %q: skipping it", path)
-			return nil
-		}
-		data := make(map[string]string, 5)
-		data["key"] = strconv.Itoa(key)
-		key += 1
-		data["client"] = pathSplit[0]
-		data["object_type"] = pathSplit[1]
-		data["file_key"] = *unitTestDir + "/" + path
-		data["last_update"] = time.Now().Format(time.RFC3339)
-		dirData = append(dirData, data)
-		return nil
-	})
-	if err != nil {
-		log.Printf("error walking the path %q: %v\n", *unitTestDir, err)
-		ERROR(w, http.StatusInternalServerError, errors.New("error while walking the unit test directory"))
-		return
-	}
-
-	// package the result, sending back only the requested collumns
-	resultRows := make([][]string, 0, len(dirData))
-	for iRow := range dirData {
-		var row []string
-		//* Need to port the raw queries to named parametrized queries as non raw queries!
-		if len(dataTableAction.Columns) > 0 {
-			row = make([]string, len(dataTableAction.Columns))
-			for iCol, col := range dataTableAction.Columns {
-				row[iCol] = dirData[iRow][col.Column]
-			}
-		} else {
-			row = make([]string, 1)
-			row[0] = dirData[iRow]["file_key"]
-		}
-		resultRows = append(resultRows, row)
-	}
-
-	results := makeResult(r)
-	results["rows"] = resultRows
-	results["totalRowCount"] = len(dirData)
-	// fmt.Println("file_key_staging DEV MODE:")
-	// json.NewEncoder(os.Stdout).Encode(results)
 	JSON(w, http.StatusOK, results)
 }
 

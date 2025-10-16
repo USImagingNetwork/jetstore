@@ -643,6 +643,14 @@ class JetsDataTableState extends FormFieldState<WidgetField> {
         _toggleCheckboxVisible();
         break;
 
+      // clear home filters
+      case DataTableActionType.clearHomeFilters:
+        JetsRouterDelegate().homeFilters = [];
+        JetsRouterDelegate().dataRegistryFilters = [];
+        JetsRouterDelegate().homeFiltersState = {};
+        _refreshTable();
+        break;
+
       // Call server to do an action
       case DataTableActionType.doAction:
         JetsRow? row = dataSource.getFirstSelectedRow();

@@ -20,10 +20,18 @@ type DistinctTransformationPipe struct {
 }
 
 // Implementing interface PipeTransformationEvaluator
-func (ctx *DistinctTransformationPipe) apply(input *[]interface{}) error {
+func (ctx *DistinctTransformationPipe) Apply(input *[]interface{}) error {
 	if input == nil {
 		return fmt.Errorf("error: unexpected null input arg in DistinctTransformationPipe")
 	}
+	// Skip row that are not valid
+	inputLen := len(*input)
+	expectedLen := len(ctx.source.config.Columns)
+	if inputLen != expectedLen {
+		// Skip the row
+		return nil
+	}
+
 	// make the key
 	ckeys := make([]string, 0, len(ctx.compositeKey))
 	for i := range ctx.compositeKey {
@@ -47,11 +55,11 @@ func (ctx *DistinctTransformationPipe) apply(input *[]interface{}) error {
 	return nil
 }
 
-func (ctx *DistinctTransformationPipe) done() error {
+func (ctx *DistinctTransformationPipe) Done() error {
 	return nil
 }
 
-func (ctx *DistinctTransformationPipe) finally() {}
+func (ctx *DistinctTransformationPipe) Finally() {}
 
 func (ctx *BuilderContext) NewDistinctTransformationPipe(source *InputChannel, outputCh *OutputChannel, spec *TransformationSpec) (*DistinctTransformationPipe, error) {
 	if spec == nil || spec.DistinctConfig == nil {
@@ -60,7 +68,7 @@ func (ctx *BuilderContext) NewDistinctTransformationPipe(source *InputChannel, o
 	// Make the composite key
 	compositeKey := make([]int, 0, len(spec.DistinctConfig.DistinctOn))
 	for _, column := range spec.DistinctConfig.DistinctOn {
-		pos, ok := source.columns[column]
+		pos, ok := (*source.columns)[column]
 		if !ok {
 			return nil, fmt.Errorf("error: key column %s is not in the input channel (distinct operator)", column)
 		}

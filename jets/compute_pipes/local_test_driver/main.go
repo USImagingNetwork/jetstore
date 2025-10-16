@@ -7,9 +7,12 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"time"
 
 	"github.com/artisoft-io/jetstore/jets/awsi"
 	"github.com/artisoft-io/jetstore/jets/compute_pipes"
+	"github.com/artisoft-io/jetstore/jets/workspace"
+	"github.com/jackc/pgx/v4/pgxpool"
 )
 
 // Booter utility to execute cpipes (loader) in loop for each jets_partition
@@ -22,6 +25,7 @@ import (
 // JETS_s3_INPUT_PREFIX
 // JETS_s3_OUTPUT_PREFIX
 // JETS_s3_STAGE_PREFIX
+// JETS_s3_SCHEMA_TRIGGERS
 // JETS_S3_KMS_KEY_ARN
 // NBR_SHARDS default nbr_nodes of cluster
 // USING_SSH_TUNNEL Connect  to DB using ssh tunnel (expecting the ssh open)
@@ -35,12 +39,17 @@ var usingSshTunnel bool
 var awsRegion string
 var awsBucket string
 var dsn string
+var dbpool *pgxpool.Pool
 
 // var nbrNodes int
 
 func main() {
 	fmt.Println("LOCAL TEST DRIVER CMD LINE ARGS:", os.Args[1:])
 	flag.Parse()
+	start := time.Now()
+	defer func ()  {
+		log.Printf("*** COMPLETED in %v ***", time.Since(start))
+	}()
 	hasErr := false
 	var errMsg []string
 	var err error
@@ -90,6 +99,32 @@ func main() {
 		panic("Invalid argument(s)")
 	}
 
+	// open db connection
+	dbpool, err = pgxpool.Connect(context.Background(), dsn)
+	if err != nil {
+		log.Fatalf("while opening db connection: %v", err)
+	}
+	defer dbpool.Close()
+
+	// Sync workspace files
+	// Fetch the jetrules and lookup db
+	// When in dev mode, the apiserver refreshes the overriten workspace files
+	_, devMode := os.LookupEnv("JETSTORE_DEV_MODE")
+	if !devMode {
+		// Get the compiled rules
+		err = workspace.SyncWorkspaceFiles(dbpool, os.Getenv("WORKSPACE"), "workspace.tgz", true, false)
+		if err != nil {
+			log.Panicf("Error while synching workspace file from db: %v", err)
+		}
+		// Get the compiled lookups
+		err = workspace.SyncWorkspaceFiles(dbpool, os.Getenv("WORKSPACE"), "sqlite", false, true)
+		if err != nil {
+			log.Panicf("Error while synching workspace file from db: %v", err)
+		}
+	} else {
+		log.Println("We are in DEV_MODE, do not sync workspace file from db")
+	}
+
 	log.Println("CP Starter:")
 	log.Println("-----------")
 	log.Println("Got argument: awsBucket", awsBucket)
@@ -109,7 +144,7 @@ func main() {
 	fmt.Println("Start Sharding Arguments")
 	b, _ = json.MarshalIndent(shardingArgs, "", " ")
 	fmt.Println(string(b))
-	cpShardingRun, err := shardingArgs.StartShardingComputePipes(ctx, dsn)
+	cpShardingRun, _, err := shardingArgs.StartShardingComputePipes(ctx, dbpool)
 	if err != nil {
 		log.Fatalf("while calling StartShardingComputePipes: %v", err)
 	}
@@ -129,8 +164,8 @@ func main() {
 	cpipesCommands := cpShardingRun.CpipesCommands.([]compute_pipes.ComputePipesNodeArgs)
 	for i := range cpipesCommands {
 		cpipesCommand := cpipesCommands[i]
-		fmt.Println("## Sharding Node", i)
-		err = (&cpipesCommand).CoordinateComputePipes(ctx, dsn)
+		fmt.Println("## Sharding Node", i, "Calling CoordinateComputePipes")
+		err = (&cpipesCommand).CoordinateComputePipes(ctx, dbpool)
 		if err != nil {
 			log.Fatalf("while sharding node %d: %v", i, err)
 		}
@@ -143,11 +178,11 @@ func main() {
 	iter = 1
 	cpRun = &cpShardingRun
 	for {
-		fmt.Println("REDUCING ITER", iter)
+		fmt.Println("*** REDUCING ITER", iter, "Calling StartReducingComputePipes")
 		iter += 1
-		cpReducingRun, err := cpRun.StartReducing.StartReducingComputePipes(ctx, dsn)
+		cpReducingRun, err := cpRun.StartReducing.StartReducingComputePipes(ctx, dbpool)
 		switch {
-		case err == compute_pipes.ErrNoReducingStep:
+		case cpReducingRun.NoMoreTask:
 			goto completed
 		case err != nil:
 			log.Fatalf("while calling StartReducingComputePipes: %v", err)
@@ -165,8 +200,8 @@ func main() {
 			cpipesCommands = cpReducingRun.CpipesCommands.([]compute_pipes.ComputePipesNodeArgs)
 			for i := range cpipesCommands {
 				cpipesCommand := cpipesCommands[i]
-				fmt.Println("## Reducing Node", i)
-				err = (&cpipesCommand).CoordinateComputePipes(ctx, dsn)
+				fmt.Println("## Reducing Node", i, "Calling CoordinateComputePipes")
+				err = (&cpipesCommand).CoordinateComputePipes(ctx, dbpool)
 				if err != nil {
 					log.Fatalf("while reducing node %d: %v", i, err)
 				}

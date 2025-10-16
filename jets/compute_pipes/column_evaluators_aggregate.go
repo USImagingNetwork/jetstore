@@ -7,17 +7,18 @@ import (
 
 // TransformationColumnSpec Type count
 type countColumnEval struct {
-	inputPos int
+	inputPos  int
 	outputPos int
-	where evalExpression
+	where     evalExpression
 }
-func (ctx *countColumnEval) initializeCurrentValue(currentValue *[]interface{}) {
+
+func (ctx *countColumnEval) InitializeCurrentValue(currentValue *[]interface{}) {
 	if currentValue == nil {
 		return
 	}
 	(*currentValue)[ctx.outputPos] = int64(0)
 }
-func (ctx *countColumnEval) update(currentValue *[]interface{}, input *[]interface{}) error {
+func (ctx *countColumnEval) Update(currentValue *[]interface{}, input *[]interface{}) error {
 	if currentValue == nil || input == nil {
 		return fmt.Errorf("error countColumnEval.update cannot have nil currentValue or input")
 	}
@@ -26,7 +27,7 @@ func (ctx *countColumnEval) update(currentValue *[]interface{}, input *[]interfa
 		return nil
 	}
 	if ctx.where != nil {
-		w, err := ctx.where.eval(input)
+		w, err := ctx.where.eval(*input)
 		if err != nil {
 			return fmt.Errorf("while evaluating where on count aggregate: %v", err)
 		}
@@ -42,18 +43,20 @@ func (ctx *countColumnEval) update(currentValue *[]interface{}, input *[]interfa
 	(*currentValue)[ctx.outputPos] = count + 1
 	return nil
 }
-func (ctx *countColumnEval) done(currentValue *[]interface{}) error {
+func (ctx *countColumnEval) Done(currentValue *[]interface{}) error {
 	return nil
 }
 
-func (ctx *BuilderContext) buildCountEvaluator(source *InputChannel, outCh *OutputChannel,  spec *TransformationColumnSpec) (TransformationColumnEvaluator, error) {
+func (ctx *BuilderContext) BuildCountTCEvaluator(source *InputChannel, outCh *OutputChannel,
+	spec *TransformationColumnSpec) (TransformationColumnEvaluator, error) {
+
 	if spec == nil || spec.Expr == nil {
 		return nil, fmt.Errorf("error: Type count must have Expr != nil")
 	}
 	inputPos := -1
 	var ok bool
 	if *spec.Expr != "*" {
-		inputPos, ok = source.columns[*spec.Expr]
+		inputPos, ok = (*source.columns)[*spec.Expr]
 		if !ok {
 			return nil, fmt.Errorf("error: count needs a valid column name or * to count all rows")
 		}
@@ -61,37 +64,37 @@ func (ctx *BuilderContext) buildCountEvaluator(source *InputChannel, outCh *Outp
 	var where evalExpression
 	var err error
 	if spec.Where != nil {
-		where, err = ctx.buildExprNodeEvaluator(source, outCh, spec.Where)
+		where, err = ctx.BuildExprNodeEvaluator(source.name, *source.columns, spec.Where)
 		if err != nil {
 			return nil, fmt.Errorf("while building where expression: %v", err)
 		}
 	}
-	outputPos, ok := outCh.columns[spec.Name]
+	outputPos, ok := (*outCh.columns)[spec.Name]
 	if !ok {
-		return nil, fmt.Errorf("error column %s not found in output source %s", spec.Name, outCh.config.Name)
+		return nil, fmt.Errorf("error column %s not found in output source %s", spec.Name, outCh.name)
 	}
 	return &countColumnEval{
-		inputPos: inputPos,
+		inputPos:  inputPos,
 		outputPos: outputPos,
-		where: where,
+		where:     where,
 	}, nil
 }
 
-
 // TransformationColumnSpec Type distinct_count
 type distinctCountColumnEval struct {
-	inputPos int
-	outputPos int
+	inputPos       int
+	outputPos      int
 	distinctValues map[string]bool
-	where evalExpression
+	where          evalExpression
 }
-func (ctx *distinctCountColumnEval) initializeCurrentValue(currentValue *[]interface{}) {
+
+func (ctx *distinctCountColumnEval) InitializeCurrentValue(currentValue *[]interface{}) {
 	if currentValue == nil {
 		return
 	}
 	(*currentValue)[ctx.outputPos] = int64(0)
 }
-func (ctx *distinctCountColumnEval) update(currentValue *[]interface{}, input *[]interface{}) error {
+func (ctx *distinctCountColumnEval) Update(currentValue *[]interface{}, input *[]interface{}) error {
 	if currentValue == nil || input == nil {
 		return fmt.Errorf("error countColumnEval.update cannot have nil currentValue or input")
 	}
@@ -101,7 +104,7 @@ func (ctx *distinctCountColumnEval) update(currentValue *[]interface{}, input *[
 		return nil
 	}
 	if ctx.where != nil {
-		w, err := ctx.where.eval(input)
+		w, err := ctx.where.eval(*input)
 		if err != nil {
 			return fmt.Errorf("while evaluating where on distinct_count aggregate: %v", err)
 		}
@@ -120,34 +123,36 @@ func (ctx *distinctCountColumnEval) update(currentValue *[]interface{}, input *[
 	}
 	return nil
 }
-func (ctx *distinctCountColumnEval) done(currentValue *[]interface{}) error {
+func (ctx *distinctCountColumnEval) Done(currentValue *[]interface{}) error {
 	return nil
 }
 
-func (ctx *BuilderContext) buildDistinctCountEvaluator(source *InputChannel, outCh *OutputChannel,  spec *TransformationColumnSpec) (TransformationColumnEvaluator, error) {
+func (ctx *BuilderContext) BuildDistinctCountTCEvaluator(source *InputChannel, outCh *OutputChannel,
+	spec *TransformationColumnSpec) (TransformationColumnEvaluator, error) {
+
 	if spec == nil || spec.Expr == nil {
 		return nil, fmt.Errorf("error: Type distinct_count must have Expr != nil")
 	}
-	inputPos, ok := source.columns[*spec.Expr]
+	inputPos, ok := (*source.columns)[*spec.Expr]
 	if !ok {
 		return nil, fmt.Errorf("error, count_distinct needs a valid column name")
 	}
 	var where evalExpression
 	var err error
 	if spec.Where != nil {
-		where, err = ctx.buildExprNodeEvaluator(source, outCh, spec.Where)
+		where, err = ctx.BuildExprNodeEvaluator(source.name, *source.columns, spec.Where)
 		if err != nil {
 			return nil, fmt.Errorf("while building where expression: %v", err)
 		}
 	}
-	outputPos, ok := outCh.columns[spec.Name]
+	outputPos, ok := (*outCh.columns)[spec.Name]
 	if !ok {
-		return nil, fmt.Errorf("error column %s not found in output source %s", spec.Name, outCh.config.Name)
+		return nil, fmt.Errorf("error column %s not found in output source %s", spec.Name, outCh.name)
 	}
 	return &distinctCountColumnEval{
-		inputPos: inputPos,
-		outputPos: outputPos,
-		where: where,
+		inputPos:       inputPos,
+		outputPos:      outputPos,
+		where:          where,
 		distinctValues: make(map[string]bool),
 	}, nil
 }
@@ -170,7 +175,7 @@ func add(lhs interface{}, rhs interface{}) (interface{}, error) {
 	// 	case float64:
 	// 	case time.Time:
 	// 	}
-	
+
 	case int:
 		switch rhsv := rhs.(type) {
 		// case string:
@@ -185,8 +190,8 @@ func add(lhs interface{}, rhs interface{}) (interface{}, error) {
 			return int64(lhsv) + rhsv, nil
 
 		case float64:
-				return float64(lhsv) + rhsv, nil
-		// case time.Time:
+			return float64(lhsv) + rhsv, nil
+			// case time.Time:
 		}
 
 	case int64:
@@ -199,7 +204,7 @@ func add(lhs interface{}, rhs interface{}) (interface{}, error) {
 
 		case float64:
 			return float64(lhsv) + rhsv, nil
-		// case time.Time:
+			// case time.Time:
 		}
 
 	case float64:
@@ -212,25 +217,26 @@ func add(lhs interface{}, rhs interface{}) (interface{}, error) {
 
 		case float64:
 			return lhsv + rhsv, nil
-		// case time.Time:
+			// case time.Time:
 		}
 
-	// case time.Time:
+		// case time.Time:
 	}
-	return nil, fmt.Errorf("add called with unsupported types: (%T, %T)",lhs, rhs)
+	return nil, fmt.Errorf("add called with unsupported types: (%T, %T)", lhs, rhs)
 }
 
 // TransformationColumnSpec Type sum
 type sumColumnEval struct {
-	inputPos int
+	inputPos  int
 	outputPos int
-	where evalExpression
+	where     evalExpression
 }
-func (ctx *sumColumnEval) initializeCurrentValue(currentValue *[]interface{}) {
+
+func (ctx *sumColumnEval) InitializeCurrentValue(currentValue *[]interface{}) {
 	// by default use int64, may change to float64 based on data
 	(*currentValue)[ctx.outputPos] = int64(0)
 }
-func (ctx *sumColumnEval) update(currentValue *[]interface{}, input *[]interface{}) error {
+func (ctx *sumColumnEval) Update(currentValue *[]interface{}, input *[]interface{}) error {
 	if currentValue == nil || input == nil {
 		return fmt.Errorf("error sumColumnEval.update cannot have nil currentValue or input")
 	}
@@ -240,7 +246,7 @@ func (ctx *sumColumnEval) update(currentValue *[]interface{}, input *[]interface
 		return nil
 	}
 	if ctx.where != nil {
-		w, err := ctx.where.eval(input)
+		w, err := ctx.where.eval(*input)
 		if err != nil {
 			return fmt.Errorf("while evaluating where on sum aggregate: %v", err)
 		}
@@ -258,37 +264,38 @@ func (ctx *sumColumnEval) update(currentValue *[]interface{}, input *[]interface
 	(*currentValue)[ctx.outputPos] = cv
 	return nil
 }
-func (ctx *sumColumnEval) done(currentValue *[]interface{}) error {
+func (ctx *sumColumnEval) Done(currentValue *[]interface{}) error {
 	return nil
 }
 
-func (ctx *BuilderContext) buildSumEvaluator(source *InputChannel, outCh *OutputChannel,  spec *TransformationColumnSpec) (TransformationColumnEvaluator, error) {
+func (ctx *BuilderContext) BuildSumTCEvaluator(source *InputChannel, outCh *OutputChannel,
+	spec *TransformationColumnSpec) (TransformationColumnEvaluator, error) {
+
 	if spec == nil || spec.Expr == nil {
 		return nil, fmt.Errorf("error: Type sum must have Expr != nil")
 	}
-	inputPos, ok := source.columns[*spec.Expr]
+	inputPos, ok := (*source.columns)[*spec.Expr]
 	if !ok {
 		return nil, fmt.Errorf("error, sum needs a valid column name")
 	}
 	var where evalExpression
 	var err error
 	if spec.Where != nil {
-		where, err = ctx.buildExprNodeEvaluator(source, outCh, spec.Where)
+		where, err = ctx.BuildExprNodeEvaluator(source.name, *source.columns, spec.Where)
 		if err != nil {
 			return nil, fmt.Errorf("while building where expression for sum aggregate: %v", err)
 		}
 	}
-	outputPos, ok := outCh.columns[spec.Name]
+	outputPos, ok := (*outCh.columns)[spec.Name]
 	if !ok {
-		return nil, fmt.Errorf("error column %s not found in output source %s", spec.Name, outCh.config.Name)
+		return nil, fmt.Errorf("error column %s not found in output source %s", spec.Name, outCh.name)
 	}
 	return &sumColumnEval{
-		inputPos: inputPos,
+		inputPos:  inputPos,
 		outputPos: outputPos,
-		where: where,
+		where:     where,
 	}, nil
 }
-
 
 // min function used for aggregates, supports int, int64, float64, time
 func minAgg(lhs interface{}, rhs interface{}) (interface{}, error) {
@@ -306,7 +313,7 @@ func minAgg(lhs interface{}, rhs interface{}) (interface{}, error) {
 		case int64:
 			return min(int64(lhsv), rhsv), nil
 		case float64:
-				return min(float64(lhsv),  rhsv), nil
+			return min(float64(lhsv), rhsv), nil
 		}
 
 	case int64:
@@ -338,17 +345,18 @@ func minAgg(lhs interface{}, rhs interface{}) (interface{}, error) {
 			return rhsv, nil
 		}
 	}
-	return nil, fmt.Errorf("minAgg called with unsupported types: (%T, %T)",lhs, rhs)
+	return nil, fmt.Errorf("minAgg called with unsupported types: (%T, %T)", lhs, rhs)
 }
 
 // TransformationColumnSpec Type min
 type minColumnEval struct {
-	inputPos int
+	inputPos  int
 	outputPos int
-	where evalExpression
+	where     evalExpression
 }
-func (ctx *minColumnEval) initializeCurrentValue(currentValue *[]interface{}) {}
-func (ctx *minColumnEval) update(currentValue *[]interface{}, input *[]interface{}) error {
+
+func (ctx *minColumnEval) InitializeCurrentValue(currentValue *[]interface{}) {}
+func (ctx *minColumnEval) Update(currentValue *[]interface{}, input *[]interface{}) error {
 	if currentValue == nil || input == nil {
 		return fmt.Errorf("error minColumnEval.update cannot have nil currentValue or input")
 	}
@@ -357,7 +365,7 @@ func (ctx *minColumnEval) update(currentValue *[]interface{}, input *[]interface
 		return nil
 	}
 	if ctx.where != nil {
-		w, err := ctx.where.eval(input)
+		w, err := ctx.where.eval(*input)
 		if err != nil {
 			return fmt.Errorf("while evaluating where on min aggregate: %v", err)
 		}
@@ -372,33 +380,34 @@ func (ctx *minColumnEval) update(currentValue *[]interface{}, input *[]interface
 	}
 	return nil
 }
-func (ctx *minColumnEval) done(currentValue *[]interface{}) error {
+func (ctx *minColumnEval) Done(currentValue *[]interface{}) error {
 	return nil
 }
 
-func (ctx *BuilderContext) buildMinEvaluator(source *InputChannel, outCh *OutputChannel,  spec *TransformationColumnSpec) (*minColumnEval, error) {
+func (ctx *BuilderContext) BuildMinTCEvaluator(source *InputChannel, outCh *OutputChannel,
+	spec *TransformationColumnSpec) (TransformationColumnEvaluator, error) {
 	if spec == nil || spec.Expr == nil {
 		return nil, fmt.Errorf("error: Type min must have Expr != nil")
 	}
-	inputPos, ok := source.columns[*spec.Expr]
+	inputPos, ok := (*source.columns)[*spec.Expr]
 	if !ok {
 		return nil, fmt.Errorf("error, min needs a valid column name")
 	}
 	var where evalExpression
 	var err error
 	if spec.Where != nil {
-		where, err = ctx.buildExprNodeEvaluator(source, outCh, spec.Where)
+		where, err = ctx.BuildExprNodeEvaluator(source.name, *source.columns, spec.Where)
 		if err != nil {
 			return nil, fmt.Errorf("while building where expression for min aggregate: %v", err)
 		}
 	}
-	outputPos, ok := outCh.columns[spec.Name]
+	outputPos, ok := (*outCh.columns)[spec.Name]
 	if !ok {
-		return nil, fmt.Errorf("error column %s not found in output source %s", spec.Name, outCh.config.Name)
+		return nil, fmt.Errorf("error column %s not found in output source %s", spec.Name, outCh.name)
 	}
 	return &minColumnEval{
-		inputPos: inputPos,
+		inputPos:  inputPos,
 		outputPos: outputPos,
-		where: where,
+		where:     where,
 	}, nil
 }
