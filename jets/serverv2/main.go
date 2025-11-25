@@ -7,9 +7,9 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/artisoft-io/jetstore/jets/awsi"
-	"github.com/artisoft-io/jetstore/jets/dbutils"
 	"github.com/artisoft-io/jetstore/jets/serverv2/delegate"
 	"github.com/artisoft-io/jetstore/jets/workspace"
 	"github.com/jackc/pgx/v4/pgxpool"
@@ -47,16 +47,27 @@ var pipelineExecKey = flag.Int("peKey", -1, "Pipeline execution key (required or
 var poolSize = flag.Int("poolSize", 10, "Coroutines pool size constraint")
 var outSessionId = flag.String("sessionId", "", "Process session ID for the output Domain Tables. (required)")
 var limit = flag.Int("limit", -1, "Limit the number of input row (rete sessions), default no limit.")
-var nbrShards = flag.Int("nbrShards", 1, "Number of shards to use in sharding the created output entities (required, default 1")
 var shardId = flag.Int("shardId", -1, "Run the server process for this single shard. (required)")
 var userEmail = flag.String("userEmail", "", "User identifier to register the execution results (argument no longer used)")
 var completedMetric = flag.String("serverCompletedMetric", "serverCompleted", "Metric name to register the server execution successfull completion (default: serverCompleted)")
 var failedMetric = flag.String("serverFailedMetric", "serverFailed", "Metric name to register the server execution failure (default: serverFailed)")
 var devMode bool
+var nbrShards int
+
+func init() {
+	nbrShards, _ = strconv.Atoi(os.Getenv("NBR_SHARDS"))
+	if nbrShards == 0 {
+		nbrShards = 1
+	}
+}
 
 func main() {
 	fmt.Println("serverv2 CMD LINE ARGS:", os.Args[1:])
 	flag.Parse()
+	start := time.Now()
+	defer func ()  {
+		log.Printf("Completed in %v", time.Since(start))
+	}()
 
 	// validate command line arguments
 	hasErr := false
@@ -120,10 +131,6 @@ func main() {
 		}
 		*lookupDb = fmt.Sprintf("%s/%s/lookup.db", os.Getenv("WORKSPACES_HOME"), os.Getenv("WORKSPACE"))
 	}
-	if *nbrShards < 1 {
-		hasErr = true
-		errMsg = append(errMsg, "The number of shards (-nbrShards) for the output entities must at least be 1.")
-	}
 	if *outSessionId == "" && *pipelineExecKey < 0 {
 		hasErr = true
 		errMsg = append(errMsg, "The session id (-sessionId) must be provided since -peKey is not provided.")
@@ -175,12 +182,12 @@ func main() {
 	if !devMode {
 		// We're not in dev mode, sync the overriten workspace files
 		// We're interested in lookup.db and workspace.tgz 
-		err = workspace.SyncWorkspaceFiles(dbpool, os.Getenv("WORKSPACE"), dbutils.FO_Open, "sqlite", false, true)
+		err = workspace.SyncWorkspaceFiles(dbpool, os.Getenv("WORKSPACE"), "sqlite", false, true)
 		if err != nil {
 			log.Println("Error while synching workspace file from db:", err)
 			return
 		}
-		err = workspace.SyncWorkspaceFiles(dbpool, os.Getenv("WORKSPACE"), dbutils.FO_Open, "workspace.tgz", true, false)
+		err = workspace.SyncWorkspaceFiles(dbpool, os.Getenv("WORKSPACE"), "workspace.tgz", true, false)
 		if err != nil {
 			log.Println("Error while synching workspace file from db:", err)
 			return
@@ -196,7 +203,7 @@ func main() {
 		PoolSize:            *poolSize,
 		OutSessionId:        *outSessionId,
 		Limit:               *limit,
-		NbrShards:           *nbrShards,
+		NbrShards:           nbrShards,
 		ShardId:             *shardId,
 		CompletedMetric:     *completedMetric,
 		FailedMetric:        *failedMetric,

@@ -417,6 +417,9 @@ int get_int_literal(HJR handle, int*v)
   case rdf_literal_int32_t    : 
     *v = boost::get<LInt32>(r)->data;
     return 0;
+  case rdf_literal_int64_t    : 
+    *v = boost::get<LInt64>(r)->data;
+    return 0;
   default: return -1;
   }
 }
@@ -632,6 +635,8 @@ int dump_rdf_graph(HJRDF hdl)
 {
   if(not hdl) return -1;
   auto * rdf_session =  static_cast<RDFSession*>(hdl);
+  std::cout << "Meta Graph Contains "<<rdf_session->meta_graph()->size()<<" triples (c++ version):"<<std::endl;
+  std::cout << rdf_session->meta_graph()<<"---"<<std::endl;
   std::cout << "Asserted Graph Contains "<<rdf_session->asserted_graph()->size()<<" triples (c++ version):"<<std::endl;
   std::cout << rdf_session->asserted_graph()<<"---"<<std::endl;
   std::cout << "Inferred Graph Contains "<<rdf_session->inferred_graph()->size()<<" triples (c++ version):"<<std::endl;

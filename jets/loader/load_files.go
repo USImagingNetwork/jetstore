@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"encoding/csv"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/artisoft-io/jetstore/jets/csv"
 	"github.com/artisoft-io/jetstore/jets/compute_pipes"
 	"github.com/artisoft-io/jetstore/jets/schema"
 	"github.com/dimchansky/utfbom"
@@ -366,7 +366,7 @@ func loadFile2DB(headersDKInfo *schema.HeadersAndDomainKeysInfo, filePath *strin
 			var mainDomainKeyPos int
 			var mainShardIdPos int
 			for _, ot := range *objTypes {
-				groupingKey, shardId, err := headersDKInfo.ComputeGroupingKey(*nbrShards, &ot, &record, recordTypeOffset, &jetsKeyStr)
+				groupingKey, shardId, err := headersDKInfo.ComputeGroupingKey(nbrShards, &ot, &record, recordTypeOffset, &jetsKeyStr)
 				if err != nil {
 					badRowsPos = append(badRowsPos, currentLineNumber)
 					processingErrors = append(processingErrors, err.Error())
@@ -407,7 +407,7 @@ func loadFile2DB(headersDKInfo *schema.HeadersAndDomainKeysInfo, filePath *strin
 			}
 			if headersDKInfo.IsDomainKeyIsJetsKey(objectType) {
 				copyRec[mainDomainKeyPos] = jetsKeyStr
-				copyRec[mainShardIdPos] = schema.ComputeShardId(*nbrShards, jetsKeyStr)
+				copyRec[mainShardIdPos] = schema.ComputeShardId(nbrShards, jetsKeyStr)
 			}
 
 			copyRec[jetsKeyPos] = jetsKeyStr

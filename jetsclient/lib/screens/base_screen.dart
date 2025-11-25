@@ -280,6 +280,7 @@ class BaseScreenState extends State<BaseScreen> with TickerProviderStateMixin {
                       child: Padding(
                         padding: const EdgeInsets.fromLTRB(40.0, 0.0, 0.0, 0.0),
                         child: DropdownButtonFormField<String>(
+                            // initialValue: JetsRouterDelegate().selectedClient,
                             value: JetsRouterDelegate().selectedClient,
                             onChanged: (String? newValue) {
                               setState(() {
@@ -300,7 +301,9 @@ class BaseScreenState extends State<BaseScreen> with TickerProviderStateMixin {
                             nodes: menuEntries
                                 .map((menuEntry) => _makeTreeNode(
                                     0, context, themeData, menuEntry))
-                                .toList()),
+                                .toList(),
+                            treeController:
+                                TreeController(allNodesExpanded: false)),
                       ),
                     ),
                     if (JetsRouterDelegate().jetstoreVersion != '###')

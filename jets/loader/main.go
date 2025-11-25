@@ -49,7 +49,6 @@ var client = flag.String("client", "", "Client associated with the source locati
 var clientOrg = flag.String("org", "", "Client associated with the source location (required)")
 var objectType = flag.String("objectType", "", "The type of object contained in the file (required)")
 var userEmail = flag.String("userEmail", "", "User identifier to register the load (required)")
-var nbrShards = flag.Int("nbrShards", 1, "Number of shards to use in sharding the input file")
 var sourcePeriodKey = flag.Int("sourcePeriodKey", -1, "Source period key associated with the in_file (fileKey)")
 var sessionId = flag.String("sessionId", "", "Process session ID, is needed as -inSessionId for the server process (must be unique, required)")
 var completedMetric = flag.String("loaderCompletedMetric", "loaderCompleted", "Metric name to register the loader successfull completion (default: loaderCompleted)")
@@ -64,7 +63,7 @@ var processName string    // used only to register with pipeline_execution_detai
 var pipelineExecKey = flag.Int("peKey", -1, "Pipeline execution key (required for cpipes with multipart files)")
 var shardId = flag.Int("shardId", -1, "Run the cpipes process for this single shard. (required when peKey is provided)")
 var jetsPartition = flag.String("jetsPartition", "", "the jets_partition to process (case cpipes reducing mode)")
-var inputSessionId string		// needed to read the file_keys from sharding table when peKey is provided
+var inputSessionId string // needed to read the file_keys from sharding table when peKey is provided
 
 var tableName string
 var domainKeysJson string
@@ -72,6 +71,7 @@ var inputColumnsJson string
 var inputColumnsPositionsCsv string
 var inputFormat string
 var inputFormatDataJson string
+
 // var computePipesJson string
 var isPartFiles int
 var sep_flag jcsv.Chartype = '€'
@@ -84,10 +84,15 @@ var jetsDebug int
 var processingErrors []string
 var fileKeyComponents map[string]interface{}
 var fileKeyDate time.Time
+var nbrShards int
 
 func init() {
 	flag.Var(&sep_flag, "sep", "Field separator for csv files, default is auto detect between pipe ('|'), tilda ('~'), tab ('\t') or comma (',')")
 	processingErrors = make([]string, 0)
+	nbrShards, _ = strconv.Atoi(os.Getenv("NBR_SHARDS"))
+	if nbrShards == 0 {
+		nbrShards = 1
+	}
 }
 
 func main() {
@@ -133,12 +138,12 @@ func main() {
 		if *objectType == "" {
 			hasErr = true
 			errMsg = append(errMsg, "Object type of the input file must be provided (-objectType).")
-		}	
+		}
 	} else {
 		if *shardId == -1 {
 			hasErr = true
 			errMsg = append(errMsg, "-shardId must be provided when -peKey is provided.")
-		}	
+		}
 	}
 	if *dsn == "" && *awsDsnSecret == "" {
 		*dsn = os.Getenv("JETS_DSN_URI_VALUE")
@@ -179,7 +184,7 @@ func main() {
 	awsApiSecret := os.Getenv("AWS_API_SECRET")
 	apiSecret := os.Getenv("API_SECRET")
 	if apiSecret == "" && awsApiSecret != "" {
-		apiSecret, err = awsi.GetSecretValue(awsApiSecret)
+		apiSecret, err = awsi.GetCurrentSecretValue(awsApiSecret)
 		if err != nil {
 			hasErr = true
 			errMsg = append(errMsg, fmt.Sprintf("while getting apiSecret from aws secret: %v", err))
@@ -205,9 +210,6 @@ func main() {
 	if *clientOrg == "''" {
 		*clientOrg = ""
 	}
-	if *nbrShards < 1 {
-		*nbrShards = 1
-	}
 	if len(*cpipesCompletedMetric) > 0 {
 		*completedMetric = *cpipesCompletedMetric
 	}
@@ -225,7 +227,7 @@ func main() {
 	log.Println("Got argument: peKey", *pipelineExecKey)
 	log.Println("Got argument: shardId", *shardId)
 	log.Println("Got argument: jetsPartition", *jetsPartition)
-	log.Println("Got argument: nbrShards", *nbrShards)
+	log.Println("Got argument: nbrShards", nbrShards)
 	log.Println("Got argument: client", *client)
 	log.Println("Got argument: org", *clientOrg)
 	log.Println("Got argument: objectType", *objectType)
@@ -236,6 +238,7 @@ func main() {
 	log.Println("Got argument: loaderCompletedMetric", *completedMetric)
 	log.Println("Got argument: loaderFailedMetric", *failedMetric)
 	log.Println("Loader out dir (from env LOADER_ERR_DIR):", errOutDir)
+	log.Printf("ENV NBR_SHARDS: %s\n", os.Getenv("NBR_SHARDS"))
 	log.Printf("ENV JETS_BUCKET: %s\n", os.Getenv("JETS_BUCKET"))
 	log.Printf("ENV JETS_DSN_SECRET: %s\n", os.Getenv("JETS_DSN_SECRET"))
 	log.Printf("ENV JETS_LOADER_CHUNCK_SIZE: %s\n", os.Getenv("JETS_LOADER_CHUNCK_SIZE"))
@@ -258,7 +261,7 @@ func main() {
 	log.Println("ENV JETS_DOMAIN_KEY_SEPARATOR:", os.Getenv("JETS_DOMAIN_KEY_SEPARATOR"))
 	if devMode {
 		log.Println("Running in DEV MODE")
-		log.Println("Nbr Shards in DEV MODE: nbrShards", *nbrShards)
+		log.Println("Nbr Shards in DEV MODE: nbrShards", nbrShards)
 	}
 	jetsDebug, _ = strconv.Atoi(os.Getenv("JETS_LOG_DEBUG"))
 

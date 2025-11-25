@@ -13,7 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/artisoft-io/jetstore/jets/awsi"
 	"github.com/jackc/pgx/v4"
 	"github.com/jackc/pgx/v4/pgxpool"
 )
@@ -23,8 +22,6 @@ import (
 // JETS_DSN_SECRET
 // JETS_REGION
 // JETS_BUCKET
-// JETS_DSN_URI_VALUE
-// JETS_DSN_JSON_VALUE
 // JETS_s3_INPUT_PREFIX
 // CPIPES_STATUS_NOTIFICATION_ENDPOINT
 // CPIPES_STATUS_NOTIFICATION_ENDPOINT_JSON
@@ -38,27 +35,25 @@ import (
 // and then the connection properties (AwsDsnSecret, DbPoolSize, UsingSshTunnel, AwsRegion)
 // are not needed.
 type StatusUpdate struct {
-	CpipesMode     bool
-	AwsDsnSecret   string
-	DbPoolSize     int
-	UsingSshTunnel bool
-	AwsRegion      string
-	Dsn            string
-	Dbpool         *pgxpool.Pool
-	PeKey          int
-	Status         string
-	FileKey        string
-	FailureDetails string
+	CpipesMode            bool
+	CpipesEnv             map[string]any
+	UsingSshTunnel        bool
+	Dbpool                *pgxpool.Pool
+	PeKey                 int
+	Status                string
+	FileKey               string
+	FailureDetails        string
+	DoNotNotifyApiGateway bool
 }
 
 // Support Functions
 // --------------------------------------------------------------------------------------
 func getStatusCount(dbpool *pgxpool.Pool, pipelineExecutionKey int) (map[string]int, error) {
-	statusCountMap := make(map[string] int)
+	statusCountMap := make(map[string]int)
 	var status string
 	var count int
 	stmt := "SELECT count(*) AS count, status FROM jetsapi.pipeline_execution_details WHERE pipeline_execution_status_key=$1 GROUP BY status"
-	rows, err := dbpool.Query(context.Background(),	stmt,	pipelineExecutionKey)
+	rows, err := dbpool.Query(context.Background(), stmt, pipelineExecutionKey)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return statusCountMap, nil
@@ -89,19 +84,17 @@ func getOutputRecordCount(dbpool *pgxpool.Pool, pipelineExecutionKey int) int64 
 	}
 	return count.Int64
 }
-func getPeInfo(dbpool *pgxpool.Pool, pipelineExecutionKey int) (string, string, int, []string) {
-	var client, sessionId string
+func GetOutputTables(dbpool *pgxpool.Pool, pipelineExecutionKey int) ([]string, error) {
 	outTables := make([]string, 0)
-	var sourcePeriodKey int
 	err := dbpool.QueryRow(context.Background(),
-		`SELECT pe.client, pc.output_tables, pe.session_id, pe.source_period_key 
-		FROM jetsapi.process_config pc, jetsapi.pipeline_config plnc, jetsapi.pipeline_execution_status pe 
-		WHERE pc.process_name = plnc.process_name AND plnc.key = pe.pipeline_config_key AND pe.key = $1`,
-		pipelineExecutionKey).Scan(&client, &outTables, &sessionId, &sourcePeriodKey)
+		`SELECT pc.output_tables 
+		 FROM jetsapi.process_config pc, jetsapi.pipeline_execution_status pe 
+		 WHERE pc.process_name = pe.process_name AND pe.key = $1`,
+		pipelineExecutionKey).Scan(&outTables)
 	if err != nil {
-		log.Fatalf("QueryRow on pipeline_execution_status failed: %v", err)
+		return nil, fmt.Errorf("while query output_tables from process_config: %v", err)
 	}
-	return client, sessionId, sourcePeriodKey, outTables
+	return outTables, nil
 }
 func updateStatus(dbpool *pgxpool.Pool, pipelineExecutionKey int, status string, failureDetails *string) error {
 	// Record the status of the pipeline execution
@@ -124,26 +117,8 @@ func (ca *StatusUpdate) ValidateArguments() []string {
 	if ca.PeKey < 0 {
 		errMsg = append(errMsg, "Pipeline Execution Status key must be provided (-peKey).")
 	}
-	if ca.Dsn == "" && ca.AwsDsnSecret == "" && ca.Dbpool == nil {
-		ca.Dsn = os.Getenv("JETS_DSN_URI_VALUE")
-		if ca.Dsn == "" {
-			var err error
-			ca.Dsn, err = awsi.GetDsnFromJson(os.Getenv("JETS_DSN_JSON_VALUE"), ca.UsingSshTunnel, ca.DbPoolSize)
-			if err != nil {
-				log.Printf("while calling GetDsnFromJson: %v", err)
-				ca.Dsn = ""
-			}
-		}
-		ca.AwsDsnSecret = os.Getenv("JETS_DSN_SECRET")
-		if ca.Dsn == "" && ca.AwsDsnSecret == "" {
-			errMsg = append(errMsg, "Connection string must be provided using either -awsDsnSecret or -dsn.")
-		}
-	}
-	if ca.AwsRegion == "" {
-		ca.AwsRegion = os.Getenv("JETS_REGION")
-	}
-	if ca.AwsDsnSecret != "" && ca.AwsRegion == "" {
-		errMsg = append(errMsg, "aws region (-awsRegion) must be provided when -awsDnsSecret is provided.")
+	if ca.Dbpool == nil {
+		errMsg = append(errMsg, "db connection must be provided to StatusUpdate")
 	}
 	// Check we have required env var
 	if os.Getenv("JETS_s3_INPUT_PREFIX") == "" {
@@ -152,27 +127,28 @@ func (ca *StatusUpdate) ValidateArguments() []string {
 
 	log.Println("Status Update Arguments:")
 	log.Println("----------------")
-	log.Println("Got argument: dsn, len", len(ca.Dsn))
-	log.Println("Got argument: awsRegion", ca.AwsRegion)
-	log.Println("Got argument: awsDsnSecret", ca.AwsDsnSecret)
-	log.Println("Got argument: dbPoolSize", ca.DbPoolSize)
 	log.Println("Got argument: usingSshTunnel", ca.UsingSshTunnel)
 	log.Println("Got argument: peKey", ca.PeKey)
 	log.Println("Got argument: status", ca.Status)
 	log.Println("Got argument: fileKey", ca.FileKey)
 	log.Println("Got argument: failureDetails", ca.FailureDetails)
-	log.Printf("ENV JETS_s3_INPUT_PREFIX: %s", os.Getenv("JETS_s3_INPUT_PREFIX"))
+	log.Println("Got argument: cpipesMode", ca.CpipesMode)
+	log.Println("Got argument: cpipesEnv", ca.CpipesEnv)
+	log.Println("Got argument: doNotNotifyApiGateway", ca.DoNotNotifyApiGateway)
+	log.Println("env JETS_s3_INPUT_PREFIX:", os.Getenv("JETS_s3_INPUT_PREFIX"))
 	log.Println("env CPIPES_STATUS_NOTIFICATION_ENDPOINT:", os.Getenv("CPIPES_STATUS_NOTIFICATION_ENDPOINT"))
 	log.Println("env CPIPES_STATUS_NOTIFICATION_ENDPOINT_JSON:", os.Getenv("CPIPES_STATUS_NOTIFICATION_ENDPOINT_JSON"))
 	log.Println("env CPIPES_CUSTOM_FILE_KEY_NOTIFICATION:", os.Getenv("CPIPES_CUSTOM_FILE_KEY_NOTIFICATION"))
 	log.Println("env CPIPES_START_NOTIFICATION_JSON:", os.Getenv("CPIPES_START_NOTIFICATION_JSON"))
 	log.Println("env CPIPES_COMPLETED_NOTIFICATION_JSON:", os.Getenv("CPIPES_COMPLETED_NOTIFICATION_JSON"))
 	log.Println("env CPIPES_FAILED_NOTIFICATION_JSON:", os.Getenv("CPIPES_FAILED_NOTIFICATION_JSON"))
+	log.Println("env JETS_DSN_SECRET:", os.Getenv("JETS_DSN_SECRET"))
 
 	return errMsg
 }
 
-func DoNotifyApiGateway(fileKey, apiEndpoint, apiEndpointJson, notificationTemplate string, customFileKeys []string, errMsg string) error {
+func DoNotifyApiGateway(fileKey, apiEndpoint, apiEndpointJson, notificationTemplate string,
+	customFileKeys []string, errMsg string, envSettings map[string]any) error {
 	var (
 		ctx    context.Context
 		cancel context.CancelFunc
@@ -189,32 +165,32 @@ func DoNotifyApiGateway(fileKey, apiEndpoint, apiEndpointJson, notificationTempl
 	} else {
 		ctx, cancel = context.WithCancel(context.Background())
 	}
-	defer cancel() // Cancel ctx as soon as CoordinateWork returns.
+	defer cancel() // Cancel ctx as soon as DoNotifyApiGateway returns.
 	// Prepare the API request.
 	var value string
 	// Extract file key components
-	keyMap := make(map[string]interface{})
-	keyMap = SplitFileKeyIntoComponents(keyMap, &fileKey)
-	v := keyMap["client"]
+	fileKeyComponents := make(map[string]any)
+	fileKeyComponents = SplitFileKeyIntoComponents(fileKeyComponents, &fileKey)
+	v := fileKeyComponents["client"]
 	if v != nil {
 		notificationTemplate = strings.ReplaceAll(notificationTemplate, "{{client}}", v.(string))
 	} else {
 		notificationTemplate = strings.ReplaceAll(notificationTemplate, "{{client}}", "")
 	}
-	v = keyMap["org"]
+	v = fileKeyComponents["org"]
 	if v != nil {
 		notificationTemplate = strings.ReplaceAll(notificationTemplate, "{{org}}", v.(string))
 	} else {
 		notificationTemplate = strings.ReplaceAll(notificationTemplate, "{{org}}", "")
 	}
-	v = keyMap["object_type"]
+	v = fileKeyComponents["object_type"]
 	if v != nil {
 		notificationTemplate = strings.ReplaceAll(notificationTemplate, "{{object_type}}", v.(string))
 	} else {
 		notificationTemplate = strings.ReplaceAll(notificationTemplate, "{{object_type}}", "")
 	}
 	for _, key := range customFileKeys {
-		switch vv := keyMap[key].(type) {
+		switch vv := fileKeyComponents[key].(type) {
 		case string:
 			value = vv
 		default:
@@ -222,6 +198,7 @@ func DoNotifyApiGateway(fileKey, apiEndpoint, apiEndpointJson, notificationTempl
 		}
 		value = strings.ReplaceAll(value, `"`, `\"`)
 		notificationTemplate = strings.ReplaceAll(notificationTemplate, fmt.Sprintf("{{%s}}", key), value)
+		apiEndpointJson = strings.ReplaceAll(apiEndpointJson, fmt.Sprintf("{{%s}}", key), value)
 	}
 
 	if len(errMsg) > 0 {
@@ -229,8 +206,19 @@ func DoNotifyApiGateway(fileKey, apiEndpoint, apiEndpointJson, notificationTempl
 		notificationTemplate = strings.ReplaceAll(notificationTemplate, "{{error}}", errMsg)
 	}
 
+	// Do substitution using key/value provided by cpipes config and main schema provider
+	for key, value := range envSettings {
+		str, ok := value.(string)
+		if ok && strings.HasPrefix(key, "$") {
+			notificationTemplate = strings.ReplaceAll(notificationTemplate, fmt.Sprintf("{{%s}}", key[1:]), str)
+			if len(apiEndpoint) == 0 {
+				apiEndpointJson = strings.ReplaceAll(apiEndpointJson, fmt.Sprintf("{{%s}}", key[1:]), str)
+			}
+		}
+	}
+
 	// Identify the endpoint where to send the request
-	if apiEndpoint == "" {
+	if len(apiEndpoint) == 0 {
 		routes := make(map[string]string)
 		err = json.Unmarshal([]byte(apiEndpointJson), &routes)
 		if err != nil {
@@ -238,20 +226,35 @@ func DoNotifyApiGateway(fileKey, apiEndpoint, apiEndpointJson, notificationTempl
 			log.Println(err)
 			return err
 		}
-		key := routes["key"]
-		if key == "" {
-			log.Println("Invalid routing json, key is missing")
-			return fmt.Errorf("error: invalid routing json, key is missing")
+		// key := routes["key"]
+		// altKey := routes["alt_key"]
+		if len(routes["key"]) == 0 && len(routes["alt_key"]) == 0 {
+			log.Println("Invalid routing json, key and alt_key are both missing, need at leat one to be set.")
+			return fmt.Errorf("error: invalid routing json, key and alt_key are missing, need at least one to be set")
 		}
-		v = keyMap[key]
-		if v == nil {
-			err = fmt.Errorf("error: routing file key component '%v' not found on file key", v)
-			log.Println(err)
-			return err
+		keys := []string{routes["key"], routes["alt_key"]}
+		for _, key := range keys {
+			if len(key) == 0 {
+				continue
+			}
+			// Check if it's a fileKeyComponents
+			routingObj := fileKeyComponents[key]
+			routingKey, ok := routingObj.(string)
+			if ok {
+				apiEndpoint = routes[strings.ToUpper(routingKey)]
+				if len(apiEndpoint) > 0 {
+					break
+				}
+			}
+			// Check if can route with key
+			apiEndpoint = routes[strings.ToUpper(key)]
+			if len(apiEndpoint) > 0 {
+				break
+			}
 		}
-		apiEndpoint = routes[v.(string)]
-		if apiEndpoint == "" {
-			err = fmt.Errorf("error: notification rendpoint not found for file key component '%s' with value %v", key, v)
+
+		if len(apiEndpoint) == 0 {
+			err = fmt.Errorf("error: notification endpoint not found for routing keys: %v", keys)
 			log.Println(err)
 			return err
 		}
@@ -279,46 +282,65 @@ func DoNotifyApiGateway(fileKey, apiEndpoint, apiEndpointJson, notificationTempl
 }
 
 func (ca *StatusUpdate) CoordinateWork() error {
+	// Expecting to have an open db connection
+	if ca.Dbpool == nil {
+		return fmt.Errorf("error: StatusUpdate.CoordinateWork is expecting to have an opened db connections")
+	}
+
+	// Need to get the main input schema provider to see if there is an override on the notification template
+	// Getting session id as well, so doing the call even if apiEndpoint is not specified
+	schemaProviderJson, sessionId, err := GetSchemaProviderJsonFromPipelineKey(ca.Dbpool, ca.PeKey)
+	log.Printf("%s Status '%s' for %s\n", sessionId, ca.Status, ca.FileKey)
+
 	// NOTE 2024-05-13 Added Notification to API Gateway via env var CPIPES_STATUS_NOTIFICATION_ENDPOINT
 	// or CPIPES_STATUS_NOTIFICATION_ENDPOINT_JSON
 	// ALSO set a deadline to calls to database to avoid locks, don't fail the call when database fails
 	apiEndpoint := os.Getenv("CPIPES_STATUS_NOTIFICATION_ENDPOINT")
 	apiEndpointJson := os.Getenv("CPIPES_STATUS_NOTIFICATION_ENDPOINT_JSON")
-	if apiEndpoint != "" || apiEndpointJson != "" {
+	if (apiEndpoint != "" || apiEndpointJson != "") && !ca.DoNotNotifyApiGateway {
 		var notificationTemplate string
+		var errMsg string
 		customFileKeys := make([]string, 0)
 		ck := os.Getenv("CPIPES_CUSTOM_FILE_KEY_NOTIFICATION")
 		if len(ck) > 0 {
 			customFileKeys = strings.Split(ck, ",")
 		}
-		var errMsg string
-		if ca.Status == "failed" {
-			notificationTemplate = os.Getenv("CPIPES_FAILED_NOTIFICATION_JSON")
-			errMsg = ca.FailureDetails
-		} else {
-			notificationTemplate = os.Getenv("CPIPES_COMPLETED_NOTIFICATION_JSON")
+
+		if err != nil {
+			return fmt.Errorf("while getting schema provider json from peKey %d in status_update: %v", ca.PeKey, err)
 		}
-		// ignore returned err
-		DoNotifyApiGateway(ca.FileKey, apiEndpoint, apiEndpointJson, notificationTemplate, customFileKeys, errMsg)
-	}
-	// open db connection, if not already opened
-	var err error
-	if ca.Dbpool == nil {
-		if ca.AwsDsnSecret != "" {
-			// Get the dsn from the aws secret
-			ca.Dsn, err = awsi.GetDsnFromSecret(ca.AwsDsnSecret, ca.UsingSshTunnel, ca.DbPoolSize)
-			if err != nil {
-				return fmt.Errorf("while getting dsn from aws secret: %v", err)
+		if len(schemaProviderJson) > 0 {
+			type SchemaProviderShort struct {
+				NotificationTemplatesOverrides   map[string]string `json:"notification_templates_overrides"`
+				NotificationRoutingOverridesJson string            `json:"notification_routing_overrides_json"`
+			}
+			schemaProvider := SchemaProviderShort{}
+			err = json.Unmarshal([]byte(schemaProviderJson), &schemaProvider)
+			if err == nil {
+				if schemaProvider.NotificationTemplatesOverrides != nil {
+					if ca.Status == "failed" {
+						notificationTemplate = schemaProvider.NotificationTemplatesOverrides["CPIPES_FAILED_NOTIFICATION_JSON"]
+						errMsg = ca.FailureDetails
+					} else {
+						notificationTemplate = schemaProvider.NotificationTemplatesOverrides["CPIPES_COMPLETED_NOTIFICATION_JSON"]
+					}
+				}
+				if len(schemaProvider.NotificationRoutingOverridesJson) > 0 {
+					apiEndpointJson = schemaProvider.NotificationRoutingOverridesJson
+				}
 			}
 		}
-		ca.Dbpool, err = pgxpool.Connect(context.Background(), ca.Dsn)
-		if err != nil {
-			return fmt.Errorf("while opening db connection: %v", err)
+		// Get the template defined at deployment if no override was found
+		if len(notificationTemplate) == 0 {
+			if ca.Status == "failed" {
+				notificationTemplate = os.Getenv("CPIPES_FAILED_NOTIFICATION_JSON")
+				errMsg = ca.FailureDetails
+			} else {
+				notificationTemplate = os.Getenv("CPIPES_COMPLETED_NOTIFICATION_JSON")
+			}
 		}
-		defer func() {
-			ca.Dbpool.Close()
-			ca.Dbpool = nil
-		}()
+		// ignore returned err
+		DoNotifyApiGateway(ca.FileKey, apiEndpoint, apiEndpointJson, notificationTemplate, customFileKeys, errMsg, ca.CpipesEnv)
 	}
 
 	// Update the pipeline_execution_status based on worst case status
@@ -346,7 +368,9 @@ func (ca *StatusUpdate) CoordinateWork() error {
 		err = updateStatus(ca.Dbpool, ca.PeKey, "completed", nil)
 	}
 	if err != nil {
-		return fmt.Errorf("while updating process execution status: %v", err)
+		err = fmt.Errorf("while updating process execution status: %v", err)
+		log.Printf("%s %s\n", sessionId, err)
+		return err
 	}
 	if ca.CpipesMode {
 		// Put cpipes run stats in cpipes_execution_status_details table
@@ -383,17 +407,35 @@ func (ca *StatusUpdate) CoordinateWork() error {
 			return fmt.Errorf("while inserting in jetsapi.cpipes_execution_status_details: %v", err)
 		}
 	}
+	// Check for pending tasks ready to start
+	// Get the stateMachineName of the current task
+	var stateMachineName string
+	err = ca.Dbpool.QueryRow(context.Background(),
+		`SELECT pc.state_machine_name	FROM jetsapi.process_config pc, jetsapi.pipeline_execution_status pe 
+		   WHERE pc.process_name = pe.process_name AND pe.key = $1`,
+		ca.PeKey).Scan(&stateMachineName)
+	if err != nil {
+		return fmt.Errorf("while queryRow on pipeline_execution_status failed: %v", err)
+	}
+	ctx := NewDataTableContext(ca.Dbpool, ca.UsingSshTunnel, ca.UsingSshTunnel, nil, nil)
+	err = ctx.StartPendingTasks(stateMachineName)
+	if err != nil {
+		log.Printf("%s Warning: while starting pending task: %v", sessionId, err)
+		err = nil
+	}
 
-	// CpipesMode - don't register outTables
-	if !ca.CpipesMode { // CPIPES_MODE is empty, ie false
-		//* TODO OPTIMIZE THIS SQL, do not getPeInfo
-		_, _, _, outTables := getPeInfo(ca.Dbpool, ca.PeKey)
-		// Register out tables
-		if ca.Status != "failed" && len(outTables) > 0 && getOutputRecordCount(ca.Dbpool, ca.PeKey) > 0 {
-			err = RegisterDomainTables(ca.Dbpool, ca.UsingSshTunnel, ca.PeKey)
-			if err != nil {
-				return fmt.Errorf("while registrying out tables to input_registry: %v", err)
-			}
+	// Register outTables
+	outTables, err := GetOutputTables(ca.Dbpool, ca.PeKey)
+	if err != nil {
+		log.Printf("%s while getting output tables: %v", sessionId, err)
+		return err
+	}
+	// Register out tables
+	if ca.Status != "failed" && len(outTables) > 0 && getOutputRecordCount(ca.Dbpool, ca.PeKey) > 0 {
+		err = RegisterDomainTables(ca.Dbpool, ca.UsingSshTunnel, ca.PeKey)
+		if err != nil {
+			log.Printf("%s while registrying output tables: %v", sessionId, err)
+			return fmt.Errorf("while registrying out tables to input_registry: %v", err)
 		}
 	}
 

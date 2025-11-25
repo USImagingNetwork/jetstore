@@ -39,6 +39,12 @@ func (wt *WriteTableSource) Next() bool {
 	return ok
 }
 func (wt *WriteTableSource) Values() ([]interface{}, error) {
+	// fmt.Println("*** WriteTable Row ***")
+	// for _, v := range wt.pending {
+	// 	fmt.Printf("%v (%T), ", v, v)
+	// }
+	// fmt.Println()
+	// fmt.Println()
 	return wt.pending, nil
 }
 func (wt *WriteTableSource) Err() error {
@@ -69,7 +75,7 @@ func (wt *WriteTableSource) WriteTable(dbpool *pgxpool.Pool, done chan struct{},
 		close(copy2DbResultCh)
 	}()
 	log.Println("Write Table Started for", wt.tableIdentifier, "with", len(wt.columns), "columns")
-	// log.Println("Write Table Started for", wt.tableIdentifier, "with columns:", wt.columns)
+	// log.Println("*** Write Table Started for", wt.tableIdentifier, "with columns:", wt.columns)
 
 	recCount, err := dbpool.CopyFrom(context.Background(), wt.tableIdentifier, wt.columns, wt)
 	if err != nil {
@@ -105,6 +111,9 @@ func PrepareOutoutTable(dbpool *pgxpool.Pool, tableIdentifier pgx.Identifier, ta
 		return fmt.Errorf("while verifying if output table exists: %v", err)
 	}
 	if !tblExists {
+		if len(tableSpec.Columns) == 0 {
+			return fmt.Errorf("error: Table '%s' does not exists and cannot be created since no column info is available", tableIdentifier.Sanitize())
+		}
 		err = CreateOutputTable(dbpool, tableIdentifier, tableSpec)
 		if err != nil {
 			return fmt.Errorf("while creating table: %v", err)
@@ -151,6 +160,9 @@ func PrepareOutoutTable(dbpool *pgxpool.Pool, tableIdentifier pgx.Identifier, ta
 
 // Create the Output Table
 func CreateOutputTable(dbpool *pgxpool.Pool, tableName pgx.Identifier, tableSpec *TableSpec) error {
+	if len(tableSpec.Columns) == 0 {
+		return fmt.Errorf("error: Cannot create table '%s' without column info", tableName.Sanitize())
+	}
 	stmt := fmt.Sprintf("DROP TABLE IF EXISTS %s", tableName.Sanitize())
 	_, err := dbpool.Exec(context.Background(), stmt)
 	if err != nil {
