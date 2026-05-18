@@ -11,6 +11,7 @@ import (
 
 	"github.com/artisoft-io/jetstore/jets/datatable"
 	"github.com/artisoft-io/jetstore/jets/schema"
+	"github.com/artisoft-io/jetstore/jets/utils"
 	"github.com/jackc/pgx/v4/pgxpool"
 )
 
@@ -36,11 +37,12 @@ func (args *StartComputePipesArgs) StartShardingComputePipes(ctx context.Context
 		return result, nil, fmt.Errorf("error: the session id is already used")
 	}
 
-	cpipesStartup, err := args.initializeCpipes(ctx, dbpool)
+	cpipesStartup, err := args.shardingInitializeCpipes(ctx, dbpool)
 	if err != nil {
 		if cpipesStartup != nil {
 			mainInputSchemaProvider = cpipesStartup.MainInputSchemaProviderConfig
 		}
+		// Need to return mainInputSchemaProvider here to send failure notification
 		return result, mainInputSchemaProvider, err
 	}
 	mainInputSchemaProvider = cpipesStartup.MainInputSchemaProviderConfig
@@ -51,7 +53,7 @@ func (args *StartComputePipesArgs) StartShardingComputePipes(ctx context.Context
 		"-sessionId", args.SessionId,
 		"-filePath", strings.Replace(args.FileKey, os.Getenv("JETS_s3_INPUT_PREFIX"), os.Getenv("JETS_s3_OUTPUT_PREFIX"), 1),
 	}
-	result.SuccessUpdate = map[string]interface{}{
+	result.SuccessUpdate = map[string]any{
 		"-peKey":         strconv.Itoa(args.PipelineExecKey),
 		"-status":        "completed",
 		"cpipesMode":     true,
@@ -59,7 +61,7 @@ func (args *StartComputePipesArgs) StartShardingComputePipes(ctx context.Context
 		"file_key":       args.FileKey,
 		"failureDetails": "",
 	}
-	result.ErrorUpdate = map[string]interface{}{
+	result.ErrorUpdate = map[string]any{
 		"-peKey":         strconv.Itoa(args.PipelineExecKey),
 		"-status":        "failed",
 		"cpipesMode":     true,
@@ -68,73 +70,27 @@ func (args *StartComputePipesArgs) StartShardingComputePipes(ctx context.Context
 		"failureDetails": "",
 	}
 
-	log.Println("Start SHARDING", args.SessionId, "file_key:", args.FileKey)
+	log.Printf("%s Start StepId %d - %s - file key: %s",
+		args.SessionId, 0, cpipesStartup.CpConfig.GetStepName(0), args.FileKey)
 	b, _ := json.Marshal(*mainInputSchemaProvider)
 	log.Printf("*** Main Input Schema Provider:%s\n", string(b))
 
-	// Update output table schema
-	for i := range cpipesStartup.CpConfig.OutputTables {
-		tableName := cpipesStartup.CpConfig.OutputTables[i].Name
-		lc := 0
-		for strings.Contains(tableName, "$") && lc < 5 && len(cpipesStartup.CpConfig.Context) != 0 {
-			lc += 1
-			for i := range cpipesStartup.CpConfig.Context {
-				if cpipesStartup.CpConfig.Context[i].Type == "value" {
-					key := cpipesStartup.CpConfig.Context[i].Key
-					value := cpipesStartup.CpConfig.Context[i].Expr
-					tableName = strings.ReplaceAll(tableName, key, value)
-				}
-			}
-		}
-		tableIdentifier, err := SplitTableName(tableName)
-		if err != nil {
-			return result, mainInputSchemaProvider, fmt.Errorf("while splitting table name: %s", err)
-		}
-		// log.Println("*** Preparing / Updating Output Table", tableIdentifier)
-		err = PrepareOutoutTable(dbpool, tableIdentifier, cpipesStartup.CpConfig.OutputTables[i])
-		if err != nil {
-			return result, mainInputSchemaProvider, fmt.Errorf("while preparing output table: %s", err)
-		}
-	}
-	// log.Println("Compute Pipes output tables schema ready")
-
-	// Send CPIPES start notification to api gateway (install specific)
-	// NOTE 2024-05-13 Added Notification to API Gateway via env var CPIPES_STATUS_NOTIFICATION_ENDPOINT or CPIPES_STATUS_NOTIFICATION_ENDPOINT_JSON
-	apiEndpoint := os.Getenv("CPIPES_STATUS_NOTIFICATION_ENDPOINT")
-	var apiEndpointJson string
-	if len(mainInputSchemaProvider.NotificationRoutingOverridesJson) > 0 {
-		apiEndpointJson = mainInputSchemaProvider.NotificationRoutingOverridesJson
-	} else {
-		apiEndpointJson = os.Getenv("CPIPES_STATUS_NOTIFICATION_ENDPOINT_JSON")
-	}
-	if apiEndpoint != "" || apiEndpointJson != "" {
-		customFileKeys := make([]string, 0)
-		ck := os.Getenv("CPIPES_CUSTOM_FILE_KEY_NOTIFICATION")
-		if len(ck) > 0 {
-			customFileKeys = strings.Split(ck, ",")
-		}
-		var notificationTemplate string
-		if mainInputSchemaProvider.NotificationTemplatesOverrides != nil {
-			notificationTemplate = mainInputSchemaProvider.NotificationTemplatesOverrides["CPIPES_START_NOTIFICATION_JSON"]
-		}
-		if len(notificationTemplate) == 0 {
-			notificationTemplate = os.Getenv("CPIPES_START_NOTIFICATION_JSON")
-		}
-		// ignore returned err
-		datatable.DoNotifyApiGateway(args.FileKey, apiEndpoint, apiEndpointJson,
-			notificationTemplate, customFileKeys, "", cpipesStartup.EnvSettings)
-	}
-
 	// Shard the input file keys, determine the number of shards and associated configuration
-	shardResult, err := ShardFileKeys(ctx, dbpool, args.FileKey, args.SessionId,
-		&cpipesStartup.CpConfig, mainInputSchemaProvider)
+	// Peek into the input channel config, assuming GetComputePipes(0) is the sharding step
+	pc, _, err := cpipesStartup.CpConfig.GetComputePipes(0, cpipesStartup.EnvSettings)
+	if err != nil {
+		return result, mainInputSchemaProvider, fmt.Errorf("while peeking on compute pipes step 0: %v", err)
+	}
+	inputConfigPeek := pc[0].InputChannel
+	inputConfigPeek.schemaProviderConfig = mainInputSchemaProvider
+	shardResult, err := ShardFileKeys(ctx, dbpool, args.FileKey, args.SessionId, inputConfigPeek,
+		cpipesStartup.CpConfig.ClusterConfig, mainInputSchemaProvider)
 	if err != nil {
 		return result, mainInputSchemaProvider, err
 	}
 	if shardResult.clusterSpec.S3WorkerPoolSize == 0 {
 		shardResult.clusterSpec.S3WorkerPoolSize = min(shardResult.clusterShardingInfo.NbrPartitions, 20)
 	}
-	log.Printf("SHARDING using %d nodes", shardResult.nbrShardingNodes)
 
 	// Augment cpipesStartup.EnvSettings with cluster info, used in When statements
 	cpipesStartup.EnvSettings["multi_step_sharding"] = shardResult.clusterShardingInfo.MultiStepSharding
@@ -146,6 +102,8 @@ func (args *StartComputePipesArgs) StartShardingComputePipes(ctx context.Context
 	cpipesStartup.EnvSettings["nbr_partitions"] = shardResult.clusterShardingInfo.NbrPartitions
 	cpipesStartup.EnvSettings["$NBR_PARTITIONS"] = shardResult.clusterShardingInfo.NbrPartitions
 
+	log.Printf("%s SHARDING using %d nodes for total size %.4f gb", args.SessionId, shardResult.nbrShardingNodes, float64(cpipesStartup.EnvSettings["total_file_size_gb"].(float64)))
+
 	stepId := 0
 	pipeConfig, stepId, err := cpipesStartup.CpConfig.GetComputePipes(stepId, cpipesStartup.EnvSettings)
 	if err != nil {
@@ -154,15 +112,20 @@ func (args *StartComputePipesArgs) StartShardingComputePipes(ctx context.Context
 	if len(pipeConfig) == 0 {
 		return result, mainInputSchemaProvider, fmt.Errorf("error: compute pipes config contains no steps")
 	}
+
+	// Apply all conditional transformation specs
+	err = ApplyAllConditionalTransformationSpec(pipeConfig, cpipesStartup.EnvSettings)
+	if err != nil {
+		return result, mainInputSchemaProvider, fmt.Errorf("while applying conditional transformation spec: %v", err)
+	}
+
+	// Select the active output tables for this step
 	outputTables, err := SelectActiveOutputTable(cpipesStartup.CpConfig.OutputTables, pipeConfig)
 	if err != nil {
 		return result, mainInputSchemaProvider, fmt.Errorf("while calling SelectActiveOutputTable for stepId %d: %v", stepId, err)
 	}
 	inputChannelConfig := &pipeConfig[0].InputChannel
-	// Validate that the first PipeSpec[0].Input == "input_row"
-	if inputChannelConfig.Name != "input_row" {
-		return result, mainInputSchemaProvider, fmt.Errorf("error: invalid cpipes config, reducing_pipes_config[0][0].input must be 'input_row'")
-	}
+	inputChannelConfig.schemaProviderConfig = GetSchemaProviderConfigByKey(cpipesStartup.CpConfig.SchemaProviders, inputChannelConfig.SchemaProvider)
 
 	// Check if need to get headers from file or if need to determine the csv delimiter
 	// Note: inputChannelConfig is in sync with the mainSchemaProvider
@@ -190,25 +153,28 @@ func (args *StartComputePipesArgs) StartShardingComputePipes(ctx context.Context
 			sp.Compression, sp.Encoding, sp.Delimiter, sp.MultiColumnsInput, sp.NoQuotes, fetchHeaders, fetchDelimitor,
 			detectEncoding, detectCrAsEol, sp.InputFormatDataJson)
 		if err != nil {
-			return result, mainInputSchemaProvider,
-				fmt.Errorf("while calling FetchHeadersAndDelimiterFromFile('%s', '%s', '%s', '%s'): %v",
-					sp.Bucket, shardResult.firstKey, sp.Format, sp.Compression, err)
+			log.Printf("while calling FetchHeadersAndDelimiterFromFile('%s', '%s', '%s', '%s'): %v\n",
+				sp.Bucket, shardResult.firstKey, sp.Format, sp.Compression, err)
+			return result, mainInputSchemaProvider, err
 		}
-		if len(fileInfo.headers) > 0 {
-			cpipesStartup.InputColumns = fileInfo.headers
+		if len(fileInfo.Headers) > 0 {
+			cpipesStartup.InputColumns = fileInfo.Headers
 		}
-		if fileInfo.sepFlag != 0 {
-			sp.Delimiter = rune(fileInfo.sepFlag)
+		if fileInfo.SepFlag != 0 {
+			sp.Delimiter = rune(fileInfo.SepFlag)
 			inputChannelConfig.Delimiter = sp.Delimiter
 		}
-		if len(fileInfo.encoding) > 0 {
-			sp.Encoding = fileInfo.encoding
-			inputChannelConfig.Encoding = fileInfo.encoding
+		if len(fileInfo.Encoding) > 0 {
+			sp.Encoding = fileInfo.Encoding
+			inputChannelConfig.Encoding = fileInfo.Encoding
 		}
-		if fileInfo.eolByte > 0 {
-			sp.EolByte = fileInfo.eolByte
-			inputChannelConfig.EolByte = fileInfo.eolByte
+		if fileInfo.EolByte > 0 {
+			sp.EolByte = fileInfo.EolByte
+			inputChannelConfig.EolByte = fileInfo.EolByte
 		}
+	}
+	if mainInputSchemaProvider.OutputEncodingSameAsInput {
+		mainInputSchemaProvider.OutputEncoding = mainInputSchemaProvider.Encoding
 	}
 	// log.Printf("*** cpipesStartup.MainInputDomainKeysSpec: %v, cpipesStartup.MainInputDomainClass: %v\n",
 	// 	cpipesStartup.MainInputDomainKeysSpec, cpipesStartup.MainInputDomainClass)
@@ -222,6 +188,15 @@ func (args *StartComputePipesArgs) StartShardingComputePipes(ctx context.Context
 			return result, mainInputSchemaProvider, fmt.Errorf("configuration error: no header information available for the input file(s)")
 		}
 	} else {
+		// Ensure the input columns are unique, if not make them unique and keep the original in InputColumnsOriginal
+		headersUniquefied := schema.NewHeadersUniquefied(cpipesStartup.InputColumns)
+		if headersUniquefied.Modified {
+			cpipesStartup.InputColumnsOriginal = headersUniquefied.OriginalHeaders
+			log.Printf("*** Uniquefied Input Columns: %v\n", headersUniquefied.UniqueHeaders)
+		}
+		cpipesStartup.InputColumns = headersUniquefied.UniqueHeaders
+
+		// log.Printf("*** Input Columns: %v\n", cpipesStartup.InputColumns)
 		// Add the headers from the partfile_key_component
 		for i := range cpipesStartup.CpConfig.Context {
 			if cpipesStartup.CpConfig.Context[i].Type == "partfile_key_component" {
@@ -236,9 +211,44 @@ func (args *StartComputePipesArgs) StartShardingComputePipes(ctx context.Context
 			cpipesStartup.InputColumns = append(cpipesStartup.InputColumns, extraInputColumns...)
 		}
 	}
+	// Update output table schema
+	for _, outTbl := range cpipesStartup.CpConfig.OutputTables {
+		tableName := outTbl.Name
+		tableName = utils.ReplaceEnvVars(tableName, cpipesStartup.EnvSettings)
+		tableIdentifier, err := SplitTableName(tableName)
+		if err != nil {
+			return result, mainInputSchemaProvider, fmt.Errorf("while splitting table name: %s", err)
+		}
+		// log.Println("*** Preparing / Updating Output Table", tableIdentifier)
+		// Check if the table is a staging table with the column taken from the input files
+		if len(outTbl.Columns) == 0 {
+			cspec := outTbl.ChannelSpecName
+			for _, channel := range cpipesStartup.CpConfig.Channels {
+				if channel.Name == cspec {
+					columns := channel.Columns
+					if channel.SameColumnsAsInput {
+						columns = cpipesStartup.InputColumns
+					}
+					outTbl.Columns = make([]TableColumnSpec, len(columns))
+					for i, colName := range columns {
+						outTbl.Columns[i] = TableColumnSpec{
+							Name:    colName,
+							RdfType: "text",
+						}
+					}
+				}
+			}
+		}
+		err = PrepareOutoutTable(dbpool, tableIdentifier, outTbl)
+		if err != nil {
+			return result, mainInputSchemaProvider, fmt.Errorf("while preparing output table: %s", err)
+		}
+	}
+	// log.Println("Compute Pipes output tables schema ready")
 
 	inputRowColumnsJson, err := json.Marshal(InputRowColumns{
-		MainInput: cpipesStartup.InputColumns,
+		OriginalHeaders: cpipesStartup.InputColumnsOriginal,
+		MainInput:       cpipesStartup.InputColumns,
 	})
 	if err != nil {
 		return result, mainInputSchemaProvider, err
@@ -313,9 +323,10 @@ func (args *StartComputePipesArgs) StartShardingComputePipes(ctx context.Context
 			ProcessName:     cpipesStartup.ProcessName,
 			SourcesConfig: SourcesConfigSpec{
 				MainInput: &InputSourceSpec{
-					InputColumns: cpipesStartup.InputColumns,
-					DomainKeys:   cpipesStartup.MainInputDomainKeysSpec,
-					DomainClass:  cpipesStartup.MainInputDomainClass,
+					OriginalInputColumns: cpipesStartup.InputColumnsOriginal,
+					InputColumns:         cpipesStartup.InputColumns,
+					DomainKeys:           cpipesStartup.MainInputDomainKeysSpec,
+					DomainClass:          cpipesStartup.MainInputDomainClass,
 				},
 			},
 			DomainKeysSpecByClass: cpipesStartup.DomainKeysSpecByClass,
@@ -342,15 +353,61 @@ func (args *StartComputePipesArgs) StartShardingComputePipes(ctx context.Context
 	if err != nil {
 		return result, mainInputSchemaProvider, err
 	}
+
+	// avoid to serialize twice some constructs
+	inputParquetSchemaJson := "{}"
+	if mainInputSchemaProvider.ParquetSchema != nil {
+		data, err := json.Marshal(mainInputSchemaProvider.ParquetSchema)
+		if err != nil {
+			return result, mainInputSchemaProvider, err
+		}
+		inputParquetSchemaJson = string(data)
+	}
+	mainInputSchemaProvider.ParquetSchema = nil
+	cpipesStartup.EnvSettings = nil
+	cpipesStartup.InputColumns = nil
+	cpipesStartup.InputColumnsOriginal = nil
+	cpipesStartupJson, err := json.Marshal(cpipesStartup)
+	if err != nil {
+		return result, mainInputSchemaProvider, err
+	}
 	// log.Println("*** shardingConfigJson")
 	// log.Println(string(shardingConfigJson))
 	// Create entry in cpipes_execution_status
 	stmt := `INSERT INTO jetsapi.cpipes_execution_status 
-						(pipeline_execution_status_key, session_id, cpipes_config_json, input_row_columns_json) 
-						VALUES ($1, $2, $3, $4)`
-	_, err2 := dbpool.Exec(ctx, stmt, args.PipelineExecKey, args.SessionId, string(shardingConfigJson), string(inputRowColumnsJson))
+						(pipeline_execution_status_key, session_id, cpipes_config_json, input_parquet_schema_json, cpipes_startup_json, input_row_columns_json) 
+						VALUES ($1, $2, $3, $4, $5, $6)`
+	_, err2 := dbpool.Exec(ctx, stmt, args.PipelineExecKey, args.SessionId, string(shardingConfigJson), inputParquetSchemaJson, string(cpipesStartupJson), string(inputRowColumnsJson))
 	if err2 != nil {
 		return result, mainInputSchemaProvider, fmt.Errorf("error inserting in jetsapi.cpipes_execution_status table: %v", err2)
 	}
+
+	// Send CPIPES start notification to api gateway (install specific)
+	// NOTE 2024-05-13 Added Notification to API Gateway via env var CPIPES_STATUS_NOTIFICATION_ENDPOINT or CPIPES_STATUS_NOTIFICATION_ENDPOINT_JSON
+	apiEndpoint := os.Getenv("CPIPES_STATUS_NOTIFICATION_ENDPOINT")
+	var apiEndpointJson string
+	if len(mainInputSchemaProvider.NotificationRoutingOverridesJson) > 0 {
+		apiEndpointJson = mainInputSchemaProvider.NotificationRoutingOverridesJson
+	} else {
+		apiEndpointJson = os.Getenv("CPIPES_STATUS_NOTIFICATION_ENDPOINT_JSON")
+	}
+	if apiEndpoint != "" || apiEndpointJson != "" {
+		customFileKeys := make([]string, 0)
+		ck := os.Getenv("CPIPES_CUSTOM_FILE_KEY_NOTIFICATION")
+		if len(ck) > 0 {
+			customFileKeys = strings.Split(ck, ",")
+		}
+		var notificationTemplate string
+		if mainInputSchemaProvider.NotificationTemplatesOverrides != nil {
+			notificationTemplate = mainInputSchemaProvider.NotificationTemplatesOverrides["CPIPES_START_NOTIFICATION_JSON"]
+		}
+		if len(notificationTemplate) == 0 {
+			notificationTemplate = os.Getenv("CPIPES_START_NOTIFICATION_JSON")
+		}
+		// ignore returned err
+		datatable.DoNotifyApiGateway(args.FileKey, apiEndpoint, apiEndpointJson,
+			notificationTemplate, customFileKeys, "", cpipesStartup.EnvSettings)
+	}
+
 	return result, mainInputSchemaProvider, nil
 }

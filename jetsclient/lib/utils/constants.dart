@@ -165,7 +165,6 @@ class FormKeys {
   static const home = "homeForm";
   // File Staging Area
   static const loadRawRows = "loadRawRowsDialog";
-  static const loadAllFiles = "loadAllFilesDialog";
   // Input Source Mapping Forms
   static const inputSourceMapping = "inputSourceMapping";
   static const processMapping = "processMappingDialog";
@@ -235,6 +234,7 @@ class FormKeys {
   static const scEditFixedWidthLayoutUF = "scEditFixedWidthLayoutUF";
   static const scEditDomainKeysUF = "scEditDomainKeysUF";
   static const scEditCodeValueMappingUF = "scEditCodeValueMappingUF";
+  static const scAddSchemaProviderJsonUF = "scAddSchemaProviderJsonUF";
   static const scEditAutomatedModeUF = "scEditAutomatedModeUF";
   static const scSummaryUF = "scSummaryUF";
   // Home Filters UF Forms
@@ -293,6 +293,7 @@ class FSK {
   static const label = "label";
   static const tableName = "table_name";
   static const fileKey = "file_key";
+  static const stageFilePath = "stage_file_path";
 
   static const dataTableAction = "datatable.action";
   static const dataTableFromTable = "datatable.from.table";
@@ -306,6 +307,7 @@ class FSK {
   static const userPassword = "password";
   static const userPasswordConfirm = "passwordConfirm";
   static const sessionId = "session_id";
+  static const inputRegistrySessionId = "input_registry.session_id";
   static const devMode = "dev_mode";
   static const isAdmin = "is_admin";
   static const isActive = "is_active";
@@ -334,6 +336,7 @@ class FSK {
   static const inputColumnsJson = "input_columns_json";
   static const inputColumnsPositionsCsv = "input_columns_positions_csv";
   static const codeValuesMappingJson = "code_values_mapping_json";
+  static const schemaProviderJson = "schema_provider_json";
   static const computePipesJson = "compute_pipes_json";
   static const entityRdfType = "entity_rdf_type";
   static const entityKey = "entity_key";
@@ -427,6 +430,11 @@ class FSK {
   // workspace.db columns
   static const wsDbSourceFileName = "source_file_name";
 
+  // reserved keys for ButtonConfig Actions
+  // --------------------------------------------------
+  // Key used to store the ButtonConfig object in the JetsFormState
+  static const bcButtonConfig = "bc.button_config";
+
   // Keys for User Flow - special state management keys
   // --------------------------------------------------
   static const ufStartAtKey = "startAtKey";
@@ -510,6 +518,7 @@ class FSK {
   static const hfEndOffset = "hfEndOffset";
 
   // reserved keys for cache
+  // --------------------------------------------------
 
   // inputFieldsCache: cache value is a list<String?>
   // based on query inputFieldsQuery
@@ -550,6 +559,9 @@ class FSK {
   // The query is in FSK.processName drowpdown initaization query
   static const processConfigCache = "cache.process_config";
 
+  // Other reserved keys
+  // --------------------------------------------------
+
   // reserve key to hold an error to display to user
   static const serverError = "server_error";
 
@@ -558,7 +570,7 @@ class FSK {
 }
 
 /// Form Action Keys
-/// stardard keys to identify Form Action Config Key
+/// standard keys to identify Form Action Config Key
 class ActionKeys {
   static const login = "loginAction";
   static const register = "registerAction";
@@ -582,7 +594,6 @@ class ActionKeys {
 
   // for load file
   static const loaderOk = "loader.ok";
-  static const loadAllFilesOk = "loadAllFiles.ok";
   static const loaderMultiOk = "loaderMulti.ok";
 
   // to sync file key with web storage (s3)
@@ -643,6 +654,11 @@ class ActionKeys {
   static const exportClientConfigOk = "exportClientConfigOk";
   static const addWorkspaceFilesOk = "addWorkspaceFilesOk";
   static const deleteWorkspaceFiles = "deleteWorkspaceFiles";
+
+  /// ButtonConfig ActionKeys for Data Tables
+  /// Note: The value of these keys are from [ButtonConfig.type]
+  static const fetchFromStage2Clipboard = "fetch_stage_to_clipboard";
+
 
   // User Form ActionKeys
   static const ufStartFlow = "ufStartFlow";
@@ -768,10 +784,6 @@ class DTKeys {
   // Client & Organization Admin DT
   // static const clientTable = "clientTable";
   // static const orgNameTable = "orgNameTable";
-
-  // File Staging Area / Source Config DT
-  static const fileKeyStagingTable = "fileKeyStagingTable";
-  static const fileKeyStagingMultiLoadTable = "fileKeyStagingMultiLoadTable";
 
   // Domain Table Viewer DT
   static const inputTable = "inputTable";

@@ -64,7 +64,7 @@ func pullWorkspaceAction(dbpool *pgxpool.Pool, irow int, gitProfile *user.GitPro
 	}
 
 	// Apply workspace overrides from database, skipping compiled files
-	err = workspace.SyncWorkspaceFiles(dbpool, workspaceName, "", true, true)
+	_, err = workspace.SyncWorkspaceFiles(dbpool, workspaceName, "", true, true)
 	if err != nil {
 		buf.WriteString(fmt.Sprintf("Error while synching workspace file from database: %v (ignored)\n", err))
 		log.Println("Error while synching workspace file from database:", err, "(ignored)")
@@ -87,7 +87,7 @@ func compileWorkspaceAction(ctx *DataTableContext, dataTableAction *DataTableAct
 		workspaceName := dataTableAction.WorkspaceName
 
 		// Compile workspace
-		fmt.Println("Compiling workspace", workspaceName)
+		log.Println("Compiling workspace", workspaceName)
 		gitLog, err = workspace.CompileWorkspace(ctx.Dbpool, workspaceName, strconv.FormatInt(time.Now().Unix(), 10))
 		if err != nil {
 			status = "error"

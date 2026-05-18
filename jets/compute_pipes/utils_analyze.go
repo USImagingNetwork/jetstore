@@ -3,7 +3,9 @@ package compute_pipes
 import (
 	"fmt"
 	"regexp"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -59,25 +61,36 @@ type MinMaxValue struct {
 	MinValue   string
 	MaxValue   string
 	MinMaxType string
-	HitCount   float64
+	HitRatio   float64
+	NbrSamples int
 }
 
 // Analyze data TransformationSpec implementing PipeTransformationEvaluator interface
 type AnalyzeState struct {
-	ColumnName     string
-	ColumnPos      int
-	DistinctValues map[string]*DistinctCount
-	NullCount      int
-	LenWelford     *WelfordAlgo
-	CharToScrub    map[rune]bool
-	RegexMatch     map[string]*RegexCount
-	LookupState    []*LookupTokensState
-	KeywordMatch   map[string]*KeywordCount
-	ParseDate      *ParseDateMatchFunction
-	ParseDouble    *ParseDoubleMatchFunction
-	ParseText      *ParseTextMatchFunction
-	TotalRowCount  int
-	Spec           *TransformationSpec
+	ColumnName         string
+	ColumnPos          int
+	DistinctValues     map[string]*DistinctCount
+	NullCount          int
+	LenWelford         *WelfordAlgo
+	CharToScrub        map[rune]bool
+	ContainsScrubbChar int // values: 0, 1
+	RegexMatch         map[string]*RegexCount
+	LookupState        []*LookupTokensState
+	KeywordMatch       map[string]*KeywordCount
+	ParseDate          *ParseDateMatchFunction
+	ParseDouble        *ParseDoubleMatchFunction
+	ParseText          *ParseTextMatchFunction
+	TotalRowCount      int
+	BlankMarkers       *BlankFieldMarkers
+	Spec               *TransformationSpec
+}
+
+// BlankFieldMarkers is the runtime version of BlankFieldMarkersSpec
+// when CaseSensitive is true, the Markers are in upper case.
+// Note: This type is re-used by the Anonymize operator as well.
+type BlankFieldMarkers struct {
+	CaseSensitive bool
+	Markers       []string
 }
 
 type LookupTokensState struct {
@@ -210,13 +223,10 @@ func NewLookupTokensState(lookupTbl LookupTable, lookupNode *LookupTokenNode) (*
 	}, nil
 }
 
-func (ctx *BuilderContext) NewAnalyzeState(columnName string, columnPos int, inputColumns *map[string]int, spec *TransformationSpec) (*AnalyzeState, error) {
+func (ctx *BuilderContext) NewAnalyzeState(columnName string, columnPos int, inputColumns *map[string]int,
+	sp SchemaProvider, blankMarkers *BlankFieldMarkers, spec *TransformationSpec) (*AnalyzeState, error) {
 
-	if spec == nil || spec.AnalyzeConfig == nil || inputColumns == nil {
-		return nil, fmt.Errorf("error: analyze Pipe Transformation spec is missing analyze_config section or input columns map is nil")
-	}
 	config := spec.AnalyzeConfig
-	sp := ctx.schemaManager.schemaProviders[config.SchemaProvider]
 
 	// Create analyze actions
 	regexMatch := make(map[string]*RegexCount)
@@ -259,7 +269,7 @@ func (ctx *BuilderContext) NewAnalyzeState(columnName string, columnPos int, inp
 		conf := &config.FunctionTokens[i]
 		switch conf.Type {
 		case "parse_date":
-			pdate, err = NewParseDateMatchFunction(conf, sp)
+			pdate, err = ctx.NewParseDateMatchFunction(columnPos, conf, sp)
 
 		case "parse_double":
 			pdouble, err = NewParseDoubleMatchFunction(conf)
@@ -305,6 +315,7 @@ func (ctx *BuilderContext) NewAnalyzeState(columnName string, columnPos int, inp
 		ParseDate:      pdate,
 		ParseDouble:    pdouble,
 		ParseText:      ptext,
+		BlankMarkers:   blankMarkers,
 		Spec:           spec,
 	}, nil
 }
@@ -318,18 +329,49 @@ func (state *AnalyzeState) NewValue(value any) error {
 	switch vv := value.(type) {
 	case string:
 		return state.NewToken(vv)
+	case int:
+		return state.NewToken(strconv.Itoa(vv))
+	case int64:
+		return state.NewToken(strconv.FormatInt(vv, 10))
+	case uint64:
+		return state.NewToken(strconv.FormatUint(vv, 10))
+	case float64:
+		return state.NewToken(strconv.FormatFloat(vv, 'f', -1, 64))
 	default:
 		return state.NewToken(fmt.Sprintf("%v", value))
 	}
 }
 
 func (state *AnalyzeState) NewToken(value string) error {
+	if state.BlankMarkers != nil && state.BlankMarkers.CaseSensitive {
+		if slices.Contains(state.BlankMarkers.Markers, value) {
+			state.NullCount += 1
+			return nil
+		}
+	}
 	// work on the upper case value of the token
 	value = strings.ToUpper(value)
-	if value == "NULL" {
+	switch value {
+	case "", "NULL", "NONE", "0000":
 		state.NullCount += 1
 		return nil
 	}
+	if state.BlankMarkers != nil && !state.BlankMarkers.CaseSensitive {
+		if slices.Contains(state.BlankMarkers.Markers, value) {
+			state.NullCount += 1
+			return nil
+		}
+	}
+
+	// Check if it's a date, in particular a null date
+	if state.ParseDate != nil {
+		isNullDate := state.ParseDate.NewValue(value)
+		if isNullDate {
+			state.NullCount += 1
+			return nil
+		}
+	}
+
 	// Remove leading 0 when there is 4 or more of them
 	if strings.HasPrefix(value, "0000") {
 		value = strings.TrimLeft(value, "0")
@@ -343,11 +385,14 @@ func (state *AnalyzeState) NewToken(value string) error {
 	// the operator MultiTokensNode will use the original value
 	// Note: Some operators use value and other use scrubbedValue
 	scrubbedValue := value
+	state.ContainsScrubbChar = 0
 	if len(state.CharToScrub) > 0 {
 		scrubbed := make([]rune, 0, len(value))
 		for _, r := range value {
 			if !state.CharToScrub[r] {
 				scrubbed = append(scrubbed, r)
+			} else {
+				state.ContainsScrubbChar = 1
 			}
 		}
 		scrubbedValue = string(scrubbed)
@@ -401,9 +446,6 @@ func (state *AnalyzeState) NewToken(value string) error {
 	}
 
 	// Function matches
-	if state.ParseDate != nil {
-		state.ParseDate.NewValue(value)
-	}
 	if state.ParseDouble != nil {
 		state.ParseDouble.NewValue(value)
 	}

@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"log"
 	"sync"
-
-	"github.com/artisoft-io/jetstore/jets/jetrules/rete"
 )
 
 // JrPoolManager manages a pool of JrPoolWorkers for jetrules execution
@@ -15,24 +13,29 @@ import (
 // The WorkersTaskCh is closed in jetrules operator
 type JrPoolManager struct {
 	config        *JetrulesSpec
-	WorkersTaskCh chan []interface{}
+	WorkersTaskCh chan []any
+	ErrorOutputCh	*OutputChannel
 	jrPoolWg      *sync.WaitGroup
 	WaitForDone   *sync.WaitGroup
 }
 
 // Create the JrPoolManager, it will be set to the receiving BuilderContext
 func (ctx *BuilderContext) NewJrPoolManager(
-	config *JetrulesSpec, source *InputChannel, reteMetaStore *rete.ReteMetaStoreFactory,
-	outputChannels []*JetrulesOutputChan, jetrulesWorkerResultCh chan JetrulesWorkerResult) (jrpm *JrPoolManager, err error) {
+	config *JetrulesSpec, source *InputChannel, rdfType2Columns map[string][]string, ruleEngine JetRuleEngine,
+	errorOutputCh *OutputChannel, outputChannels []*JetrulesOutputChan, 
+	jetrulesWorkerResultCh chan JetrulesWorkerResult) (jrpm *JrPoolManager, err error) {
+		
 	log.Println("Starting the Pool Manager")
 	if config.PoolSize < 1 {
 		close(jetrulesWorkerResultCh)
 		return nil, fmt.Errorf("error: cannot have a worker pool of size less than 1")
 	}
+
 	// Create the pool manager
 	jrpm = &JrPoolManager{
 		config:        config,
-		WorkersTaskCh: make(chan []interface{}, 1),
+		WorkersTaskCh: make(chan []any, 1),
+		ErrorOutputCh: errorOutputCh,
 		jrPoolWg:      new(sync.WaitGroup),
 		WaitForDone:   new(sync.WaitGroup),
 	}
@@ -82,7 +85,8 @@ func (ctx *BuilderContext) NewJrPoolManager(
 			jrpm.jrPoolWg.Add(1)
 			go func() {
 				defer jrpm.jrPoolWg.Done()
-				worker := NewJrPoolWorker(config, source, reteMetaStore, outputChannels, ctx.done, ctx.errCh)
+				worker := ctx.NewJrPoolWorker(config, source, rdfType2Columns, ruleEngine, 
+					jrpm.ErrorOutputCh, outputChannels, ctx.done, ctx.errCh)
 				worker.DoWork(jrpm, workersResultCh)
 			}()
 		}

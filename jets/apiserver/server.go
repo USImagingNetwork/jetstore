@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -136,7 +135,7 @@ func (server *Server) checkJetStoreSchema() error {
 		_, _, err = server.ResetDomainTables(&PurgeDataAction{
 			Action:            "reset_domain_tables",
 			RunUiDbInitScript: true,
-			Data:              []map[string]interface{}{},
+			Data:              []map[string]any{},
 		})
 		if err != nil {
 			return fmt.Errorf("while calling ResetDomainTables to initialize db schema: %v", err)
@@ -146,7 +145,6 @@ func (server *Server) checkJetStoreSchema() error {
 		if err != nil {
 			return fmt.Errorf("while calling saving jetstoreVersion to database: %v", err)
 		}
-
 	}
 	return nil
 }
@@ -169,7 +167,7 @@ func (server *Server) checkDomainTablesVersion() error {
 		_, _, err = server.ResetDomainTables(&PurgeDataAction{
 			Action:            "reset_domain_tables",
 			RunUiDbInitScript: true,
-			Data:              []map[string]interface{}{},
+			Data:              []map[string]any{},
 		})
 		if err != nil {
 			return fmt.Errorf("while calling ResetDomainTables to initialize db (no version exist in db): %v", err)
@@ -177,7 +175,7 @@ func (server *Server) checkDomainTablesVersion() error {
 
 	case !version.Valid || jetstoreVersion > version.String:
 		log.Println("JetStore deployed version (in database) is", version.String)
-		log.Println("New JetStore Release deployed, update domain and suystem table and run workspace db init script")
+		log.Println("New JetStore Release deployed, update domain and system tables and run workspace db init script")
 		serverArgs = []string{"-initBaseWorkspaceDb", "-migrateDb"}
 		if *usingSshTunnel {
 			serverArgs = append(serverArgs, "-usingSshTunnel")
@@ -188,8 +186,8 @@ func (server *Server) checkDomainTablesVersion() error {
 		}
 
 	default:
-		log.Println("JetStore deployed version (in database) is", version)
-		log.Println("JetStore version in database", version, ">=", "JetStore image version", jetstoreVersion)
+		log.Println("JetStore deployed version (in database) is", version.String)
+		log.Println("JetStore version in database", version.String, ">=", "JetStore image version", jetstoreVersion)
 		// DO NOT UPDATE version in database, hence return here
 		return nil
 	}
@@ -200,68 +198,6 @@ func (server *Server) checkDomainTablesVersion() error {
 		return fmt.Errorf("while calling saving jetstoreVersion to database: %v", err)
 	}
 	return nil
-}
-
-// Get the file_key list of the unit test files
-func (server *Server) getUnitTestFileKeys() ([]string, error) {
-	workspaceName := os.Getenv("WORKSPACE")
-	root := os.Getenv("WORKSPACES_HOME") + "/" + workspaceName
-	// Check that the workspace contains a unit_test directory
-	_, err := os.Open(root + "/data/test_data")
-	if err != nil {
-		log.Println("Folder 'data/test_data' does not exists in workspace, skipping copying unit test files")
-		return nil, nil
-	}
-	workspaceNode, err := wsfile.VisitDirWrapper(root, "data/test_data", "Unit Test Data", &[]string{".txt", ".csv"}, workspaceName)
-	if err != nil {
-		log.Println("while walking workspace unit test folder structure:", err)
-		return nil, err
-	}
-	stack := workspaceNode.Children
-	fileKeys := make([]string, 0)
-	for len(*stack) > 0 {
-		item := (*stack)[0]
-		*stack = (*stack)[1:]
-		str, err := url.QueryUnescape(item.RouteParams["file_name"])
-		if err != nil {
-			log.Println("while walking workspace unit test folder structure:", err)
-			return nil, err
-		}
-		if len(str) > 0 {
-			fileKeys = append(fileKeys, str)
-		}
-		if item.Children != nil {
-			*stack = append(*stack, *item.Children...)
-		}
-	}
-	return fileKeys, nil
-}
-
-func (server *Server) syncUnitTestFiles() {
-	// Collect files from local workspace
-	log.Println("Copying unit_test files to s3:")
-	fileKeys, err := server.getUnitTestFileKeys()
-	if err != nil {
-		//* TODO Log to a new workspace error table to report in UI
-		log.Println("Error while getting unit test file keys:", err)
-	} else {
-		bucket := os.Getenv("JETS_BUCKET")
-		region := os.Getenv("JETS_REGION")
-		s3Prefix := os.Getenv("JETS_s3_INPUT_PREFIX")
-		workspaceName := os.Getenv("WORKSPACE")
-		root := os.Getenv("WORKSPACES_HOME") + "/" + workspaceName
-		for i := range fileKeys {
-			fileHd, err := os.Open(fmt.Sprintf("%s/%s", root, fileKeys[i]))
-			if err != nil {
-				log.Println("Error while opening file to copy to s3:", err)
-			} else {
-				if err = awsi.UploadToS3(bucket, region, strings.Replace(fileKeys[i], "data/test_data", s3Prefix, 1), fileHd); err != nil {
-					log.Println("Error while copying to s3:", err)
-				}
-				fileHd.Close()
-			}
-		}
-	}
 }
 
 // Download overriten workspace files from jetstore database
@@ -306,6 +242,7 @@ func (server *Server) checkWorkspaceVersion() error {
 	}
 
 	var version sql.NullString
+	compilationRequired := false
 	jetstoreVersion := os.Getenv("JETS_VERSION")
 	// Check the workspace release in database vs current release
 	stmt := "SELECT MAX(version) FROM jetsapi.workspace_version"
@@ -314,39 +251,49 @@ func (server *Server) checkWorkspaceVersion() error {
 	case err != nil:
 		if errors.Is(err, pgx.ErrNoRows) {
 			log.Println("Workspace version is not defined (no rows returned) in workspace_version table, setting it to JetStore version")
-			server.syncUnitTestFiles()
+			compilationRequired = true
 		} else {
 			return fmt.Errorf("while reading workspace version from workspace_version table: %v", err)
 		}
 
 	case !version.Valid:
 		log.Println("Workspace version is not defined (null version) in workspace_version table, setting it to JetStore version")
-		server.syncUnitTestFiles()
+		compilationRequired = true
 
 	case jetstoreVersion > version.String:
-		// Download overriten workspace files from database if any, skipping sqlite and tgz files since we will recompile workspace
-		if err = workspace.SyncWorkspaceFiles(server.dbpool, workspaceName, "", true, true); err != nil {
+		// Download overriten workspace files from database if any, skipping sqlite and tgz files since we will recompile workspace or take
+		// it from local repo.
+		if compilationRequired, err = workspace.SyncWorkspaceFiles(server.dbpool, workspaceName, "", true, true); err != nil {
 			log.Println("Error (ignored) while synching workspace file from database:", err)
+			compilationRequired = true
 		}
-		log.Println("Workspace deployed version (in database) is", version.String)
-		// Sync unit test files
-		server.syncUnitTestFiles()
+		log.Println("Workspace deployed version (in database) is", version.String, "compilation required?", compilationRequired)
 
 	default:
-		log.Println("Workspace version in database", version, ">=", "JetStore image version", jetstoreVersion, ", no need to recompile workspace")
+		log.Println("Workspace version in database", version.String, ">=", "JetStore image version", jetstoreVersion, ", no need to recompile workspace")
 		// Download overriten workspace files from database if any, not skipping sqlite/tgz files to get latest in case it was recompiled
-		if err = workspace.SyncWorkspaceFiles(server.dbpool, workspaceName, "", false, false); err != nil {
+		if _, err = workspace.SyncWorkspaceFiles(server.dbpool, workspaceName, "", false, false); err != nil {
 			log.Println("Error (ignored) while synching workspace file from database:", err)
 		}
 		// NOT Recompiling workspace, hence return here
 		return nil
 	}
-	log.Println("Recompiling workspace, set the workspace version to be same as jetstore version")
-	_, err = workspace.CompileWorkspace(server.dbpool, workspaceName, jetstoreVersion)
-	if err != nil {
-		err = fmt.Errorf("error while compiling workspace: %v", err)
-		log.Println(err)
-		return err
+	if compilationRequired {
+		log.Printf("Recompiling workspace, set the workspace version (%s) to be same as jetstore version %s", version.String, jetstoreVersion)
+		_, err = workspace.CompileWorkspace(server.dbpool, workspaceName, jetstoreVersion)
+		if err != nil {
+			err = fmt.Errorf("error while compiling workspace: %v", err)
+			log.Println(err)
+			return err
+		}
+	} else {
+		log.Println(" 🙌 Taking workspace from local repository, recompilation not required, synching assets to db  🙌")
+		err = workspace.UploadWorkspaceAssets(server.dbpool, workspaceName, version.String)
+		if err != nil {
+			err = fmt.Errorf("Error while uploading workspace assets to database: %v", err)
+			log.Println(err)
+			return err
+		}
 	}
 	return nil
 }
@@ -454,7 +401,7 @@ func listenAndServe() error {
 	rawJSON := []byte(`{
 	  "level": "info",
 	  "encoding": "json",
-	  "outputPaths": ["stdout", "/tmp/logs"],
+	  "outputPaths": ["stdout"],
 	  "errorOutputPaths": ["stderr"],
 	  "initialFields": {"logger_type": "audit_log"},
 	  "encoderConfig": {
@@ -630,9 +577,9 @@ func listenAndServe() error {
 				}
 
 				// Start pending task and check for timeouts
-				err = datatable.NewDataTableContext(server.dbpool, false, false, nil, nil).StartPendingTasks("cpipesSM")
+				err = datatable.NewDataTableContext(server.dbpool, false, false, nil, nil).StartPendingTasks()
 				if err != nil {
-					log.Println("Warning: while StartPendingTasks for cpipesSM:", err)
+					log.Println("Warning: while StartPendingTasks:", err)
 					err = nil
 				}
 			}
@@ -652,7 +599,9 @@ func listenAndServe() error {
 		return http.ListenAndServeTLS(serverAddr, "cert.pem", "key.pem", server.Router)
 	}
 }
+
 var hbaErrCount int
+
 func (server *Server) GetLastSecretRotation() (tm *time.Time, err error) {
 	var sqltm sql.NullTime
 	err = server.dbpool.QueryRow(context.Background(), "SELECT MAX(last_update) FROM jetsapi.secret_rotation").Scan(&sqltm)
@@ -669,7 +618,7 @@ func (server *Server) GetLastSecretRotation() (tm *time.Time, err error) {
 				err = fmt.Errorf("while querying last_update from secret_rotation table: %v", err)
 				log.Println(err)
 				hbaErrCount++
-				err2:= GenerateCert()
+				err2 := GenerateCert()
 				if err2 != nil {
 					err = fmt.Errorf("while GenerateCert to fix: >%s< got: %s", err, err2)
 					log.Println(err)

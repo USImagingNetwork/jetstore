@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/artisoft-io/jetstore/jets/awsi"
+	"github.com/artisoft-io/jetstore/jets/utils"
 	"github.com/jackc/pgx/v4/pgxpool"
 )
 
@@ -21,7 +21,7 @@ func (args *StartComputePipesArgs) StartReducingComputePipes(ctx context.Context
 		log.Println("error: missing file_key or session_id or step_id as input args of StartComputePipes (reducing mode)")
 		return result, fmt.Errorf("error: missing file_key or session_id or step_id as input args of StartComputePipes (reducing mode)")
 	}
-	cpipesStartup, err := args.initializeCpipes(ctx, dbpool)
+	cpipesStartup, err := args.reducingInitializeCpipes(ctx, dbpool)
 	if err != nil {
 		return result, err
 	}
@@ -36,7 +36,7 @@ func (args *StartComputePipesArgs) StartReducingComputePipes(ctx context.Context
 		"-sessionId", args.SessionId,
 		"-filePath", strings.Replace(args.FileKey, os.Getenv("JETS_s3_INPUT_PREFIX"), os.Getenv("JETS_s3_OUTPUT_PREFIX"), 1),
 	}
-	result.SuccessUpdate = map[string]interface{}{
+	result.SuccessUpdate = map[string]any{
 		"cpipesMode":     true,
 		"cpipesEnv":      cpipesStartup.EnvSettings,
 		"-peKey":         strconv.Itoa(args.PipelineExecKey),
@@ -44,7 +44,7 @@ func (args *StartComputePipesArgs) StartReducingComputePipes(ctx context.Context
 		"file_key":       args.FileKey,
 		"failureDetails": "",
 	}
-	result.ErrorUpdate = map[string]interface{}{
+	result.ErrorUpdate = map[string]any{
 		"cpipesMode":     true,
 		"cpipesEnv":      cpipesStartup.EnvSettings,
 		"-peKey":         strconv.Itoa(args.PipelineExecKey),
@@ -100,54 +100,67 @@ startStepId:
 		return result, nil
 	}
 
-	inputChannelConfig := &pipeConfig[0].InputChannel
-	mainInputStepId := inputChannelConfig.ReadStepId
-	if len(mainInputStepId) == 0 {
-		return result, fmt.Errorf("configuration error: missing input_channel.read_step_id for first pipe at step %d", stepId)
+	// Apply all conditional transformation specs
+	err = ApplyAllConditionalTransformationSpec(pipeConfig, cpipesStartup.EnvSettings)
+	if err != nil {
+		return result, fmt.Errorf("while applying conditional transformation spec: %v", err)
 	}
 
-	// Read the partitions file keys, this will give us the nbr of nodes for reducing
-	// Root dir of each partition:
-	//		<JETS_s3_STAGE_PREFIX>/process_name=QcProcess/session_id=123456789/step_id=reducing01/jets_partition=22p/
-	// Get the partition key from compute_pipes_partitions_registry
-	partitions := make([]string, 0)
-	stmt := `SELECT jets_partition 
-			FROM jetsapi.compute_pipes_partitions_registry 
-			WHERE session_id = $1 AND step_id = $2`
-	rows, err := dbpool.Query(context.Background(), stmt, args.SessionId, mainInputStepId)
-	if err != nil {
-		return result,
-			fmt.Errorf("while querying jets_partition from compute_pipes_partitions_registry: %v", err)
-	}
-	err = func() error {
-		defer rows.Close()
-		for rows.Next() {
-			// scan the row
-			var jetsPartition string
-			err := rows.Scan(&jetsPartition)
-			if err != nil {
-				return fmt.Errorf("while scanning jetsPartition from compute_pipes_partitions_registry table: %v", err)
-			}
-			partitions = append(partitions, jetsPartition)
-		}
-		return nil
-	}()
+	// Validate the PipeSpec.TransformationSpec.OutputChannel configuration
+	// also sync the input and output channels with the associated schema provider.
+	err = cpipesStartup.ValidatePipeSpecConfig(&cpipesStartup.CpConfig, pipeConfig)
 	if err != nil {
 		return result, err
 	}
 
-	// Check if there is no partitions for the step, if so move to next step
+	// Get the input channel config
+	inputChannelConfig := &pipeConfig[0].InputChannel
+	inputChannelConfig.schemaProviderConfig = GetSchemaProviderConfigByKey(cpipesStartup.CpConfig.SchemaProviders, inputChannelConfig.SchemaProvider)
+	mainInputStepId := inputChannelConfig.ReadStepId
+	stepName := cpipesStartup.CpConfig.GetStepName(stepId)
+	switch {
+	case len(inputChannelConfig.FileKey) > 0:
+		// Reading historical data from stage.
+		log.Printf("Step %d - %s - is reading historical data from stage with file key %s\n", stepId, stepName, inputChannelConfig.FileKey)
+
+	default:
+		log.Printf("Step %d - %s - is reading from previous reducing step with step id %s\n", stepId, stepName, mainInputStepId)
+	}
+
+	var partitions []JetsPartitionInfo
+	if inputChannelConfig.Type == "generator" {
+		// Case of generator, we generate the partitions based on the number of concurrent tasks we want to run
+		if inputChannelConfig.NbrNodesAny == nil {
+			inputChannelConfig.NbrNodesAny = "${NBR_PARTITIONS}"
+		}
+		nbrNodes, err := utils.ToIntWithEnv(inputChannelConfig.NbrNodesAny, cpipesStartup.EnvSettings)
+		if err != nil {
+			return result, fmt.Errorf("while evaluating nbr_nodes for generator input channel: %v", err)
+		}
+		log.Printf("Start Reducing with input channel of type 'generator' with %d nodes", nbrNodes)
+		for i := range nbrNodes {
+			partitions = append(partitions, JetsPartitionInfo{
+				PartitionLabel: fmt.Sprintf("%04dP", i),
+			})
+		}
+	} else {
+		// Check if we need to get the partitions size from s3
+		// Root dir of each partition:
+		//		<JETS_s3_STAGE_PREFIX>/process_name=QcProcess/session_id=123456789/step_id=reducing01/jets_partition=22p/
+		partitions, err = cpipesStartup.GetComputePipesPartitions(dbpool, cpipesStartup.ProcessName, args.SessionId, inputChannelConfig)
+		if err != nil {
+			return result, err
+		}
+	}
+
+	// Check if there are no partitions for the step, then move to next step
 	if len(partitions) == 0 {
 		log.Println("WARNING: no partitions found during start reducing for step", stepId, "moving on to next step")
 		stepId += 1
 		goto startStepId
 	}
 
-	stepName := ""
-	if len(cpipesStartup.CpConfig.ConditionalPipesConfig) > 0 {
-		stepName = cpipesStartup.CpConfig.ConditionalPipesConfig[stepId].StepName
-	}
-	log.Printf("Start REDUCING %s StepId %d (%s), Read from: %s, file key: %s",
+	log.Printf("%s Start StepId %d - %s - Read from: %s, file key: %s",
 		args.SessionId, stepId, stepName, mainInputStepId, args.FileKey)
 
 	// Identify the output tables for this step
@@ -185,11 +198,7 @@ startStepId:
 		IsDebugMode:           cpipesStartup.CpConfig.ClusterConfig.IsDebugMode,
 	}
 	if clusterSpec.S3WorkerPoolSize == 0 {
-		if len(partitions) > 20 {
-			clusterSpec.S3WorkerPoolSize = 20
-		} else {
-			clusterSpec.S3WorkerPoolSize = len(partitions)
-		}
+		clusterSpec.S3WorkerPoolSize = min(len(partitions), 20)
 	}
 
 	// Determine if using ecs tasks for this stepId
@@ -202,32 +211,19 @@ startStepId:
 	result.CpipesMaxConcurrency = GetMaxConcurrency(len(partitions), cpipesStartup.CpConfig.ClusterConfig.DefaultMaxConcurrency)
 
 	// Get the input columns from Pipes Config, from the first pipes channel
-	var inputColumns []string
 	inputChannel := inputChannelConfig.Name
 	if inputChannel == "input_row" {
-		// special case, need to get the input columns from cpipes_execution_status table
-		var inputRowColumnsJson string
-		stmt := `SELECT input_row_columns_json FROM jetsapi.cpipes_execution_status WHERE session_id=$1`
-		err = dbpool.QueryRow(ctx, stmt, args.SessionId).Scan(&inputRowColumnsJson)
-		if err != nil {
-			return result, fmt.Errorf("while querying input_row_columns_json from table cpipes_execution_status: %v", err)
-		}
-		var inputRowColumns InputRowColumns
-		err = json.Unmarshal([]byte(inputRowColumnsJson), &inputRowColumns)
-		if err != nil {
-			return result, fmt.Errorf("while unmarshalling input_row_columns_json ->%s<-: %v", inputRowColumnsJson, err)
-		}
-		inputColumns = inputRowColumns.MainInput
-		if len(inputColumns) == 0 {
-			return result, fmt.Errorf("error: expecting main input column names from input_row_columns_json: %s", inputRowColumnsJson)
+		// Validate we have input columns
+		if len(cpipesStartup.InputColumns) == 0 {
+			return result, fmt.Errorf("error: expecting main input column names from input_row_columns_json")
 		}
 	} else {
 		// Get the columns from the channel spec
 		chSpec := GetChannelSpec(cpipesStartup.CpConfig.Channels, inputChannel)
 		if chSpec != nil {
-			inputColumns = chSpec.Columns
+			cpipesStartup.InputColumns = chSpec.Columns
 		}
-		if !isMergeFiles && len(inputColumns) == 0 {
+		if !isMergeFiles && len(cpipesStartup.InputColumns) == 0 {
 			return result, fmt.Errorf("error: cpipes config is missing channel config for input %s", inputChannel)
 		}
 	}
@@ -237,31 +233,7 @@ startStepId:
 		return result, err
 	}
 
-	// Validate the PipeSpec.TransformationSpec.OutputChannel configuration
-	err = cpipesStartup.ValidatePipeSpecConfig(&cpipesStartup.CpConfig, pipeConfig)
-	if err != nil {
-		return result, err
-	}
-
-	var inputParquetSchema *ParquetSchemaInfo
 	mainInputSchemaProvider := cpipesStartup.MainInputSchemaProviderConfig
-	if strings.HasPrefix(mainInputSchemaProvider.Format, "parquet") {
-		// Get the saved parquet schema of main input file from s3
-		fileKey := fmt.Sprintf("%s/process_name=%s/session_id=%s/input_parquet_schema.json",
-			jetsS3StagePrefix, cpipesStartup.ProcessName, args.SessionId)
-		log.Printf("Loading parquet schema from: %s", fileKey)
-		schemaBuf, err := awsi.DownloadBufFromS3(fileKey)
-		if err != nil {
-			return result, err
-		}
-		inputParquetSchema = &ParquetSchemaInfo{}
-		err = json.Unmarshal(schemaBuf, inputParquetSchema)
-		if err != nil {
-			fmt.Println("Parquet Schema:\n", string(schemaBuf))
-			return result, fmt.Errorf("while unmarshalling parquet schema from %s: %v",
-				fileKey, err)
-		}
-	}
 	cpReducingConfig := &ComputePipesConfig{
 		CommonRuntimeArgs: &ComputePipesCommonArgs{
 			CpipesMode:      "reducing",
@@ -277,10 +249,10 @@ startStepId:
 			ProcessName:     cpipesStartup.ProcessName,
 			SourcesConfig: SourcesConfigSpec{
 				MainInput: &InputSourceSpec{
-					InputColumns:       inputColumns,
-					InputParquetSchema: inputParquetSchema,
-					DomainKeys:         cpipesStartup.MainInputDomainKeysSpec,
-					DomainClass:        cpipesStartup.MainInputDomainClass,
+					OriginalInputColumns: cpipesStartup.InputColumnsOriginal,
+					InputColumns:         cpipesStartup.InputColumns,
+					DomainKeys:           cpipesStartup.MainInputDomainKeysSpec,
+					DomainClass:          cpipesStartup.MainInputDomainClass,
 				},
 			},
 			DomainKeysSpecByClass: cpipesStartup.DomainKeysSpecByClass,
@@ -297,15 +269,24 @@ startStepId:
 		SchemaProviders: cpipesStartup.CpConfig.SchemaProviders,
 		PipesConfig:     pipeConfig,
 	}
-
 	reducingConfigJson, err := json.Marshal(cpReducingConfig)
 	if err != nil {
 		return result, err
 	}
 
+	// avoid to serialize twice some constructs
+	cpipesStartup.MainInputSchemaProviderConfig.ParquetSchema = nil
+	cpipesStartup.MainInputSchemaProviderConfig = nil
+	cpipesStartup.EnvSettings = nil
+	cpipesStartup.InputColumns = nil
+	cpipesStartup.InputColumnsOriginal = nil
+	cpipesStartupJson, err := json.Marshal(cpipesStartup)
+	if err != nil {
+		return result, err
+	}
 	// Update entry in cpipes_execution_status with reducing config json
-	stmt = "UPDATE jetsapi.cpipes_execution_status SET cpipes_config_json = $1 WHERE session_id = $2"
-	_, err2 := dbpool.Exec(ctx, stmt, string(reducingConfigJson), args.SessionId)
+	stmt := "UPDATE jetsapi.cpipes_execution_status SET (cpipes_config_json, cpipes_startup_json) = ($1, $2) WHERE session_id = $3"
+	_, err2 := dbpool.Exec(ctx, stmt, string(reducingConfigJson), string(cpipesStartupJson), args.SessionId)
 	if err2 != nil {
 		return result, fmt.Errorf("error inserting in jetsapi.cpipes_execution_status table (reducing): %v", err2)
 	}
@@ -342,7 +323,7 @@ startStepId:
 		for i := range cpipesCommands {
 			value := strings.Replace(templateStr, "123456789", strconv.Itoa(i), 1)
 			cpipesCommands[i] = []string{
-				strings.Replace(value, "__LABEL__", partitions[i], 1),
+				strings.Replace(value, "__LABEL__", partitions[i].PartitionLabel, 1),
 			}
 		}
 		result.CpipesCommands = cpipesCommands
@@ -352,7 +333,7 @@ startStepId:
 		for i := range cpipesCommands {
 			cpipesCommands[i] = ComputePipesNodeArgs{
 				NodeId:             i,
-				JetsPartitionLabel: partitions[i],
+				JetsPartitionLabel: partitions[i].PartitionLabel,
 				PipelineExecKey:    args.PipelineExecKey,
 			}
 		}

@@ -3,6 +3,7 @@ package compute_pipes
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"regexp"
 
@@ -24,9 +25,9 @@ type StartComputePipesArgs struct {
 	PipelineExecKey   int                  `json:"pipeline_execution_key"`
 	FileKey           string               `json:"file_key,omitempty"`
 	SessionId         string               `json:"session_id,omitempty"`
-	StepId            *int                 `json:"step_id"`
-	ClusterInfo       *ClusterShardingInfo `json:"cluster_sharding_info"`
-	MainInputRowCount int                  `json:"main_input_row_count"`
+	StepId            *int                 `json:"step_id,omitzero"`
+	ClusterInfo       *ClusterShardingInfo `json:"cluster_sharding_info,omitzero"`
+	MainInputRowCount int64                `json:"main_input_row_count,omitzero"`
 }
 
 // Contains info about the clustersharding. This info
@@ -88,14 +89,16 @@ type SourcesConfigSpec struct {
 
 // InputRowColumns: used to save the input_row channel column name in
 // table cpipes_execution_status, column input_row_columns_json
+// OriginalHeaders are the original headers read from the main input file
 type InputRowColumns struct {
-	MainInput     []string   `json:"main_input"`
-	MergedInput   [][]string `json:"merged_inputs"`
-	InjectedInput [][]string `json:"injected_inputs"`
+	OriginalHeaders []string `json:"original_headers"`
+	MainInput       []string `json:"main_input"`
 }
 
 // InputColumns correspond to columns in the input files, this
 // applies to reducing as well as sharding steps.
+// InputColumns is the uniquefied version of OriginalInputColumns
+// OriginalInputColumns is the orignal input file columns
 // For the case of sharding step, it includes columns from part files key.
 // DomainKeys is taken from:
 //   - source_config table or main schema provider for source_type = 'file'
@@ -106,12 +109,17 @@ type InputRowColumns struct {
 //
 // Note: for source_type = 'file', DomainClass does not apply, the file needs to be mapped first.
 type InputSourceSpec struct {
-	InputColumns       []string           `json:"input_columns"`
-	InputParquetSchema *ParquetSchemaInfo `json:"input_parquet_schema,omitempty"`
-	DomainClass        string             `json:"domain_class,omitempty"`
-	DomainKeys         *DomainKeysSpec    `json:"domain_keys_spec,omitempty"`
+	OriginalInputColumns []string        `json:"original_input_columns,omitempty"`
+	InputColumns         []string        `json:"input_columns,omitempty"`
+	DomainClass          string          `json:"domain_class,omitempty"`
+	DomainKeys           *DomainKeysSpec `json:"domain_keys_spec,omitempty"`
 }
 
+// FileKeyInfo contains the file key and the info about the file key such as size and the range to read for sharding step.
+// The range to read is specified as bytes for text files and nbr of rows with offset for parquet files.
+// So for parquet files, if a file is split in 3 shards and reading the second shard would 
+// be specified as start = 1 (second shard), end = 3 (3 shards).
+// 'start' is 0-based since it's an indice while 'end' is 1-based since it's a count.
 type FileKeyInfo struct {
 	key          string
 	size         int
@@ -191,7 +199,7 @@ func ReadCpipesArgsFromS3(s3Location string) ([]ComputePipesNodeArgs, error) {
 // 	"-filePath", strings.Replace(fileKey.(string), os.Getenv("JETS_s3_INPUT_PREFIX"), os.Getenv("JETS_s3_OUTPUT_PREFIX"), 1),
 // }
 // status_update arguments:
-// map[string]interface{}
+// map[string]any
 // {
 //  "-peKey": peKey,
 //  "-status": "completed",
@@ -208,16 +216,16 @@ func ReadCpipesArgsFromS3(s3Location string) ([]ComputePipesNodeArgs, error) {
 // ReportsCommand contains the argument for RunReport
 // SuccessUpdate / ErrorUpdate are the arguments for status update.
 type ComputePipesRun struct {
-	CpipesCommands       interface{}            `json:"cpipesCommands"`
-	CpipesCommandsS3Key  string                 `json:"cpipesCommandsS3Key,omitempty"`
-	CpipesMaxConcurrency int                    `json:"cpipesMaxConcurrency"`
-	StartReducing        StartComputePipesArgs  `json:"startReducing"`
-	IsLastReducing       bool                   `json:"isLastReducing"`
-	NoMoreTask           bool                   `json:"noMoreTask"`
-	UseECSReducingTask   bool                   `json:"useECSReducingTask"`
-	ReportsCommand       []string               `json:"reportsCommand"`
-	SuccessUpdate        map[string]interface{} `json:"successUpdate"`
-	ErrorUpdate          map[string]interface{} `json:"errorUpdate"`
+	CpipesCommands       any                   `json:"cpipesCommands"`
+	CpipesCommandsS3Key  string                `json:"cpipesCommandsS3Key,omitempty"`
+	CpipesMaxConcurrency int                   `json:"cpipesMaxConcurrency"`
+	StartReducing        StartComputePipesArgs `json:"startReducing"`
+	IsLastReducing       bool                  `json:"isLastReducing"`
+	NoMoreTask           bool                  `json:"noMoreTask"`
+	UseECSReducingTask   bool                  `json:"useECSReducingTask"`
+	ReportsCommand       []string              `json:"reportsCommand"`
+	SuccessUpdate        map[string]any        `json:"successUpdate"`
+	ErrorUpdate          map[string]any        `json:"errorUpdate"`
 }
 
 type FileName struct {
@@ -233,18 +241,36 @@ type CompiledPartFileComponent struct {
 type ComputePipesContext struct {
 	ComputePipesArgs
 	CpConfig              *ComputePipesConfig
-	FileKeyComponents     map[string]interface{}
+	FileKeyComponents     map[string]any
 	PartFileKeyComponents []CompiledPartFileComponent
 	AddionalInputHeaders  []string
-	EnvSettings           map[string]interface{}
+	EnvSettings           map[string]any
 	SamplingCount         int
-	InputFileKeys         []*FileKeyInfo
+	JetStoreTempFolder    string
+	InputFileKeys         [][]*FileKeyInfo
+	JetRules              JetRulesProxy
 	ChResults             *ChannelResults
 	KillSwitch            chan struct{}
+	MainMergeDone         *chan struct{}
 	Done                  chan struct{}
 	ErrCh                 chan error
-	FileNamesCh           chan FileName
+	FileNamesCh           []chan FileName
 	DownloadS3ResultCh    chan DownloadS3Result // avoid to modify ChannelResult for now...
 	S3DeviceMgr           *S3DeviceManager
 	SchemaManager         *SchemaManager
+}
+
+func (cpCtx *ComputePipesContext) DoneAll(err error) {
+	if err != nil {
+		log.Printf("ComputePipesContext.DoneAll: terminating with err %v, closing done channel\n", err)
+		cpCtx.ErrCh <- err
+	}
+	// Avoid closing a closed channel
+	log.Println("ComputePipesContext.DoneAll: all done")
+	select {
+	case <-cpCtx.Done:
+		log.Println("ComputePipesContext.DoneAll: done channel already closed")
+	default:
+		close(cpCtx.Done)
+	}
 }

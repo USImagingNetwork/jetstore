@@ -47,7 +47,8 @@ func WriteParquetPartitionV3(schemaInfo *ParquetSchemaInfo, nrowsInRec int64, fo
 	// Write the rows into the temp file
 	for inRow := range inCh {
 		if len(inRow) != len(builders) {
-			cpErr = fmt.Errorf("error: len(row) does not match len(builders) in WriteParquetPartitionV2")
+			cpErr = fmt.Errorf("error: len(row) %d does not match len(builders) %d in WriteParquetPartitionV2",
+				len(inRow), len(builders))
 			goto gotError
 		}
 		for i, builder := range builders {
@@ -122,11 +123,7 @@ func ConvertToSchemaV2(v any, se *FieldInfo) (any, error) {
 					// Couln't parse the date, return 1970/01/01
 					return int32(0), nil
 				}
-				tm := int32(d.Unix())
-				if tm > 24*60*60 {
-					return tm / (42 * 60 * 60), nil
-				}
-				return int32(0), nil
+				return arrow.Date32FromTime(*d), nil
 			}
 			i, err := strconv.Atoi(vv)
 			return int32(i), err
@@ -137,7 +134,30 @@ func ConvertToSchemaV2(v any, se *FieldInfo) (any, error) {
 		case int64:
 			return int32(vv), nil
 		default:
-			return int32(0), fmt.Errorf("error: WriteParquet invalid data for int32: %v", v)
+			return int32(0), fmt.Errorf("error: WriteParquet invalid data for int32 or date32: %v", v)
+		}
+
+	case arrow.PrimitiveTypes.Int64.Name(), arrow.PrimitiveTypes.Date64.Name():
+		switch vv := v.(type) {
+		case string:
+			// Check if it's a date
+			if se.Type == arrow.PrimitiveTypes.Date64.Name() {
+				d, err := rdf.ParseDate(vv)
+				if err != nil {
+					// Couln't parse the date, return 1970/01/01
+					return int64(0), nil
+				}
+				return arrow.Date64FromTime(*d), nil
+			}
+			return strconv.ParseInt(vv, 10, 64)
+		case int:
+			return int64(vv), nil
+		case int32:
+			return int64(vv), nil
+		case int64:
+			return vv, nil
+		default:
+			return int64(0), fmt.Errorf("error: WriteParquet invalid data for int64 or date64: %v", v)
 		}
 
 	case arrow.FixedWidthTypes.Timestamp_s.Name(),
@@ -172,20 +192,6 @@ func ConvertToSchemaV2(v any, se *FieldInfo) (any, error) {
 			return vv, nil
 		default:
 			return int64(0), fmt.Errorf("error: WriteParquet invalid data type for timestamp: %T", v)
-		}
-
-	case arrow.PrimitiveTypes.Int64.Name():
-		switch vv := v.(type) {
-		case string:
-			return strconv.ParseInt(vv, 10, 64)
-		case int:
-			return int64(vv), nil
-		case int32:
-			return int64(vv), nil
-		case int64:
-			return vv, nil
-		default:
-			return int64(0), fmt.Errorf("error: WriteParquet invalid data for int64: %v", v)
 		}
 
 	case arrow.PrimitiveTypes.Float32.Name():

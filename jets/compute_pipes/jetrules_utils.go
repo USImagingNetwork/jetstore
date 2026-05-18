@@ -11,7 +11,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/artisoft-io/jetstore/jets/jetrules/rdf"
 	"github.com/artisoft-io/jetstore/jets/jetrules/rete"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v4/pgxpool"
@@ -19,39 +18,130 @@ import (
 
 // Utility functions for jetrules transformation pipes operator
 
-// metaStoreFactoryMap is a map mainRuleName -> *ReteMetaStoreFactory
-var metaStoreFactoryMap *sync.Map = new(sync.Map)
+var workspaceControl *rete.WorkspaceControl
+var workspaceControlMx sync.Mutex
+
+// ruleEngineCache is a map mainRuleName -> *ReteMetaStoreFactory
+var ruleEngineCache *sync.Map = new(sync.Map)
 var inputMappingCache *sync.Map = new(sync.Map)
+
 var dataPropertyInfoMap map[string]*rete.DataPropertyNode
 var dataPropertyInfoMx sync.Mutex
+
 var domainTablesMap map[string]*rete.TableNode
 var domainTablesMx sync.Mutex
+
 var domainClassesMap map[string]*rete.ClassNode
 var domainClassesMx sync.Mutex
 
-// Assert source period info (date, period, type) to rdf graph
-func AssertSourcePeriodInfo(config *JetrulesSpec, graph *rdf.RdfGraph, rm *rdf.ResourceManager) (err error) {
-	if graph.IsLocked() {
-		log.Println("Warning: AssertSourcePeriodInfo called on locked graph")
-		return nil
+var ruleEngineConfig map[string]string
+var ruleEngineConfigMx sync.Mutex
+
+// Function to clear local caches, needed for when workspace have been updated and need to force the lambda to
+// reload the worspace metadata from jetstore db
+// Note: This must be called before starting goroutines as it is not thread safe.
+func ClearJetrulesCaches() {
+	workspaceControl = nil
+	ruleEngineCache = new(sync.Map)
+	inputMappingCache = new(sync.Map)
+	dataPropertyInfoMap = nil
+	domainTablesMap = nil
+	domainClassesMap = nil
+	ruleEngineConfig = nil
+}
+
+// pre-loading jetrules caches
+func LoadJetrulesCaches() {
+	c1, err := GetWorkspaceControl()
+	if err != nil {
+		log.Printf("Error while pre-loading workspace control: %v", err)
+	} else {
+		log.Printf("Pre-loaded workspace control with %d rulesets", len(c1.RuleSets))
 	}
-	jr := rm.JetsResources
-	_, err = graph.Insert(jr.Jets__istate, jr.Jets__currentSourcePeriod, rm.NewIntLiteral(config.CurrentSourcePeriod))
+	_, err = GetRuleEngineConfig(c1.RuleSets[0], "test")
+	if err != nil {
+		log.Printf("Error while pre-loading rule engine config: %v", err)
+	} else {
+		log.Printf("Pre-loaded rule engine config")
+	}
+	c2, err := GetWorkspaceDomainTables()
+	if err != nil {
+		log.Printf("Error while pre-loading domain tables: %v", err)
+	} else {
+		log.Printf("Pre-loaded domain tables with %d entries", len(c2))
+	}
+	c3, err := GetWorkspaceDataProperties()
+	if err != nil {
+		log.Printf("Error while pre-loading data properties: %v", err)
+	} else {
+		log.Printf("Pre-loaded data properties with %d entries", len(c3))
+	}
+	c4, err := GetWorkspaceDomainClasses()
+	if err != nil {
+		log.Printf("Error while pre-loading domain classes: %v", err)
+	} else {
+		log.Printf("Pre-loaded domain classes with %d entries", len(c4))
+	}
+}
+
+func GetWorkspaceControl() (*rete.WorkspaceControl, error) {
+	if workspaceControl == nil {
+		workspaceControlMx.Lock()
+		defer workspaceControlMx.Unlock()
+		if workspaceControl == nil {
+			fpath := fmt.Sprintf("%s/%s/workspace_control.json", WorkspaceHome(), WorkspacePrefix())
+			log.Println("Loading workspace control from:", fpath)
+			wc, err := rete.LoadWorkspaceControl(fpath)
+			if err != nil {
+				return nil, fmt.Errorf("while loading workspace control from %s: %v", fpath, err)
+			}
+			workspaceControl = wc
+		}
+	}
+	return workspaceControl, nil
+}
+
+// Assert source period info (date, period, type) to rdf graph
+func AssertSourcePeriodInfo(re JetRuleEngine, config *JetrulesSpec, env map[string]any) (err error) {
+	rm := re.GetMetaResourceManager()
+	jr := re.JetResources()
+	// ${PERIOD_ID_TYPE}
+	var pt string
+	if config.CurrentSourcePeriod == 0 || config.CurrentSourcePeriodType == "" {
+		pt, _ = env["${PERIOD_ID_TYPE}"].(string)
+		switch pt {
+		case "${MONTH_PERIOD}", "month_period":
+			config.CurrentSourcePeriodType = "month_period"
+		case "${DAY_PERIOD}", "day_period":
+			config.CurrentSourcePeriodType = "day_period"
+		case "${HOUR_PERIOD}", "hour_period":
+			config.CurrentSourcePeriodType = "hour_period"
+		}
+
+		switch vv := env[pt].(type) {
+		case int:
+			config.CurrentSourcePeriod = vv
+		case float64:
+			config.CurrentSourcePeriod = int(vv)
+		case string:
+			config.CurrentSourcePeriod, _ = strconv.Atoi(vv)
+		}
+	}
+	err = re.Insert(jr.Jets__istate, jr.Jets__currentSourcePeriod, rm.NewIntLiteral(config.CurrentSourcePeriod))
 	if err != nil {
 		return
 	}
+	if config.CurrentSourcePeriodDate == "" {
+		config.CurrentSourcePeriodDate, _ = env["$DATE_FILE_KEY"].(string)
+	}
 	if config.CurrentSourcePeriodDate != "" {
-		d, err2 := rdf.NewLDate(config.CurrentSourcePeriodDate)
-		if err2 == nil {
-			_, err = graph.Insert(jr.Jets__istate, jr.Jets__currentSourcePeriodDate, rm.NewDateLiteral(d))
-			if err != nil {
-				return
-			}
+		err = re.Insert(jr.Jets__istate, jr.Jets__currentSourcePeriodDate, rm.NewDateLiteral(config.CurrentSourcePeriodDate))
+		if err != nil {
+			return
 		}
 	}
 	if config.CurrentSourcePeriodType != "" {
-		_, err = graph.Insert(jr.Jets__istate, jr.Jets__currentSourcePeriodDate,
-			rm.NewTextLiteral(config.CurrentSourcePeriodType))
+		err = re.Insert(jr.Jets__istate, jr.Jets__sourcePeriodType, rm.NewTextLiteral(config.CurrentSourcePeriodType))
 		if err != nil {
 			return
 		}
@@ -60,7 +150,7 @@ func AssertSourcePeriodInfo(config *JetrulesSpec, graph *rdf.RdfGraph, rm *rdf.R
 }
 
 // Assert rule config to meta graph from the pipeline configuration
-func AssertMetadataSource(reteMetaStore *rete.ReteMetaStoreFactory, config *JetrulesSpec, env map[string]any) error {
+func AssertMetadataSource(re JetRuleEngine, config *JetrulesSpec, env map[string]any) error {
 	for i := range config.MetadataInputSources {
 		sourceSpec := &config.MetadataInputSources[i]
 		metadataSource, err := NewCsvSourceS3(sourceSpec, env)
@@ -68,7 +158,7 @@ func AssertMetadataSource(reteMetaStore *rete.ReteMetaStoreFactory, config *Jetr
 			return err
 		}
 		log.Println("Loading metadata source from:", metadataSource.fileKey.key)
-		err = metadataSource.ReadFileToMetaGraph(reteMetaStore, config)
+		err = metadataSource.ReadFileToMetaGraph(re, config)
 		// log.Println("DONE Loading metadata source from:", metadataSource.fileKey.key,"with err:",err)
 		if err != nil {
 			return err
@@ -78,39 +168,36 @@ func AssertMetadataSource(reteMetaStore *rete.ReteMetaStoreFactory, config *Jetr
 }
 
 // Assert rule config to meta graph from the pipeline configuration
-func AssertRuleConfiguration(reteMetaStore *rete.ReteMetaStoreFactory, config *JetrulesSpec) (err error) {
-	if reteMetaStore.MetaGraph.IsLocked() {
-		log.Println("Warning: AssertRuleConfiguration called on locked graph")
-		return nil
-	}
-	var object *rdf.Node
+func AssertRuleConfiguration(re JetRuleEngine, config *JetrulesSpec, env map[string]any) (err error) {
+	var object RdfNode
+	rm := re.GetMetaResourceManager()
 	for _, rc := range config.RuleConfig {
 
 		// determine the subject of rc (look for jets:key or use a uuid)
 		var subjectTxt string
 		s, ok := rc["jets:key"]
 		if ok {
-			subjectTxt, _, err = extractValue(s)
+			subjectTxt, _, err = ExtractRdfNodeInfoJson(s)
 			if err != nil {
 				return
 			}
 		} else {
 			subjectTxt = uuid.New().String()
 		}
-		subject := reteMetaStore.ResourceMgr.NewResource(subjectTxt)
+		subject := rm.NewResource(subjectTxt)
 
 		for predicateTxt := range rc {
-			value, rdfType, err2 := extractValue(rc[predicateTxt])
+			value, rdfType, err2 := ExtractRdfNodeInfoJson(rc[predicateTxt])
 			if err2 != nil {
 				return err2
 			}
-			predicate := reteMetaStore.ResourceMgr.NewResource(predicateTxt)
-			object, err = ParseObject(reteMetaStore.ResourceMgr, value, rdfType)
+			predicate := rm.NewResource(predicateTxt)
+			object, err = ParseRdfNodeValue(re.GetMetaResourceManager(), value, rdfType)
 			if err != nil {
 				return
 			}
 			// Assert the triple
-			_, err = reteMetaStore.MetaGraph.Insert(subject, predicate, object)
+			err = re.Insert(subject, predicate, object)
 			if err != nil {
 				return
 			}
@@ -120,13 +207,13 @@ func AssertRuleConfiguration(reteMetaStore *rete.ReteMetaStoreFactory, config *J
 }
 
 // Function to extract value and type from json struct
-func extractValue(e interface{}) (value, rdfType string, err error) {
+func ExtractRdfNodeInfoJson(e any) (value, rdfType string, err error) {
 	switch obj := e.(type) {
 	case string:
 		value = obj
 		rdfType = "text"
 		return
-	case map[string]interface{}:
+	case map[string]any:
 		// fmt.Println("*** Domain Key is a struct of composite keys", value)
 		for k, v := range obj {
 			switch vv := v.(type) {
@@ -152,87 +239,13 @@ func extractValue(e interface{}) (value, rdfType string, err error) {
 	}
 }
 
-func ParseObject(rm *rdf.ResourceManager, object, rdfType string) (node *rdf.Node, err error) {
-	var key int
-	var date rdf.LDate
-	var datetime rdf.LDatetime
-	// log.Println("**PARSE OBJECT:",object,"TO TYPE:",rdfType)
-	switch strings.TrimSpace(rdfType) {
-	case "null":
-		node = rdf.Null()
-	case "bn":
-		key, err = strconv.Atoi(object)
-		if err != nil {
-			return
-		}
-		node = rm.CreateBNode(key)
-	case "resource":
-		node = rm.NewResource(object)
-	case "int":
-		var v int
-		_, err = fmt.Sscan(object, &v)
-		if err != nil {
-			return nil, fmt.Errorf("while asserting rule config: %v", err)
-		}
-		node = rm.NewIntLiteral(v)
-	case "bool":
-		v := 0
-		if len(object) > 0 {
-			c := strings.ToLower(object[0:1])
-			switch c {
-			case "t", "1", "y":
-				v = 1
-			case "f", "0", "n":
-				v = 0
-			default:
-				return nil, fmt.Errorf("while rule config triple; object is not bool: %s", object)
-			}
-		}
-		node = rm.NewIntLiteral(v)
-	case "long":
-		var v int
-		_, err = fmt.Sscan(object, &v)
-		if err != nil {
-			return nil, fmt.Errorf("while asserting rule config: %v", err)
-		}
-		node = rm.NewIntLiteral(v)
-	case "double":
-		var v float64
-		_, err = fmt.Sscan(object, &v)
-		if err != nil {
-			return nil, fmt.Errorf("while asserting rule config: %v", err)
-		}
-		node = rm.NewDoubleLiteral(v)
-	case "text":
-		node = rm.NewTextLiteral(object)
-	case "date":
-		date, err = rdf.NewLDate(object)
-		node = rm.NewDateLiteral(date)
-	case "datetime":
-		datetime, err = rdf.NewLDatetime(object)
-		node = rm.NewDatetimeLiteral(datetime)
-	default:
-		err = fmt.Errorf("ERROR ParseObject: unknown rdf type for object: %s", rdfType)
-	}
-	return
-}
+// Function to get the JetRuleEngine for a rule process
+func GetJetRuleEngine(reFactory JetRulesFactory, dbpool *pgxpool.Pool, processName string, isDebug bool) (
+	ruleEngine JetRuleEngine, err error) {
 
-// Function to clear local caches, needed for when workspace have been updated and need to force the lambda to
-// reload the worspace metadata from jetstore db
-// Note: This must be called before starting goroutines as it is not thread safe.
-func ClearJetrulesCaches() {
-	metaStoreFactoryMap = new(sync.Map)
-	inputMappingCache = new(sync.Map)
-	dataPropertyInfoMap = nil
-	domainTablesMap = nil
-	domainClassesMap = nil
-}
-
-// Function to get the jetrules factory for a rule process
-func GetJetrulesFactory(dbpool *pgxpool.Pool, processName string) (reteMetaStore *rete.ReteMetaStoreFactory, err error) {
 	// Get the Rete MetaStore for the mainRules
-	msf, _ := metaStoreFactoryMap.Load(processName)
-	if msf == nil {
+	reHdle, _ := ruleEngineCache.Load(processName)
+	if reHdle == nil {
 		// Get the jetrule process info -- the mainRule name or ruleSequence name
 		var mainRules string
 		stmt := `SELECT	pc.main_rules FROM jetsapi.process_config pc WHERE pc.process_name = $1`
@@ -245,19 +258,52 @@ func GetJetrulesFactory(dbpool *pgxpool.Pool, processName string) (reteMetaStore
 		if len(mainRules) == 0 {
 			return nil, fmt.Errorf("error: main rule file name is empty for process %s", processName)
 		}
-		log.Printf("Rete Meta Store for ruleset '%s' for process '%s' not loaded, loading from local workspace",
+		log.Printf("Rule engine for ruleset '%s' for process '%s' not loaded, loading from local workspace",
 			mainRules, processName)
-		reteMetaStore, err = rete.NewReteMetaStoreFactory(mainRules)
+		ruleEngine, err = reFactory.NewJetRuleEngine(dbpool, mainRules, isDebug)
 		if err != nil {
 			return nil,
-				fmt.Errorf("while loading ruleset '%s' for process '%s' from local workspace via NewReteMetaStoreFactory: %v",
+				fmt.Errorf("while loading ruleset '%s' for process '%s' from local workspace via NewJetRuleEngine: %v",
 					mainRules, processName, err)
 		}
-		metaStoreFactoryMap.Store(processName, reteMetaStore)
+		//*** concurrent read/write og resourceMap issue
+		// ruleEngineCache.Store(processName, ruleEngine)
 	} else {
-		reteMetaStore = msf.(*rete.ReteMetaStoreFactory)
+		ruleEngine = reHdle.(JetRuleEngine)
 	}
 	return
+}
+
+type RuleEngineConfig struct {
+	MainRuleFile   string            `json:"main_rule_file_name,omitempty"`
+	JetStoreConfig map[string]string `json:"jetstore_config,omitempty"`
+}
+
+// Function to get domain classes info from the local workspace
+func GetRuleEngineConfig(mainRuleFile, property string) (string, error) {
+	if ruleEngineConfig == nil {
+		config := &RuleEngineConfig{}
+		ruleEngineConfigMx.Lock()
+		defer ruleEngineConfigMx.Unlock()
+		if ruleEngineConfig == nil {
+			fpath := fmt.Sprintf("%s/%s/build/%s.config.json", workspaceHome, wsPrefix, strings.TrimSuffix(mainRuleFile, ".jr"))
+			log.Println("Reading Rule Engine config definitions from:", fpath)
+			file, err := os.ReadFile(fpath)
+			if err != nil {
+				err = fmt.Errorf("while reading config.json file (GetRuleEngineConfig):%v", err)
+				log.Println(err)
+				return "", err
+			}
+			err = json.Unmarshal(file, config)
+			if err != nil {
+				err = fmt.Errorf("while unmarshaling config.json (GetRuleEngineConfig):%v", err)
+				log.Println(err)
+				return "", err
+			}
+			ruleEngineConfig = config.JetStoreConfig
+		}
+	}
+	return ruleEngineConfig[property], nil
 }
 
 // Function to get domain classes info from the local workspace
@@ -265,46 +311,50 @@ func GetWorkspaceDomainClasses() (map[string]*rete.ClassNode, error) {
 	if domainClassesMap == nil {
 		domainClassesMx.Lock()
 		defer domainClassesMx.Unlock()
-		fmt.Println("Load Domain Tables from local Workspace")
-		domainClassesMap = make(map[string]*rete.ClassNode)
-		fpath := fmt.Sprintf("%s/%s/build/classes.json", workspaceHome, wsPrefix)
-		log.Println("Reading Domain Classes definitions from:", fpath)
-		file, err := os.ReadFile(fpath)
-		if err != nil {
-			err = fmt.Errorf("while reading classes.json file (GetWorkspaceDomainClasses):%v", err)
-			log.Println(err)
-			return nil, err
-		}
-		err = json.Unmarshal(file, &domainClassesMap)
-		if err != nil {
-			err = fmt.Errorf("while unmarshaling classes.json (GetWorkspaceDomainClasses):%v", err)
-			log.Println(err)
-			return nil, err
+		if domainClassesMap == nil {
+			fmt.Println("Load Domain Tables from local Workspace")
+			domainClassesMap = make(map[string]*rete.ClassNode)
+			fpath := fmt.Sprintf("%s/%s/build/classes.json", workspaceHome, wsPrefix)
+			log.Println("Reading Domain Classes definitions from:", fpath)
+			file, err := os.ReadFile(fpath)
+			if err != nil {
+				err = fmt.Errorf("while reading classes.json file (GetWorkspaceDomainClasses):%v", err)
+				log.Println(err)
+				return nil, err
+			}
+			err = json.Unmarshal(file, &domainClassesMap)
+			if err != nil {
+				err = fmt.Errorf("while unmarshaling classes.json (GetWorkspaceDomainClasses):%v", err)
+				log.Println(err)
+				return nil, err
+			}
 		}
 	}
 	return domainClassesMap, nil
 }
 
-// Function to get domain classes info from the local workspace
+// Function to get domain tables info from the local workspace
 func GetWorkspaceDomainTables() (map[string]*rete.TableNode, error) {
 	if domainTablesMap == nil {
 		domainTablesMx.Lock()
 		defer domainTablesMx.Unlock()
-		fmt.Println("Load Domain Tables from local Workspace")
-		domainTablesMap = make(map[string]*rete.TableNode)
-		fpath := fmt.Sprintf("%s/%s/build/tables.json", workspaceHome, wsPrefix)
-		log.Println("Reading Domain Tables definitions from:", fpath)
-		file, err := os.ReadFile(fpath)
-		if err != nil {
-			err = fmt.Errorf("while reading tables.json file (GetWorkspaceDomainTables):%v", err)
-			log.Println(err)
-			return nil, err
-		}
-		err = json.Unmarshal(file, &domainTablesMap)
-		if err != nil {
-			err = fmt.Errorf("while unmarshaling tables.json (GetWorkspaceDomainTables):%v", err)
-			log.Println(err)
-			return nil, err
+		if domainTablesMap == nil {
+			domainTablesMap = make(map[string]*rete.TableNode)
+			fpath := fmt.Sprintf("%s/%s/build/tables.json", workspaceHome, wsPrefix)
+			// log.Println("*** Loading Domain Tables definitions from:", fpath)
+			file, err := os.ReadFile(fpath)
+			if err != nil {
+				err = fmt.Errorf("while reading tables.json file (GetWorkspaceDomainTables):%v", err)
+				log.Println(err)
+				return nil, err
+			}
+			err = json.Unmarshal(file, &domainTablesMap)
+			if err != nil {
+				err = fmt.Errorf("while unmarshaling tables.json (GetWorkspaceDomainTables):%v", err)
+				log.Println(err)
+				return nil, err
+			}
+			// log.Printf("*** Domain Tables Loaded with %d table definitions", len(domainTablesMap))
 		}
 	}
 	return domainTablesMap, nil
@@ -315,24 +365,64 @@ func GetWorkspaceDataProperties() (map[string]*rete.DataPropertyNode, error) {
 	if dataPropertyInfoMap == nil {
 		dataPropertyInfoMx.Lock()
 		defer dataPropertyInfoMx.Unlock()
-		fmt.Println("Load Data Properties from local Workspace")
-		dataPropertyInfoMap = make(map[string]*rete.DataPropertyNode)
-		fpath := fmt.Sprintf("%s/%s/build/properties.json", workspaceHome, wsPrefix)
-		log.Println("Reading Data Properties definitions from:", fpath)
-		file, err := os.ReadFile(fpath)
-		if err != nil {
-			err = fmt.Errorf("while reading properties.json file (GetWorkspaceDataProperties):%v", err)
-			log.Println(err)
-			return nil, err
-		}
-		err = json.Unmarshal(file, &dataPropertyInfoMap)
-		if err != nil {
-			err = fmt.Errorf("while unmarshaling properties.json (GetWorkspaceDataProperties):%v", err)
-			log.Println(err)
-			return nil, err
+		if dataPropertyInfoMap == nil {
+			// log.Println("*** Load Data Properties from local Workspace")
+			dataPropertyInfoMap = make(map[string]*rete.DataPropertyNode)
+			fpath := fmt.Sprintf("%s/%s/build/properties.json", workspaceHome, wsPrefix)
+			// log.Println("Reading Data Properties definitions from:", fpath)
+			file, err := os.ReadFile(fpath)
+			if err != nil {
+				err = fmt.Errorf("while reading properties.json file (GetWorkspaceDataProperties):%v", err)
+				log.Println(err)
+				return nil, err
+			}
+			err = json.Unmarshal(file, &dataPropertyInfoMap)
+			if err != nil {
+				err = fmt.Errorf("while unmarshaling properties.json (GetWorkspaceDataProperties):%v", err)
+				log.Println(err)
+				return nil, err
+			}
+			// log.Printf("*** Data Properties Loaded with %d property definitions", len(dataPropertyInfoMap))
 		}
 	}
 	return dataPropertyInfoMap, nil
+}
+
+func GetMultiValueProperties(className string) ([]string, error) {
+	cache, err := GetWorkspaceDomainTables()
+	if err != nil {
+		return nil, fmt.Errorf("while getting domain tables from local workspace: %v", err)
+	}
+	tableInfo := cache[className]
+	if tableInfo == nil {
+		return nil, fmt.Errorf("error: domain table for class %s is not found in the local workspace, cache contains %d entries", className, len(cache))
+	}
+	multiValueProperties := make([]string, 0)
+	for i := range tableInfo.Columns {
+		p := tableInfo.Columns[i]
+		if p.AsArray {
+			multiValueProperties = append(multiValueProperties, p.ColumnName)
+		}
+	}
+	// log.Printf("*** Multi-value properties for class %s: %v", className, multiValueProperties)
+	return multiValueProperties, nil
+}
+
+func GetDataPropertyRdfType(className string) (map[string]string, error) {
+	cache, err := GetWorkspaceDomainTables()
+	if err != nil {
+		return nil, fmt.Errorf("while getting domain tables from local workspace: %v", err)
+	}
+	tableInfo := cache[className]
+	if tableInfo == nil {
+		return nil, fmt.Errorf("error: domain table for class %s is not found in the local workspace, cache contains %d entries", className, len(cache))
+	}
+	property2RdfType := make(map[string]string)
+	for i := range tableInfo.Columns {
+		p := tableInfo.Columns[i]
+		property2RdfType[p.ColumnName] = p.Type
+	}
+	return property2RdfType, nil
 }
 
 // Get the domain properties for className.
@@ -364,12 +454,16 @@ func GetDomainProperties(className string, directPropertitesOnly bool) ([]string
 		if tableInfo == nil {
 			return nil, fmt.Errorf("error: domain table/class %s is not found in the local workspace", className)
 		}
-		columns = make([]string, 0, len(tableInfo.Columns))
+		columns = make([]string, 0, len(tableInfo.Columns)+3)
 		columns = append(columns, "jets:key")
 		columns = append(columns, "rdf:type")
+		columns = append(columns, "jets:source_period_sequence")
 		for i := range tableInfo.Columns {
-			p := tableInfo.Columns[i].PropertyName
-			if p != "jets:key" && p != "rdf:type" {
+			p := tableInfo.Columns[i].ColumnName
+			switch p {
+			case "jets:key", "rdf:type", "jets:source_period_sequence":
+				// skip reserved properties
+			default:
 				columns = append(columns, p)
 			}
 		}
@@ -386,7 +480,7 @@ type InputMappingExpr struct {
 	ErrorMessage          sql.NullString
 }
 
-// read mapping definitions
+// read mapping definitions from process_mapping
 func GetInputMapping(dbpool *pgxpool.Pool, tableName string) ([]InputMappingExpr, error) {
 	item, _ := inputMappingCache.Load(tableName)
 	if item == nil {
@@ -422,4 +516,23 @@ func GetInputMapping(dbpool *pgxpool.Pool, tableName string) ([]InputMappingExpr
 		inputMappingCache.Store(tableName, item)
 	}
 	return item.([]InputMappingExpr), nil
+}
+
+// read code value mapping json from source_config and convert it to map[string]string
+func GetCodeValueMapping(dbpool *pgxpool.Pool, tableName string) (map[string]map[string]string, error) {
+	var mappingJson sql.NullString
+	// Get the code value json from source_config table
+	stmt := "SELECT code_values_mapping_json FROM jetsapi.source_config WHERE table_name = $1"
+	err := dbpool.QueryRow(context.Background(), stmt, tableName).Scan(&mappingJson)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, err
+	}
+	if !mappingJson.Valid {
+		return nil, nil
+	}
+	var codeValueMapping map[string]map[string]string
+	if err := json.Unmarshal([]byte(mappingJson.String), &codeValueMapping); err != nil {
+		return nil, err
+	}
+	return codeValueMapping, nil
 }
