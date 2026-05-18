@@ -16,10 +16,10 @@ import (
 	"github.com/artisoft-io/jetstore/jets/awsi"
 )
 
-func (cpCtx *ComputePipesContext) ReadParquetFileV2(filePath *FileName, 
+func (cpCtx *ComputePipesContext) ReadParquetFileV2(filePath *FileName,
 	fileReader parquet.ReaderAtSeeker, readBatchSize int64,
-	castToRdfTxtTypeFncs []CastToRdfTxtFnc, inputSchemaCh chan<- ParquetSchemaInfo,
-	computePipesInputCh chan<- []any) (int64, error) {
+	castToRdfTxtTypeFncs []*CastToRdfTxtFnc, inputSchemaCh chan<- *ParquetSchemaInfo,
+	reorderColumnsOnRead []int, computePipesInputCh chan<- []any) (int64, error) {
 
 	var inputColumns []string
 	var err error
@@ -27,8 +27,8 @@ func (cpCtx *ComputePipesContext) ReadParquetFileV2(filePath *FileName,
 	samplingMaxCount := int64(cpCtx.CpConfig.PipesConfig[0].InputChannel.SamplingMaxCount)
 
 	// Here nbrColumns is the nbr of columns in the parquet file (excluding the extra columns added by the process)
-	nbrColumns := len(cpCtx.CpConfig.CommonRuntimeArgs.SourcesConfig.MainInput.InputColumns)-
-		len(cpCtx.PartFileKeyComponents)-len(cpCtx.AddionalInputHeaders)
+	nbrColumns := len(cpCtx.CpConfig.CommonRuntimeArgs.SourcesConfig.MainInput.InputColumns) -
+		len(cpCtx.PartFileKeyComponents) - len(cpCtx.AddionalInputHeaders)
 	if nbrColumns > 0 {
 		// Read specified columns
 		inputColumns = cpCtx.CpConfig.CommonRuntimeArgs.SourcesConfig.MainInput.InputColumns[:nbrColumns]
@@ -57,21 +57,25 @@ func (cpCtx *ComputePipesContext) ReadParquetFileV2(filePath *FileName,
 
 	// Check if we read only some rows
 	var firstRowToRead, nbrRowsToRead int64
-	if filePath.InFileKeyInfo.end > 0 {
-		nbrRowsToRead = reader.ParquetReader().NumRows() / int64(cpCtx.CpConfig.ClusterConfig.ShardingInfo.NbrPartitions)
-		firstRowToRead = int64(cpCtx.ComputePipesNodeArgs.NodeId) * nbrRowsToRead
+	if filePath.InFileKeyInfo.end > 1 {
+		nbrRowsToRead = reader.ParquetReader().NumRows() / int64(filePath.InFileKeyInfo.end)
+		firstRowToRead = int64(filePath.InFileKeyInfo.start) * nbrRowsToRead
 	}
-	if cpCtx.ComputePipesNodeArgs.NodeId == cpCtx.CpConfig.ClusterConfig.ShardingInfo.NbrPartitions-1 {
+	if filePath.InFileKeyInfo.start == filePath.InFileKeyInfo.end-1 {
+		// reading the last shard, make sure to read all the remaining rows
 		nbrRowsToRead = reader.ParquetReader().NumRows() - firstRowToRead
 	}
-	// log.Println("*** The parquet file contains", reader.ParquetReader().NumRows(), "rows, reading from row", firstRowToRead, "reading", nbrRowsToRead, "rows")
+	if cpCtx.CpConfig.ClusterConfig.IsDebugMode {
+		log.Println("*** The parquet file contains", reader.ParquetReader().NumRows(), "rows, reading from row", firstRowToRead, "reading", nbrRowsToRead, "rows",
+			"start", filePath.InFileKeyInfo.start, "end", filePath.InFileKeyInfo.end)
+	}
 
 	parquetSchemaInfo := NewParquetSchemaInfo(schema)
 	// Save the parquet schema to s3 on request
 	if inputSchemaCh != nil {
 
 		// Make the schema avail to channel registry
-		inputSchemaCh <- *parquetSchemaInfo
+		inputSchemaCh <- parquetSchemaInfo
 
 		if cpCtx.ComputePipesArgs.NodeId == 0 {
 			// save schema info to s3
@@ -80,7 +84,7 @@ func (cpCtx *ComputePipesContext) ReadParquetFileV2(filePath *FileName,
 				return 0, fmt.Errorf("while making json from parquet schema info: %v", err)
 			}
 			fileKey := fmt.Sprintf("%s/process_name=%s/session_id=%s/input_parquet_schema.json",
-				jetsS3StagePrefix, cpCtx.ProcessName, cpCtx.SessionId)
+				awsi.JetStoreStagePrefix(), cpCtx.ProcessName, cpCtx.SessionId)
 			log.Printf("Saving parquet schema to: %s", fileKey)
 			err = awsi.UploadBufToS3("", fileKey, schemaInfo)
 			if err != nil {
@@ -97,6 +101,8 @@ func (cpCtx *ComputePipesContext) ReadParquetFileV2(filePath *FileName,
 			if len(idx) > 0 {
 				columnIndices = append(columnIndices, idx[0])
 			} else {
+				si, _ := json.Marshal(parquetSchemaInfo)
+				log.Printf("error: column %s is not found in parquet schema of part file (ReadParquetFileV2), schema of part file:\n %s", c, string(si))
 				return 0, fmt.Errorf("error: column %s is not found in the parquet schema of '%s' (ReadParquetFileV2)", c, cpCtx.FileKey)
 			}
 		}
@@ -139,9 +145,9 @@ func (cpCtx *ComputePipesContext) ReadParquetFileV2(filePath *FileName,
 	var done bool
 	for !done && recordReader.Next() {
 		// read and put the rows into computePipesInputCh
-		currentRow, inputRowCount, done, err = cpCtx.processRecord(computePipesInputCh, 
+		currentRow, inputRowCount, done, err = cpCtx.processRecord(computePipesInputCh,
 			recordReader.Record(), parquetSchemaInfo,
-			nbrColumns, extColumns, trimColumns, castToRdfTxtTypeFncs,
+			nbrColumns, extColumns, trimColumns, castToRdfTxtTypeFncs, reorderColumnsOnRead,
 			firstRowToRead, nbrRowsToRead, samplingRate, samplingMaxCount, currentRow, inputRowCount)
 		if err != nil {
 			return inputRowCount, err
@@ -154,11 +160,11 @@ func (cpCtx *ComputePipesContext) ReadParquetFileV2(filePath *FileName,
 }
 
 func (cpCtx *ComputePipesContext) processRecord(computePipesInputCh chan<- []any, arrowRecord arrow.Record,
-	parquetSchemaInfo *ParquetSchemaInfo, nbrColumns int, extColumns []string, 
-	trimColumns bool, castToRdfTxtTypeFncs []CastToRdfTxtFnc,
+	parquetSchemaInfo *ParquetSchemaInfo, nbrColumns int, extColumns []string,
+	trimColumns bool, castToRdfTxtTypeFncs []*CastToRdfTxtFnc, reorderColumnsOnRead []int,
 	firstRowToRead, nbrRowsToRead, samplingRate, samplingMaxCount, currentRow, inputRowCount int64) (int64, int64, bool, error) {
 	defer arrowRecord.Release()
-	var castFnc CastToRdfTxtFnc
+	var castFnc *CastToRdfTxtFnc
 	var errCol error
 	if nbrRowsToRead > 0 && firstRowToRead > currentRow+arrowRecord.NumRows() {
 		// skip this record
@@ -198,7 +204,7 @@ func (cpCtx *ComputePipesContext) processRecord(computePipesInputCh chan<- []any
 				record[jcol], errCol = ConvertWithSchemaV1(irow, col, trimColumns, parquetSchemaInfo.Fields[jcol], castFnc)
 				if errCol != nil {
 					return currentRow, inputRowCount, false, fmt.Errorf(
-						"while reading input records (ReadParquetFile) for column %d (%s) with value %v: %v", 
+						"while reading input records (ReadParquetFile) for column %d (%s) with value %v: %v",
 						jcol, parquetSchemaInfo.Columns()[jcol], col.ValueStr(irow), errCol)
 				}
 			}
@@ -221,6 +227,18 @@ func (cpCtx *ComputePipesContext) processRecord(computePipesInputCh chan<- []any
 		if cpCtx.CpConfig.ClusterConfig.KillSwitchMin > 0 &&
 			time.Since(ComputePipesStart).Minutes() >= float64(cpCtx.CpConfig.ClusterConfig.KillSwitchMin) {
 			return currentRow, inputRowCount, false, ErrKillSwitch
+		}
+
+		if len(reorderColumnsOnRead) > 0 {
+			m := min(len(reorderColumnsOnRead), len(record))
+			row := make([]any, len(record))
+			for i := range m {
+				row[i] = record[reorderColumnsOnRead[i]]
+			}
+			for i := m; i < len(record); i++ {
+				row[i] = record[i]
+			}
+			record = row
 		}
 
 		// Send out the record

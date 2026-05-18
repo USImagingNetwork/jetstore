@@ -6,10 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"strings"
 
 	"github.com/artisoft-io/jetstore/jets/datatable/jcsv"
-	"github.com/artisoft-io/jetstore/jets/jetrules/rete"
+	"github.com/artisoft-io/jetstore/jets/utils"
 	"github.com/jackc/pgx/v4"
 )
 
@@ -18,24 +17,25 @@ import (
 type JetrulesTransformationPipe struct {
 	cpConfig       *ComputePipesConfig
 	source         *InputChannel
-	reteMetaStore  *rete.ReteMetaStoreFactory
+	ruleEngine     JetRuleEngine
 	jrPoolManager  *JrPoolManager
+	errorOutputCh  *OutputChannel
 	outputChannels []*JetrulesOutputChan
 	spec           *TransformationSpec
-	env            map[string]interface{}
+	env            map[string]any
 	doneCh         chan struct{}
 }
 
 type JetrulesOutputChan struct {
-	className        string
-	columnEvaluators []TransformationColumnEvaluator
-	outputCh         *OutputChannel
+	ClassName        string
+	ColumnEvaluators []TransformationColumnEvaluator
+	OutputCh         *OutputChannel
 }
 
 // Implementing interface PipeTransformationEvaluator
 // Each call to Apply, the input correspond to a rdf session on which to Apply the jetrules
 // see jetrules_pool_worker.go for worker implementation
-func (ctx *JetrulesTransformationPipe) Apply(input *[]interface{}) error {
+func (ctx *JetrulesTransformationPipe) Apply(input *[]any) error {
 	if input == nil {
 		return fmt.Errorf("error: unexpected null input arg in JetrulesTransformationPipe")
 	}
@@ -59,17 +59,61 @@ func (ctx *JetrulesTransformationPipe) Finally() {
 	// This is to avoid to close the output channel too early since the pool workers
 	// are writing to the output channel async
 	ctx.jrPoolManager.WaitForDone.Wait()
+	// log.Println("JetrulesTransformationPipe.Finally done")
+	// Close the error channel if exists
+	if ctx.errorOutputCh != nil {
+		close(ctx.errorOutputCh.Channel)
+	}
 }
 
-func (ctx *BuilderContext) NewJetrulesTransformationPipe(source *InputChannel, _ *OutputChannel, spec *TransformationSpec) (*JetrulesTransformationPipe, error) {
+func (ctx *BuilderContext) NewJetrulesTransformationPipe(source *InputChannel, _ *OutputChannel, spec *TransformationSpec) (
+	*JetrulesTransformationPipe, error) {
+
 	if spec == nil || spec.JetrulesConfig == nil {
-		return nil, fmt.Errorf("error: Jetrules Pipe Transformation spec is missing regex, lookup, and/or keywords definition")
+		return nil, fmt.Errorf("error: Jetrules Pipe Transformation spec is missing jetrules_config element")
 	}
 	spec.NewRecord = true
 	config := spec.JetrulesConfig
 
-	// Get the rete meta store
-	reteMetaStore, err := GetJetrulesFactory(ctx.dbpool, config.ProcessName)
+	// Prepare JetRules engine
+	var jrFactory JetRulesFactory
+	if config.UseJetRulesNative {
+		jrFactory = ctx.jetRules.GetNativeFactory()
+	}
+	if config.UseJetRulesGo {
+		jrFactory = ctx.jetRules.GetGoFactory()
+	}
+	if jrFactory == nil {
+		jrFactory = ctx.jetRules.GetDefaultFactory()
+		if jrFactory == nil {
+			log.Println("WARNING: no JetRulesFactory available in CoordinateComputePipes")
+		}
+	}
+	log.Printf("%s node %d %s - Using Jetrule engine: %s",
+		ctx.cpConfig.CommonRuntimeArgs.SessionId,
+		ctx.nodeId, ctx.cpConfig.CommonRuntimeArgs.MainInputStepId, jrFactory.JetRulesName())
+
+	// Get the main input channel config, it will be used to get the input domain class and to check if we have merge channels
+	inputChannelConfig := &ctx.cpConfig.PipesConfig[0].InputChannel
+	rdfType2Columns := make(map[string][]string)
+	if len(source.Config.ClassName) > 0 {
+		rdfType2Columns[source.Config.ClassName] = source.Config.Columns
+	}
+	for _, mergeChannelConfig := range inputChannelConfig.MergeChannels {
+		c := ctx.channelRegistry.ComputeChannels[mergeChannelConfig.Name]
+		if c == nil {
+			err := fmt.Errorf("unexpected error: channel '%s' not found for merge channel config", mergeChannelConfig.Name)
+			log.Println(err)
+			return nil, err
+		}
+		rdfType2Columns[c.Config.ClassName] = c.Config.Columns
+	}
+
+	// Get the jetrules engine for the process
+	// Apply environment variables
+	processName := utils.ReplaceEnvVars(config.ProcessName, ctx.env)
+	log.Printf("%s NewJetrulesTransformationPipe - ProcessName: %s", ctx.cpConfig.CommonRuntimeArgs.SessionId, processName)
+	ruleEngine, err := jrFactory.NewJetRuleEngine(ctx.dbpool, processName, config.IsDebug)
 	if err != nil {
 		return nil, err
 	}
@@ -81,7 +125,7 @@ func (ctx *BuilderContext) NewJetrulesTransformationPipe(source *InputChannel, _
 		if err != nil {
 			return nil, err
 		}
-		if len(outCh.config.ClassName) == 0 {
+		if len(outCh.Config.ClassName) == 0 {
 			return nil, fmt.Errorf("error: missing class name on jetrules output channel named %s",
 				config.OutputChannels[i].Name)
 		}
@@ -97,14 +141,14 @@ func (ctx *BuilderContext) NewJetrulesTransformationPipe(source *InputChannel, _
 			}
 		}
 		jetrulesOutputChan = append(jetrulesOutputChan, &JetrulesOutputChan{
-			className:        outCh.config.ClassName,
-			columnEvaluators: columnEvaluators,
-			outputCh:         outCh,
+			ClassName:        outCh.Config.ClassName,
+			ColumnEvaluators: columnEvaluators,
+			OutputCh:         outCh,
 		})
 	}
 
 	// Assert current source period to meta graph
-	err = AssertSourcePeriodInfo(config, reteMetaStore.MetaGraph, reteMetaStore.ResourceMgr)
+	err = AssertSourcePeriodInfo(ruleEngine, config, ctx.env)
 	if err != nil {
 		return nil, fmt.Errorf("while AssertSourcePeriodInfo: %v", err)
 	}
@@ -139,7 +183,7 @@ func (ctx *BuilderContext) NewJetrulesTransformationPipe(source *InputChannel, _
 	// Get pipeline / client specific rule config from pipeline_config
 	ruleConfigJson = ""
 	err = ctx.dbpool.QueryRow(context.Background(),
-		`SELECT rule_config_json FROM jetsapi.pipeline_config WHERE key = $1`, 
+		`SELECT rule_config_json FROM jetsapi.pipeline_config WHERE key = $1`,
 		ctx.cpConfig.CommonRuntimeArgs.PipelineConfigKey).Scan(&ruleConfigJson)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("while reading rule_config_json from pipeline_config table: %v", err)
@@ -151,38 +195,49 @@ func (ctx *BuilderContext) NewJetrulesTransformationPipe(source *InputChannel, _
 			return nil, fmt.Errorf("while parsing and appending rule config from pipeline_config table: %v", err)
 		}
 	}
-	
+
 	// Assert rule config to meta graph from the pipeline configuration
-	err = AssertRuleConfiguration(reteMetaStore, config)
+	err = AssertRuleConfiguration(ruleEngine, config, ctx.env)
 	if err != nil {
 		return nil, fmt.Errorf("while AssertRuleConfiguration: %v", err)
 	}
 
 	// Assert metadata source
-	err = AssertMetadataSource(reteMetaStore, config, ctx.env)
+	err = AssertMetadataSource(ruleEngine, config, ctx.env)
 	if err != nil {
 		return nil, fmt.Errorf("while AssertMetadataSource: %v", err)
 	}
 
-	// Print rdf session if in debug mode
-	if config.IsDebug {
-		log.Println("METADATA GRAPH")
-		log.Println(strings.Join(reteMetaStore.MetaGraph.ToTriples(), "\n"))
+	// Get the error channel if configured
+	var errorOutputCh *OutputChannel
+	if config.ErrorChannel != nil {
+		if len(config.ErrorChannel.Name) == 0 {
+			return nil, fmt.Errorf("error: error_channel name cannot be empty")
+		}
+		if len(config.ErrorChannel.SpecName) == 0 {
+			return nil, fmt.Errorf("error: error_channel spec name cannot be empty")
+		}
+		errorOutputCh, err = ctx.channelRegistry.GetOutputChannel(config.ErrorChannel.Name)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Setup a worker pool
 	var jrPoolManager *JrPoolManager
 	workerResultCh := make(chan JetrulesWorkerResult, 10)
 	ctx.chResults.JetrulesWorkerResultCh <- workerResultCh
-	jrPoolManager, err = ctx.NewJrPoolManager(config, source, reteMetaStore, jetrulesOutputChan, workerResultCh)
+	jrPoolManager, err = ctx.NewJrPoolManager(config, source, rdfType2Columns, ruleEngine,
+		errorOutputCh, jetrulesOutputChan, workerResultCh)
 	if err != nil {
 		return nil, err
 	}
 	return &JetrulesTransformationPipe{
 		cpConfig:       ctx.cpConfig,
 		source:         source,
-		reteMetaStore:  reteMetaStore,
+		ruleEngine:     ruleEngine,
 		jrPoolManager:  jrPoolManager,
+		errorOutputCh:  errorOutputCh,
 		outputChannels: jetrulesOutputChan,
 		spec:           spec,
 		env:            ctx.env,
@@ -191,11 +246,11 @@ func (ctx *BuilderContext) NewJetrulesTransformationPipe(source *InputChannel, _
 }
 
 func appendRuleConfig(ruleConfig []map[string]any, configJson *string) ([]map[string]any, error) {
-  if len(*configJson) > 0 {
-    config := make([]map[string]any, 0)
+	if len(*configJson) > 0 {
+		config := make([]map[string]any, 0)
 		if err := json.Unmarshal([]byte(*configJson), &config); err != nil {
 			// Assume it's csv
-      var err2 error
+			var err2 error
 			config, err2 = parseRuleConfigCsv(config, configJson)
 			if err2 != nil {
 				return nil, fmt.Errorf("while reading jetsapi.pipeline_config table, invalid rule_config_json\nJSON ERR:%v\nCSV ERR: %v", err, err2)
@@ -206,47 +261,47 @@ func appendRuleConfig(ruleConfig []map[string]any, configJson *string) ([]map[st
 				log.Println("Got pipeline-specific rule config in json format")
 			}
 		}
-    ruleConfig = append(ruleConfig, config...)
-  }
-  return ruleConfig, nil
+		ruleConfig = append(ruleConfig, config...)
+	}
+	return ruleConfig, nil
 }
 
 func parseRuleConfigCsv(config []map[string]any, ruleConfig *string) ([]map[string]any, error) {
 	rows, err := jcsv.Parse(*ruleConfig)
 	if len(rows) > 1 && len(rows[0]) > 3 && err == nil {
-    entities := make(map[string]map[string]any)
+		entities := make(map[string]map[string]any)
 		for i := range rows {
 			// Skip the header
 			if i > 0 {
-        // Transform triples:
-        // subject:   rows[i][0],
-        // predicate: rows[i][1],
-        // object:    rows[i][2],
-        // rdfType:   rows[i][3],
-        // Into json struct:
-        // [
-        //   {
-        //   "usi_sm:clientName": {
-        //     "value": "Local 138",
-        //     "type": "text"
-        //   }
-        // ]
-        entity := entities[rows[i][0]]
-        if entity == nil {
-          entity = make(map[string]any)
-          entities[rows[i][0]] = entity
-        }
-        // predicate to value / type
-        entity[rows[i][1]] = map[string]any{
-          "value": rows[i][2],
-          "type": rows[i][3],
-        }
+				// Transform triples:
+				// subject:   rows[i][0],
+				// predicate: rows[i][1],
+				// object:    rows[i][2],
+				// rdfType:   rows[i][3],
+				// Into json struct:
+				// [
+				//   {
+				//   "usi_sm:clientName": {
+				//     "value": "Local 138",
+				//     "type": "text"
+				//   }
+				// ]
+				entity := entities[rows[i][0]]
+				if entity == nil {
+					entity = make(map[string]any)
+					entities[rows[i][0]] = entity
+				}
+				// predicate to value / type
+				entity[rows[i][1]] = map[string]any{
+					"value": rows[i][2],
+					"type":  rows[i][3],
+				}
 			}
 		}
-    // Get the list of entities into config
-    for _, entity := range entities {
-      config = append(config, entity)
-    }
+		// Get the list of entities into config
+		for _, entity := range entities {
+			config = append(config, entity)
+		}
 	}
 	return config, err
 }

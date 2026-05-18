@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/artisoft-io/jetstore/jets/utils"
 	"github.com/google/uuid"
 )
 
@@ -22,8 +23,7 @@ type hashColumnEval struct {
 	outputPos     int
 }
 
-func (ctx *hashColumnEval) InitializeCurrentValue(currentValue *[]interface{}) {}
-func (ctx *hashColumnEval) Update(currentValue *[]interface{}, input *[]interface{}) error {
+func (ctx *hashColumnEval) Update(currentValue *[]any, input *[]any) error {
 	var hashedValue any
 	var err error
 	if currentValue == nil || input == nil {
@@ -40,44 +40,46 @@ func (ctx *hashColumnEval) Update(currentValue *[]interface{}, input *[]interfac
 	}
 	return err
 }
-func (ctx *hashColumnEval) Done(currentValue *[]interface{}) error {
+func (ctx *hashColumnEval) Done(currentValue *[]any) error {
 	return nil
 }
 
 // The Hash operator example (dw_rawfilename is string):
 //
-//	 case hash function:
-//		{
-//			"name": "jets_partition",
-//			"type": "hash",
-//			"hash_expr": {
-//				"expr": "dw_rawfilename",
-//				"composite_expr": ["partion", "dw_rawfilename"],
-//				"nbr_jets_partitions": 3,
-//				"alternate_composite_expr": ["name", "gender", "format_date(dob)"],
-//			}
+//		Case hash function:
+//	 =========================================
+//			{
+//				"name": "jets_partition",
+//				"type": "hash",
+//				"hash_expr": {
+//					"expr": "dw_rawfilename",
+//					"composite_expr": ["partion", "dw_rawfilename"],
+//					"nbr_jets_partitions": 3,
+//					"alternate_composite_expr": ["name", "gender", "format_date(dob)"],
+//				}
 //
 // jets_partition will be of type uint64
 //
-//	 case compute domain key:
-//		{
-//			"name": "Claim:domain_key",
-//			"type": "hash",
-//			"hash_expr": {
-//				"domain_key": "Claim",
-//				"compute_domain_key": true
-//			}
+//		Case compute domain key:
+//	 =========================================
+//			{
+//				"name": "Claim:domain_key",
+//				"type": "hash",
+//				"hash_expr": {
+//					"domain_key": "Claim",
+//					"compute_domain_key": true
+//				}
 //
 // Claim:domain_key will be of type string
 func (ctx *BuilderContext) BuildHashTCEvaluator(source *InputChannel, outCh *OutputChannel,
 	spec *TransformationColumnSpec) (TransformationColumnEvaluator, error) {
 
 	if spec == nil || spec.HashExpr == nil {
-		return nil, fmt.Errorf("error: Type hash must have HashExpr != nil")
+		return nil, fmt.Errorf("error: Type 'hash' must have field 'hash_expr' != nil")
 	}
-	outputPos, ok := (*outCh.columns)[spec.Name]
+	outputPos, ok := (*outCh.Columns)[spec.Name]
 	if !ok {
-		return nil, fmt.Errorf("error column %s not found in output source %s", spec.Name, outCh.name)
+		return nil, fmt.Errorf("error column %s not found in output source %s", spec.Name, outCh.Name)
 	}
 	hashEvaluator, err := ctx.NewHashEvaluator(source, spec.HashExpr)
 
@@ -87,7 +89,7 @@ func (ctx *BuilderContext) BuildHashTCEvaluator(source *InputChannel, outCh *Out
 	}, err
 }
 
-// Hashing Algo for computing Domain Key
+// Hashing Algo supported
 type HashingAlgoEnum int
 
 const (
@@ -96,7 +98,13 @@ const (
 	HashingAlgo_MD5
 )
 
-// HashEvaluator is a type to compute a hask key based on an input record.
+func (e HashingAlgoEnum) String() string {
+	return [...]string{"none", "sha1", "md5"}[e]
+}
+
+// HashEvaluator is a type to compute a hash key based on an input record.
+// The hashing algo can be sha1, md5 or none. This is used to compute domain key ONLY.
+// For regular hash-based partitioning, the hashing algo is always FNV-1a 64bit, and the hash key is always uint64.
 type HashEvaluator struct {
 	inputPos          int
 	compositeInputKey []PreprocessingFunction
@@ -105,11 +113,50 @@ type HashEvaluator struct {
 	computeDomainKey  bool
 	hashingAlgo       HashingAlgoEnum
 	delimit           string
+	// debugCount int
+}
+
+func (ctx *HashEvaluator) String() string {
+	var b strings.Builder
+	b.WriteString("HashEvaluator(")
+	if ctx.inputPos > -1 {
+		fmt.Fprintf(&b, "inputPos=%d, ", ctx.inputPos)
+	}
+	if len(ctx.compositeInputKey) > 0 {
+		b.WriteString("compositeInputKey=[")
+		for i, pf := range ctx.compositeInputKey {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(pf.String())
+		}
+		b.WriteString("], ")
+	}
+	if ctx.computeDomainKey {
+		b.WriteString("computeDomainKey=true, ")
+		fmt.Fprintf(&b, "hashingAlgo=%s, ", ctx.hashingAlgo.String())
+	}
+	if ctx.partitions > 0 {
+		fmt.Fprintf(&b, "partitions=%d, ", ctx.partitions)
+	}
+	if len(ctx.altInputKey) > 0 {
+		b.WriteString("altInputKey=[")
+		for i, pf := range ctx.altInputKey {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(pf.String())
+		}
+		b.WriteString("], ")
+	}
+	fmt.Fprintf(&b, "delimit='%s')", ctx.delimit)
+	return b.String()
 }
 
 var HashingSeed uuid.UUID
 var HashingAlgo string = strings.ToLower(os.Getenv("JETS_DOMAIN_KEY_HASH_ALGO"))
 var DomainKeyDelimit string = os.Getenv("JETS_DOMAIN_KEY_SEPARATOR")
+
 func init() {
 	var err error
 	seed := os.Getenv("JETS_DOMAIN_KEY_HASH_SEED")
@@ -133,17 +180,17 @@ func (ctx *BuilderContext) NewHashEvaluator(source *InputChannel,
 	exprLen := len(spec.Expr)
 	compositeLen := len(spec.CompositeExpr)
 	domainKeyLen := len(spec.DomainKey)
-	if exprLen == 0 && compositeLen == 0 && domainKeyLen == 0 {
-		return nil, fmt.Errorf("error: must specify one of expr, composite_expr, or domain_key in hash operator")
+
+	// perform some validation
+	switch {
+	case exprLen > 0 && (compositeLen > 0 || domainKeyLen > 0):
+		return nil, fmt.Errorf("error: HashExpression cannot have both Expr and CompositeExpr/DomainKey")
+	case compositeLen > 0 && domainKeyLen > 0:
+		return nil, fmt.Errorf("error: HashExpression cannot have both CompositeExpr and DomainKey")
+	case exprLen == 0 && compositeLen == 0 && domainKeyLen == 0:
+		return nil, fmt.Errorf("error: HashExpression must have one of Expr, CompositeExpr or DomainKey")
 	}
-	if spec.ComputeDomainKey {
-		if domainKeyLen == 0 {
-			return nil, fmt.Errorf("error: domain_key in hash operator not set while compute_domain_key is true")
-		}
-		if exprLen > 0 || compositeLen > 0 {
-			return nil, fmt.Errorf("error: compute domain key in hash operator with exprLen > 0 || compositeLen > 0")
-		}
-	}
+
 	inputPos := -1
 	var compositeInputKey []PreprocessingFunction
 	var ok bool
@@ -151,19 +198,28 @@ func (ctx *BuilderContext) NewHashEvaluator(source *InputChannel,
 	hashingAlgo := HashingAlgo
 	hashingEnum := HashingAlgo_None
 
-	switch {
-	case exprLen > 0:
-		inputPos, ok = (*source.columns)[spec.Expr]
+	if exprLen > 0 {
+		inputPos, ok = (*source.Columns)[spec.Expr]
 		if !ok {
-			return nil, fmt.Errorf("error column %s not found in input source %s", spec.Expr, source.name)
+			// assuming it's using a pre-processing function (will fail later if not)
+			inputPos = -1
+			spec.CompositeExpr = []string{spec.Expr}
+			compositeLen = 1
+			exprLen = 0
 		}
-	case compositeLen > 0 || domainKeyLen > 0:
+	}
+	// IMPORTANT NOTE : source.DomainKeySpec can be nil if domainKeyLen == 0
+	if spec.ComputeDomainKey {
+		// When computing domain key, we don't want to have the partitioning logic applied on the hash key
+		spec.NoPartitions = true
+	}
+	if compositeLen > 0 || domainKeyLen > 0 {
 		var keys []string
 		if domainKeyLen > 0 {
-			dk := source.domainKeySpec
+			dk := source.DomainKeySpec
 			if dk == nil {
 				return nil, fmt.Errorf(
-					"error: hash operator is configured with domain key but no domain key spec available on source '%s'", source.config.Name)
+					"error: hash operator is configured with domain key but no domain key spec available on source '%s'", source.Config.Name)
 			}
 			domainKeyInfo, ok = dk.DomainKeys[spec.DomainKey]
 			if ok {
@@ -177,13 +233,12 @@ func (ctx *BuilderContext) NewHashEvaluator(source *InputChannel,
 		}
 		toUpper := true
 		if spec.ComputeDomainKey {
-			toUpper = len(keys) > 1
-			if len(source.domainKeySpec.HashingOverride) > 0 {
-				if source.domainKeySpec.HashingOverride == "none" {
-					// This is the case of domain_table
-					hashingAlgo = "none"
-				} else {
-					hashingAlgo = source.domainKeySpec.HashingOverride
+			if source.DomainKeySpec != nil && len(source.DomainKeySpec.HashingOverride) > 0 {
+				hashingAlgo = source.DomainKeySpec.HashingOverride
+				if hashingAlgo == "none" {
+					// This is the case of domain_table or performing a merge with ordered sources.
+					// don't do toUpper if the domain key is already computed since it may be a hash
+					toUpper = len(keys) > 1
 				}
 			}
 			switch hashingAlgo {
@@ -195,41 +250,60 @@ func (ctx *BuilderContext) NewHashEvaluator(source *InputChannel,
 				hashingEnum = HashingAlgo_None
 			default:
 				return nil, fmt.Errorf(
-					"error: unknown hasing also '%s' for computing domain key, expecting sha1, md5 or none, check JETS_DOMAIN_KEY_HASH_ALGO",
+					"error: unknown hashing algo '%s' for computing domain key, expecting sha1, md5 or none, check JETS_DOMAIN_KEY_HASH_ALGO",
 					hashingAlgo)
 			}
 		}
-	
-		compositeInputKey, err = ParsePreprocessingExpressions(keys, toUpper, source.columns)
+
+		compositeInputKey, err = ParsePreprocessingExpressions(keys, toUpper, source.Columns)
 		if err != nil {
-			return nil, fmt.Errorf("while calling ParsePreprocessingExpressions (input channel name %s): %v", source.name, err)
+			log.Printf("error while calling ParsePreprocessingExpressions for source %s with keys %v: %v\ncolumns are %v", source.Name, keys, err, source.Columns)
+			return nil, fmt.Errorf("while calling ParsePreprocessingExpressions (input channel name %s): %v", source.Name, err)
 		}
 	}
-	var partitions uint64
+
+	var partitions int
 	if !spec.NoPartitions {
-		if spec.NbrJetsPartitions != nil {
-			partitions = *spec.NbrJetsPartitions
+		if spec.NbrJetsPartitionsAny != nil {
+			partitions = toInt(spec.NbrJetsPartitionsAny)
 		} else {
-			partitions = uint64(ctx.cpConfig.ClusterConfig.NbrPartitions(spec.MultiStepShardingMode))
+			partitions = ctx.cpConfig.ClusterConfig.NbrPartitions(spec.MultiStepShardingMode)
+			if spec.MaxNbrJetsPartitionsAny != nil {
+				partitions = min(partitions, toInt(spec.MaxNbrJetsPartitionsAny))
+			}
 		}
 	}
 	var altInputKey []PreprocessingFunction
 	if len(spec.AlternateCompositeExpr) > 0 {
-		altInputKey, err = ParsePreprocessingExpressions(spec.AlternateCompositeExpr, true, source.columns)
+		altInputKey, err = ParsePreprocessingExpressions(spec.AlternateCompositeExpr, true, source.Columns)
 		if err != nil {
-			return nil, fmt.Errorf("%v in source name %s", err, source.name)
+			return nil, fmt.Errorf("%v in source name %s", err, source.Name)
 		}
 	}
+	// var debugCount int
+	// if ctx.cpConfig.ClusterConfig.IsDebugMode {
+	// 	debugCount = 100
+	// }
 
 	return &HashEvaluator{
 		inputPos:          inputPos,
 		compositeInputKey: compositeInputKey,
-		partitions:        partitions,
+		partitions:        uint64(partitions),
 		altInputKey:       altInputKey,
 		computeDomainKey:  spec.ComputeDomainKey,
 		hashingAlgo:       hashingEnum,
 		delimit:           DomainKeyDelimit,
+		// debugCount: debugCount,
 	}, nil
+}
+
+func toInt(value any) int {
+	n, err := utils.ToInt(value)
+	if err != nil {
+		log.Printf("Warning: Invalid nbr partitions value '%v', defaulting to 0", value)
+		return 0
+	}
+	return n
 }
 
 func Hash(key []byte, partitions uint64) uint64 {
@@ -283,7 +357,7 @@ func EvalHash(key any, partitions uint64) *uint64 {
 		hashedValue = partition(uint64(vv.Unix()), partitions)
 
 	default:
-		hashedValue = Hash([]byte(fmt.Sprintf("%v", vv)), partitions)
+		hashedValue = Hash(fmt.Appendf(nil, "%v", vv), partitions)
 	}
 	return &hashedValue
 }
@@ -297,30 +371,34 @@ func (ctx *HashEvaluator) ComputeHash(input []any) (any, error) {
 		return ctx.ComputeDomainKey(input)
 	}
 
-	// compute the hash of value @ inputPos, if it's nil use the alternate (composite) key
+	// compute the hash of value @ inputPos or using compositeInputKey, if it's nil use the alternate (composite) key
 	var inputVal, hashedValue any
-	if ctx.inputPos > -1 {
+	switch {
+	case ctx.inputPos > -1:
 		if ctx.inputPos < len(input) {
 			inputVal = input[ctx.inputPos]
 		} else {
-			return nil, fmt.Errorf("error: hash operator called with invalid read key position of %d for len of %d", ctx.inputPos, len(input))
+			return nil, fmt.Errorf("error: HashEvaluator.ComputeHash called with invalid read key position of %d for len of %d", ctx.inputPos, len(input))
 		}
-	} else {
-		// Use the composite key
-		inputVal, err = makeAlternateKey(&ctx.compositeInputKey, &input)
-		// fmt.Printf("##### # makeCompositeKey: %v\n", inputVal)
+	case len(ctx.compositeInputKey) > 0:
+		var buf bytes.Buffer
+		err = makeAlternateKey(&buf, &ctx.compositeInputKey, "", &input)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("while making composite key for HashEvaluator.ComputeHash: %v", err)
 		}
+		inputVal = buf.Bytes()
 	}
-	// fmt.Printf("##### # inputVal: %v\n", inputVal)
-	if inputVal == nil && ctx.altInputKey != nil {
+
+	// If the input value is null and we have an alternate key, use the alternate key to compute the hash
+	if inputVal == nil && len(ctx.altInputKey) > 0 {
 		// Make the alternate key to hash
-		inputVal, err = makeAlternateKey(&ctx.altInputKey, &input)
+		var buf bytes.Buffer
+		err = makeAlternateKey(&buf, &ctx.altInputKey, "", &input)
 		// fmt.Printf("##### # makeAlternateKey: %v\n", inputVal)
 		if err != nil {
 			return nil, err
 		}
+		inputVal = buf.Bytes()
 	}
 
 	h := EvalHash(inputVal, ctx.partitions)
@@ -330,40 +408,65 @@ func (ctx *HashEvaluator) ComputeHash(input []any) (any, error) {
 		// } else {
 		// 	fmt.Printf("##### # EvalHash k: %v, nbr partitions: %d => NULL\n", inputVal, ctx.partitions)
 	}
+	// if ctx.debugCount > 0 {
+	// 	log.Printf("HashEvaluator.ComputeHash debug %d: input=%v => hash=%v\n", ctx.debugCount, inputVal, hashedValue)
+	// 	ctx.debugCount--
+	// }
 	return hashedValue, nil
 }
 
 func (ctx *HashEvaluator) ComputeDomainKey(input []any) (any, error) {
-	var buf bytes.Buffer
 	var err error
-	sz := len(ctx.delimit)
-	for i, pf := range ctx.compositeInputKey {
-		if i > 0 && sz > 0 {
-			buf.WriteString(ctx.delimit)
+	var data []byte
+	if ctx.inputPos > -1 {
+		if ctx.inputPos < len(input) {
+			inputVal, ok := input[ctx.inputPos].(string)
+			if !ok {
+				return nil, fmt.Errorf("error: ComputeDomainKey expected string value at position %d but got %T: %v", ctx.inputPos, input[ctx.inputPos], input[ctx.inputPos])
+			}
+			if ctx.hashingAlgo == HashingAlgo_None {
+				return inputVal, nil
+			}
+			data = []byte(inputVal)
+		} else {
+			return nil, fmt.Errorf("error: ComputeDomainKey called with invalid read key position of %d for len of %d", ctx.inputPos, len(input))
 		}
-		err = pf.ApplyPF(&buf, &input)
+	} else {
+		// Use the composite key
+		var buf bytes.Buffer
+		err = makeAlternateKey(&buf, &ctx.compositeInputKey, ctx.delimit, &input)
 		if err != nil {
 			return nil, err
 		}
+		if ctx.hashingAlgo == HashingAlgo_None {
+			return buf.String(), nil
+		}
+		data = buf.Bytes()
 	}
+
 	switch ctx.hashingAlgo {
 	case HashingAlgo_SHA1:
-		return uuid.NewSHA1(HashingSeed, buf.Bytes()).String(), nil
+		return uuid.NewSHA1(HashingSeed, data).String(), nil
 	case HashingAlgo_MD5:
-		return uuid.NewMD5(HashingSeed, buf.Bytes()).String(), nil
+		return uuid.NewMD5(HashingSeed, data).String(), nil
 	default:
-		return buf.String(), nil
+		// not expected to come here since we already check for HashingAlgo_None
+		log.Printf("warning: ComputeDomainKey with unknown hashing algo '%s', returning unhashed composite key", ctx.hashingAlgo.String())
+		return string(data), nil
 	}
 }
 
-func makeAlternateKey(altInputKey *[]PreprocessingFunction, input *[]interface{}) (interface{}, error) {
-	var buf bytes.Buffer
+func makeAlternateKey(buf *bytes.Buffer, compositeKey *[]PreprocessingFunction, delimit string, input *[]any) error {
 	var err error
-	for _, pf := range *altInputKey {
-		err = pf.ApplyPF(&buf, input)
+	sz := len(delimit)
+	for i, pf := range *compositeKey {
+		if i > 0 && sz > 0 {
+			buf.WriteString(delimit)
+		}
+		err = pf.ApplyPF(buf, input)
 		if err != nil {
-			return nil, err
+			return err
 		}
 	}
-	return buf.String(), nil
+	return nil
 }

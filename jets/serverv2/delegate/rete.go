@@ -7,6 +7,7 @@ import (
 	"log"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/artisoft-io/jetstore/jets/bridgego"
 	"github.com/artisoft-io/jetstore/jets/cleansing_functions"
@@ -58,9 +59,10 @@ func (rw *ReteWorkspace) Release() error {
 // main processing function to execute rules
 func (rw *ReteWorkspace) ExecuteRules(
 	workerId int,
+	outSessionId string,
 	dataInputc <-chan groupedJetRows,
 	outputSpecs workspace.OutputTableSpecs,
-	writeOutputc map[string][]chan []interface{}) (*ExecuteRulesResult, error) {
+	writeOutputc map[string][]chan []any) (*ExecuteRulesResult, error) {
 
 	var result ExecuteRulesResult
 	// for each msg in dataInput:
@@ -147,6 +149,7 @@ func (rw *ReteWorkspace) ExecuteRules(
 		if err != nil {
 			return &result, fmt.Errorf("while creating rdf session: %v", err)
 		}
+		start := time.Now()
 
 		for iset, ruleset := range rw.js.Factory.MainRuleFileNames {
 			if glogv > 0 {
@@ -245,6 +248,8 @@ func (rw *ReteWorkspace) ExecuteRules(
 			log.Println("ExecuteRule() Completed, the rdf sesion contains:")
 			rdfSession.DumpRdfGraph()
 		}
+		reteCompleted := time.Since(start)
+		start = time.Now()
 
 		// Get the jets:exception(s)
 		ctor, err := rdfSession.Find_sp(ri.jets__istate, ri.jets__exception)
@@ -281,6 +286,8 @@ func (rw *ReteWorkspace) ExecuteRules(
 			}
 			ctor.Done()
 		}
+		extractExceptions := time.Since(start)
+		start = time.Now()
 
 		// pulling the data out of the rete session
 		for tableName, tableSpec := range outputSpecs {
@@ -288,6 +295,9 @@ func (rw *ReteWorkspace) ExecuteRules(
 			if tableName == "jetsapi.process_errors" {
 				continue
 			}
+			// //***
+			// log.Println("\n*** Extracting output for table:", tableName)
+
 			// extract entities by rdf type
 			ctor, err := rdfSession.Find(nil, ri.rdf__type, tableSpec.ClassResource)
 			if err != nil {
@@ -332,13 +342,15 @@ func (rw *ReteWorkspace) ExecuteRules(
 				}
 				// extract entity if we keep it (i.e. not an historical entity)
 				if keepObj {
+					// //***
+					// debugRow := make(map[string]any)
+
 					// make a slice corresponding to the entity row, selecting predicates from the outputSpec
 					ncol := len(tableSpec.Columns)
 					// Compute the Domain Keys and ShardIds
-					entityRow := make([]interface{}, ncol)
-					for i := 0; i < ncol; i++ {
+					entityRow := make([]any, ncol)
+					for i := range ncol {
 						domainColumn := &tableSpec.Columns[i]
-						// log.Println("Found entity with subject:",subject.AsTextSilent(), "with column",domainColumn.ColumnName,"of type",domainColumn.DataType)
 						switch {
 						case domainColumn.ColumnInfo.ColumnName == "session_id":
 							entityRow[i] = outSessionId
@@ -348,6 +360,9 @@ func (rw *ReteWorkspace) ExecuteRules(
 							domainKey, _, err := tableSpec.DomainKeysInfo.ComputeGroupingKeyI(nbrShards, &objectType, &entityRow)
 							if err != nil {
 								return &result, fmt.Errorf("while ComputeGroupingKeyI: %v", err)
+							}
+							if len(domainKey) == 0 {
+								log.Println("Error: Domain Key computed is empty, for domain entity of type", tableSpec.TableInfo.ClassName)
 							}
 							entityRow[i] = domainKey
 
@@ -360,7 +375,7 @@ func (rw *ReteWorkspace) ExecuteRules(
 							entityRow[i] = shardId
 
 						default:
-							var data []interface{}
+							var data []any
 							itor, err := rdfSession.Find_sp(bridgego.NewResource(subject), domainColumn.Predicate)
 							if err != nil {
 								return &result, fmt.Errorf("while finding triples of an entity of type %s: %v", tableSpec.TableInfo.ClassName, err)
@@ -432,8 +447,14 @@ func (rw *ReteWorkspace) ExecuteRules(
 							}
 							itor.Done()
 						}
+						// //***
+						// debugRow[domainColumn.ColumnInfo.ColumnName] = entityRow[i]
 					}
 					// entityRow is complete
+					// //***
+					// b, _ := json.Marshal(debugRow)
+					// log.Println(string(b))
+					// //***
 					//* REMOVE MULTI DB CONNECTION BY NODES :: compute_node_id_from_shard_id
 					// writeOutputc[tableName][compute_node_id_from_shard_id(shard)] <- entityRow
 					writeOutputc[tableName][0] <- entityRow
@@ -443,8 +464,13 @@ func (rw *ReteWorkspace) ExecuteRules(
 			// //**
 			// log.Println("Done Extracting class:", tableSpec.TableInfo.ClassName)
 		}
+		dataExtracted := time.Since(start)
+		start = time.Now()
 		result.ExecuteRulesCount += 1
 		rdfSession.ReleaseRDFSession()
+		sessionReleased := time.Since(start)
+		log.Printf("%s retex %v, exceptions %v, extract %v, release %v",
+			outSessionId, reteCompleted, extractExceptions, dataExtracted, sessionReleased)
 	}
 	return &result, nil
 }
@@ -463,7 +489,7 @@ func (rw *ReteWorkspace) addOutputClassResource(domainTable *workspace.DomainTab
 func (rw *ReteWorkspace) addOutputPredicate(domainColumns []workspace.DomainColumn) error {
 	for ipos := range domainColumns {
 		var err error
-		domainColumns[ipos].Predicate, err = rw.js.NewResource(domainColumns[ipos].ColumnInfo.PropertyName)
+		domainColumns[ipos].Predicate, err = rw.js.NewResource(domainColumns[ipos].ColumnInfo.ColumnName)
 		if err != nil {
 			return fmt.Errorf("while adding predicate to DomainColumn: %v", err)
 		}
