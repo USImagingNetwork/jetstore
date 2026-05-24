@@ -8,9 +8,7 @@ import (
 	"strings"
 )
 
-// currentValue is the value of the current column being transformed,
 // input is the whole input row as []any or map[string]any depending on the context.
-// currentValue is only applicable to "then" and "else_expr" of case operator.
 type evalExpression interface {
 	Eval(input any) (any, error)
 }
@@ -19,15 +17,29 @@ type evalOperator interface {
 }
 
 type expressionNodeEvaluator struct {
-	Lhs evalExpression
-	Op  evalOperator
-	Rhs evalExpression
+	Lhs     evalExpression
+	Op      evalOperator
+	Rhs     evalExpression
+	Default evalExpression
 }
 
 func (node *expressionNodeEvaluator) Eval(input any) (any, error) {
 	lhs, err := node.Lhs.Eval(input)
 	if err != nil {
 		return nil, err
+	}
+	// Special consideration for short-circuit operators AND and OR,
+	// if the operator is AND and lhs is false, we do not evaluate rhs and return false,
+	// if the operator is OR and lhs is true, we do not evaluate rhs and return true.
+	switch node.Op.(type) {
+	case *opAND:
+		if !ToBool(lhs) {
+			return 0, nil
+		}
+	case *opOR:
+		if ToBool(lhs) {
+			return 1, nil
+		}
 	}
 	var rhs any
 	if node.Rhs != nil {
@@ -36,13 +48,42 @@ func (node *expressionNodeEvaluator) Eval(input any) (any, error) {
 			return nil, err
 		}
 	}
-	return node.Op.Eval(lhs, rhs)
+	result, err := node.Op.Eval(lhs, rhs)
+	if err != nil && node.Default != nil {
+		return node.Default.Eval(input)
+	}
+	return result, err
 }
+
+type expressionFunctionEvaluator struct {
+	Args    []evalExpression
+	Fnc     evalFunction
+	Default evalExpression
+}
+
+func (node *expressionFunctionEvaluator) Eval(input any) (any, error) {
+	args := make([]any, len(node.Args))
+	for i, arg := range node.Args {
+		var err error
+		args[i], err = arg.Eval(input)
+		if err != nil {
+			return nil, err
+		}
+	}
+	result, err := node.Fnc(args)
+	if err != nil && node.Default != nil {
+		return node.Default.Eval(input)
+	}
+	return result, err
+}
+
+type evalFunction func(args []any) (any, error)
 
 type expressionSelectLeaf struct {
 	index   int
 	colName string
 	rdfType string
+	Default evalExpression
 }
 
 func (node *expressionSelectLeaf) Eval(in any) (any, error) {
@@ -56,10 +97,17 @@ func (node *expressionSelectLeaf) Eval(in any) (any, error) {
 	case map[string]any:
 		value = input[node.colName]
 	default:
+		if node.Default != nil {
+			return node.Default.Eval(in)
+		}
 		return nil, fmt.Errorf("error: invalid type passed to expression.Eval for input: %v", in)
 	}
 	if node.rdfType != "" {
-		return CastToRdfType(value, node.rdfType, nil)
+		r, err := CastToRdfType(value, node.rdfType, nil)
+		if err != nil && node.Default != nil {
+			return node.Default.Eval(in)
+		}
+		return r, err
 	}
 	return value, nil
 }
@@ -150,6 +198,13 @@ func (ctx ExprBuilderContext) parseValue(expr *string, maxSubstitutions int) (an
 
 // Note that columns can be nil when evalExtression is having map[string]any as argument.
 func (ctx ExprBuilderContext) BuildExprNodeEvaluator(sourceName string, columns map[string]int, spec *ExpressionNode) (evalExpression, error) {
+	if spec == nil {
+		return nil, nil
+	}
+	defaultExpr, err := ctx.BuildExprNodeEvaluator(sourceName, columns, spec.Default)
+	if err != nil {
+		return nil, fmt.Errorf("while building default expression: %v", err)
+	}
 	switch {
 	case spec.Arg != nil:
 		// Case of unary operator node
@@ -165,8 +220,9 @@ func (ctx ExprBuilderContext) BuildExprNodeEvaluator(sourceName string, columns 
 			return nil, err
 		}
 		return &expressionNodeEvaluator{
-			Lhs: arg,
-			Op:  op,
+			Lhs:     arg,
+			Op:      op,
+			Default: defaultExpr,
 		}, nil
 
 	case spec.Lhs != nil:
@@ -174,9 +230,18 @@ func (ctx ExprBuilderContext) BuildExprNodeEvaluator(sourceName string, columns 
 		if spec.Rhs == nil || spec.Op == "" {
 			return nil, fmt.Errorf("error: case node, must have lhs, rhs, and op != nil")
 		}
-		// Check for special IN operator who must have a static_list as rhs
+		// Check for special IN IN_NO_CASE operator who must have a static_list as rhs
 		if strings.ToUpper(spec.Op) == "IN" && strings.ToUpper(spec.Rhs.Type) != "STATIC_LIST" {
 			return nil, fmt.Errorf("error: operator IN must have static_list as rhs argument")
+		}
+		if strings.ToUpper(spec.Op) == "IN_NO_CASE" {
+			if strings.ToUpper(spec.Rhs.Type) != "STATIC_LIST" {
+				return nil, fmt.Errorf("error: operator IN_NO_CASE must have static_list as rhs argument")
+			}
+			// make the static list in upper case for case-insensitive comparison in opIn.Eval
+			for i, v := range spec.Rhs.ExprList {
+				spec.Rhs.ExprList[i] = strings.ToUpper(v)
+			}
 		}
 		lhs, err := ctx.BuildExprNodeEvaluator(sourceName, columns, spec.Lhs)
 		if err != nil {
@@ -191,9 +256,10 @@ func (ctx ExprBuilderContext) BuildExprNodeEvaluator(sourceName string, columns 
 			return nil, err
 		}
 		return &expressionNodeEvaluator{
-			Lhs: lhs,
-			Op:  op,
-			Rhs: rhs,
+			Lhs:     lhs,
+			Op:      op,
+			Rhs:     rhs,
+			Default: defaultExpr,
 		}, nil
 
 	case spec.Type != "":
@@ -239,16 +305,22 @@ func (ctx ExprBuilderContext) BuildExprNodeEvaluator(sourceName string, columns 
 					return &expressionSelectLeaf{
 						colName: spec.Expr,
 						rdfType: spec.AsRdfType,
+						Default: defaultExpr,
 					}, nil
 				}
 				inputPos, ok := columns[spec.Expr]
 				var err error
 				if !ok {
-					err = fmt.Errorf("error column %s not found in input source %s", spec.Expr, sourceName)
+					if defaultExpr == nil {
+						err = fmt.Errorf("error column %s not found in input source %s", spec.Expr, sourceName)
+					} else {
+						return defaultExpr, nil
+					}
 				}
 				return &expressionSelectLeaf{
 					index:   inputPos,
 					rdfType: spec.AsRdfType,
+					Default: defaultExpr,
 				}, err
 
 			case spec.ExprPos != nil:
@@ -256,6 +328,7 @@ func (ctx ExprBuilderContext) BuildExprNodeEvaluator(sourceName string, columns 
 				return &expressionSelectLeaf{
 					index:   *spec.ExprPos,
 					rdfType: spec.AsRdfType,
+					Default: defaultExpr,
 				}, nil
 			}
 
@@ -299,6 +372,27 @@ func (ctx ExprBuilderContext) BuildExprNodeEvaluator(sourceName string, columns 
 			// build the expression evaluator for the parsed ExpressionNode
 			return ctx.BuildExprNodeEvaluator(sourceName, columns, &exprNode)
 
+		case "FUNCTION":
+			if spec.Expr == "" {
+				return nil, fmt.Errorf("error: Type function must have Expr not nil")
+			}
+			fnc, err := BuildFncEvaluator(spec.Expr)
+			if err != nil {
+				return nil, fmt.Errorf("error: failed to build operator for function type expression with expr %s: %v", spec.Expr, err)
+			}
+			args := make([]evalExpression, len(spec.Farg))
+			for i, argSpec := range spec.Farg {
+				argEval, err := ctx.BuildExprNodeEvaluator(sourceName, columns, &argSpec)
+				if err != nil {
+					return nil, fmt.Errorf("error: failed to build evaluator for argument %d of function type expression with expr %s: %v", i, spec.Expr, err)
+				}
+				args[i] = argEval
+			}
+			return &expressionFunctionEvaluator{
+				Fnc:     fnc,
+				Args:    args,
+				Default: defaultExpr,
+			}, nil
 		default:
 			return nil, fmt.Errorf("error: unknown expression leaf node type: %s", spec.Type)
 		}
