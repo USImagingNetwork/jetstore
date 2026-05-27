@@ -70,6 +70,8 @@ func BuildEvalOperator(op string) (evalOperator, error) {
 		return &opFindAndReplace{}, nil
 	case "TO_ARRAY":
 		return &opToArray{}, nil
+	case "TO_DATE":
+		return &opToDate{}, nil
 	}
 	return nil, fmt.Errorf("error: unknown operator: %v", op)
 }
@@ -345,7 +347,7 @@ func (op *opNotEqual) Eval(lhs any, rhs any) (any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("opNotEqual Eval using opEqual: %v", err)
 	}
-	switch ToBool(v) {
+	switch !ToBool(v) {
 	case true:
 		return 1, nil
 	case false:
@@ -395,11 +397,11 @@ func (op *opNot) Eval(lhs any, _ any) (any, error) {
 	if lhs == nil {
 		return 0, nil
 	}
-	switch ToBool(lhs) {
+	switch !ToBool(lhs) {
 	case true:
-		return 0, nil
-	case false:
 		return 1, nil
+	case false:
+		return 0, nil
 	}
 	return 0, nil
 }
@@ -1408,4 +1410,36 @@ func (op *opABS) Eval(lhs any, _ any) (any, error) {
 		return math.Abs(lhsv), nil
 	}
 	return nil, fmt.Errorf("opABS incompatible types: '%T', rejected", lhs)
+}
+
+// Operator toDate() unary operator, convert a string to date if possible, 
+// or int to seconds since epoch, int64 to milliseconds since epoch, float64 to seconds since epoch
+type opToDate struct{}
+
+func (op *opToDate) Eval(lhs any, _ any) (any, error) {
+	if lhs == nil {
+		return nil, nil
+	}
+	// Return the date part of a datetime, or convert a string to date if possible, 
+	// or int to seconds since epoch, int64 to milliseconds since epoch, float64 to seconds since epoch
+	switch lhsv := lhs.(type) {
+	case string:
+		v, err := rdf.ParseDate(lhsv)
+		if err != nil {
+			return nil, fmt.Errorf("opToDate string, string not a date: %v", err)
+		}
+		return *v, nil
+
+	case int:
+		return time.Unix(int64(lhsv), 0).UTC(), nil
+
+	case int64:
+		return time.Unix(lhsv/1000, (lhsv%1000)*int64(time.Millisecond)).UTC(), nil
+
+	case float64:
+		sec := int64(lhsv)
+		nsec := int64((lhsv - float64(sec)) * float64(time.Second))
+		return time.Unix(sec, nsec).UTC(), nil
+	}
+	return nil, fmt.Errorf("opToDate incompatible types: '%T', rejected", lhs)
 }
