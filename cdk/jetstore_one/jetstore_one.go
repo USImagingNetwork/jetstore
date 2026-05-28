@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"strings"
 
 	jetstorestack "github.com/artisoft-io/jetstore/cdk/jetstore_one/stack"
 	awscdk "github.com/aws/aws-cdk-go/awscdk/v2"
@@ -14,7 +15,6 @@ import (
 	"github.com/aws/aws-cdk-go/awscdk/v2/awsec2"
 	"github.com/aws/aws-cdk-go/awscdk/v2/awsecr"
 	"github.com/aws/aws-cdk-go/awscdk/v2/awsecs"
-	awselb "github.com/aws/aws-cdk-go/awscdk/v2/awselasticloadbalancingv2"
 	"github.com/aws/aws-cdk-go/awscdk/v2/awsiam"
 	"github.com/aws/aws-cdk-go/awscdk/v2/awslogs"
 	"github.com/aws/aws-cdk-go/awscdk/v2/awsrds"
@@ -74,6 +74,12 @@ func NewJetstoreOneStack(scope constructs.Construct, id string, props *jetstores
 			os.Getenv("AWS_REGION"), os.Getenv("AWS_ACCOUNT"), *props.MkId("cpipesSM")),
 		ReportsSmArn: fmt.Sprintf("arn:aws:states:%s:%s:stateMachine:%s",
 			os.Getenv("AWS_REGION"), os.Getenv("AWS_ACCOUNT"), *props.MkId("reportsSM")),
+		DeployCpipesNative: strings.ToUpper(os.Getenv("DEPLOY_CPIPES_NATIVE")) == "TRUE" || strings.ToUpper(os.Getenv("DEPLOY_CPIPES_NATIVE")) == "1",
+	}
+	if jsComp.DeployCpipesNative {
+		log.Println("Deploying CPIPES Native Image")
+		jsComp.CpipesNativeSmArn = fmt.Sprintf("arn:aws:states:%s:%s:stateMachine:%s",
+			os.Getenv("AWS_REGION"), os.Getenv("AWS_ACCOUNT"), *props.MkId("cpipesNativeSM"))
 	}
 	// Identify external buckets for exchanging data with external systems
 	jsComp.ResolveExternalBuckets(stack)
@@ -123,7 +129,7 @@ func NewJetstoreOneStack(scope constructs.Construct, id string, props *jetstores
 		Value: jsComp.SourceBucket.BucketName(),
 	})
 
-	// Create a VPC to run tasks in.
+	// Create or lookup a VPC to run tasks in.
 	// ----------------------------------------------------------------------------------------------
 	jsComp.PublicSubnetSelection = &awsec2.SubnetSelection{
 		SubnetType: awsec2.SubnetType_PUBLIC,
@@ -134,13 +140,45 @@ func NewJetstoreOneStack(scope constructs.Construct, id string, props *jetstores
 	jsComp.IsolatedSubnetSelection = &awsec2.SubnetSelection{
 		SubnetType: awsec2.SubnetType_PRIVATE_ISOLATED,
 	}
-	jsComp.Vpc = jetstorestack.CreateJetStoreVPC(stack)
-	awscdk.NewCfnOutput(stack, jsii.String("JetStore_VPC_ID"), &awscdk.CfnOutputProps{
+
+	// Lookup VPC by id if provided otherwise create a new one
+	if os.Getenv("JETS_VPC_ID") != "" {
+		// Lookup existing VPC by id
+		jsComp.Vpc = jetstorestack.LookupJetStoreVPC(stack, os.Getenv("JETS_VPC_ID"))
+		// Lookup the vpc endpoints security group by id to use for ecs tasks and lambdas
+		jsComp.VpcEndpointsSg = jetstorestack.LookupVpcEndpointsSecurityGroup(stack, os.Getenv("JETS_VPC_ENDPOINTS_SG_ID"))
+		// Lookup the vpc endpoint for API Gateway
+		jsComp.ApiGatewayVpcEndpoint = jetstorestack.LookupApiGatewayVpcEndpoint(stack,
+			os.Getenv("JETS_API_GATEWAY_VPC_ENDPOINT_ID"), jsComp.VpcEndpointsSg)
+	} else {
+		// Create a new VPC
+		jsComp.Vpc = jetstorestack.CreateJetStoreVPC(stack)
+
+		// Add Endpoints on private subnets and return the security group to use in ecs tasks
+		jsComp.VpcEndpointsSg = jsComp.AddVpcEndpoints(stack, jsComp.Vpc, jsComp.PrivateSubnetSelection)
+	}
+
+	// Add VPC ID as outputs
+	awscdk.NewCfnOutput(stack, jsii.String("JetStoreVpcID"), &awscdk.CfnOutputProps{
 		Value: jsComp.Vpc.VpcId(),
 	})
 
-	// Add Endpoints on private subnets
-	jsComp.PrivateSecurityGroup = jetstorestack.AddVpcEndpoints(stack, jsComp.Vpc, "Private", jsComp.PrivateSubnetSelection)
+	// Add VpcEndpointsSg ID to outputs
+	awscdk.NewCfnOutput(stack, jsii.String("VpcEndpointsSGID"), &awscdk.CfnOutputProps{
+		Value: jsComp.VpcEndpointsSg.SecurityGroupId(),
+	})
+
+	// Create security groups
+	jsComp.RdsAccessSg = awsec2.NewSecurityGroup(stack, jsii.String("RdsAccessSg"), &awsec2.SecurityGroupProps{
+		Vpc:              jsComp.Vpc,
+		Description:      jsii.String("Allow access to RDS"),
+		AllowAllOutbound: jsii.Bool(false),
+	})
+	jsComp.InternetAccessSg = awsec2.NewSecurityGroup(stack, jsii.String("InternetAccessSg"), &awsec2.SecurityGroupProps{
+		Vpc:              jsComp.Vpc,
+		Description:      jsii.String("Allow access to internet"),
+		AllowAllOutbound: jsii.Bool(true),
+	})
 
 	// Database Cluster
 	// ----------------------------------------------------------------------------------------------
@@ -159,6 +197,10 @@ func NewJetstoreOneStack(scope constructs.Construct, id string, props *jetstores
 		dbVersion = awsrds.AuroraPostgresEngineVersion_VER_14_5()
 	case "15.10":
 		dbVersion = awsrds.AuroraPostgresEngineVersion_VER_15_10()
+	case "15.15":
+		dbVersion = awsrds.AuroraPostgresEngineVersion_VER_15_15()
+	case "15.17":
+		dbVersion = awsrds.AuroraPostgresEngineVersion_VER_15_17()
 	}
 
 	jsComp.RdsCluster = awsrds.NewDatabaseCluster(stack, jsii.String("pgCluster"), &awsrds.DatabaseClusterProps{
@@ -168,6 +210,7 @@ func NewJetstoreOneStack(scope constructs.Construct, id string, props *jetstores
 		Credentials:         awsrds.Credentials_FromSecret(jsComp.RdsSecret, username),
 		ClusterIdentifier:   props.MkId("jetstoreDb"),
 		DefaultDatabaseName: jsii.String("postgres"),
+		Port:                jsii.Number(5432),
 		DeletionProtection:  jsii.Bool(true),
 		Writer: awsrds.ClusterInstance_ServerlessV2(jsii.String("ClusterInstance"), &awsrds.ServerlessV2ClusterInstanceProps{
 			AllowMajorVersionUpgrade: jsii.Bool(true),
@@ -185,7 +228,9 @@ func NewJetstoreOneStack(scope constructs.Construct, id string, props *jetstores
 		S3ImportBuckets: &[]awss3.IBucket{
 			jsComp.SourceBucket,
 		},
-		StorageEncrypted:        jsii.Bool(true),
+		StorageEncrypted: jsii.Bool(true),
+		// Enable CloudWatch Logs exports
+		CloudwatchLogsExports:   &[]*string{jsii.String("postgresql")},
 		CloudwatchLogsRetention: awslogs.RetentionDays_THREE_MONTHS,
 	})
 	if phiTagName != nil {
@@ -201,14 +246,30 @@ func NewJetstoreOneStack(scope constructs.Construct, id string, props *jetstores
 		Value: jsComp.RdsCluster.ClusterIdentifier(),
 	})
 
-	// Grant access to ECS Tasks in Private subnets
-	jsComp.PrivateSecurityGroup.Connections().AllowTo(jsComp.RdsCluster, awsec2.Port_Tcp(jsii.Number(5432)), jsii.String("Allow connection from PrivateSecurityGroup"))
+	// Grant Database access to ECS Tasks and lambdas
+	jsComp.RdsAccessSg.Connections().AllowTo(jsComp.RdsCluster, awsec2.Port_Tcp(jsii.Number(5432)), jsii.String("Allow connection from RdsAccessSg"))
+
+	// Create role for lambda functions requiring access to external buckets
+	// Create Lambda execution role with VPC access and assume role permissions
+	jsComp.LambdaExecutionRole = awsiam.NewRole(stack, jsii.String("LambdaExecutionRole"), &awsiam.RoleProps{
+		AssumedBy: awsiam.NewServicePrincipal(jsii.String("lambda.amazonaws.com"), nil),
+		ManagedPolicies: &[]awsiam.IManagedPolicy{
+			awsiam.ManagedPolicy_FromAwsManagedPolicyName(jsii.String("service-role/AWSLambdaBasicExecutionRole")),
+			awsiam.ManagedPolicy_FromAwsManagedPolicyName(jsii.String("service-role/AWSLambdaVPCAccessExecutionRole")),
+		},
+	})
+	jsComp.RdsSecret.GrantRead(jsComp.LambdaExecutionRole, nil)
+	jsComp.SourceBucket.GrantReadWrite(jsComp.LambdaExecutionRole, nil)
+	jsComp.GrantReadWriteFromExternalBuckets(stack, jsComp.LambdaExecutionRole)
+	if jsComp.ExternalKmsKey != nil {
+		jsComp.ExternalKmsKey.GrantEncryptDecrypt(jsComp.LambdaExecutionRole)
+	}
 
 	// Create the jsComp.EcsCluster.
 	// ==============================================================================================================
 	jsComp.EcsCluster = awsecs.NewCluster(stack, props.MkId("ecsCluster"), &awsecs.ClusterProps{
-		Vpc:               jsComp.Vpc,
-		ContainerInsights: jsii.Bool(true),
+		Vpc: jsComp.Vpc,
+		ContainerInsightsV2: awsecs.ContainerInsights_ENABLED,
 	})
 	if phiTagName != nil {
 		awscdk.Tags_Of(jsComp.EcsCluster).Add(phiTagName, jsii.String("true"), nil)
@@ -255,19 +316,24 @@ func NewJetstoreOneStack(scope constructs.Construct, id string, props *jetstores
 	jsComp.AdminPwdSecret.GrantRead(jsComp.EcsTaskRole, nil)
 	jsComp.EncryptionKeySecret.GrantRead(jsComp.EcsTaskRole, nil)
 
-	// JetStore Image from ecr -- referenced in most tasks
+	// JetStore Image from ecr -- referenced in most legacy tasks:
+	// - ui service
+	// - run reports task
+	// - loader task
+	// - server task
+	// ----------------------------------------------------------------------------------------------
 	jsComp.JetStoreImage = awsecs.AssetImage_FromEcrRepository(
 		//* example: arn:aws:ecr:us-east-1:470601442608:repository/jetstore_test_ws
 		awsecr.Repository_FromRepositoryArn(stack, jsii.String("jetstore-image"), jsii.String(os.Getenv("JETS_ECR_REPO_ARN"))),
 		jsii.String(os.Getenv("JETS_IMAGE_TAG")))
 
-	// JetStore Image from ecr -- referenced in most tasks
+	// JetStore Cpipes Image from ecr -- referenced in most tasks
 	jsComp.CpipesImage = awsecs.AssetImage_FromEcrRepository(
-		//* example: arn:aws:ecr:us-east-1:470601442608:repository/jetstore_test_ws
 		awsecr.Repository_FromRepositoryArn(stack, jsii.String("jetstore-cpipes-image"), jsii.String(os.Getenv("CPIPES_ECR_REPO_ARN"))),
 		jsii.String(os.Getenv("CPIPES_IMAGE_TAG")))
 
 	// Build ECS Tasks
+	// ---------------------------------------------
 	//	- RunreportTaskDefinition
 	//	- LoaderTaskDefinition
 	//	- ServerTaskDefinition
@@ -275,11 +341,18 @@ func NewJetstoreOneStack(scope constructs.Construct, id string, props *jetstores
 	jsComp.BuildEcsTasks(scope, stack, props)
 
 	// Build JetStore general prupose Lambdas:
+	// ---------------------------------------------
 	//	- StatusUpdateLambda
 	//	- SecretRotationLambda
 	//	- RunReportsLambda
 	//	- PurgeDataLambda
 	jsComp.BuildLambdas(scope, stack, props)
+
+	// Build the Api Gateway Lambda and REST API
+	// ---------------------------------------------
+	//	- ApiGatewayLambda
+	//	- JetsApi
+	jsComp.BuildApiLambdas(scope, stack, props)
 
 	// Build Loader State Machine
 	// ---------------------------------------------
@@ -294,13 +367,15 @@ func NewJetstoreOneStack(scope constructs.Construct, id string, props *jetstores
 	jsComp.BuildServerSM(scope, stack, props)
 	jsComp.BuildServerv2SM(scope, stack, props)
 
-	// Build lambdas used by cpipesSM:
+	// Build lambdas used by cpipesSM/cpipesNativeSM:
 	//	- CpipesNodeLambda
 	//	- CpipesStartShardingLambda
 	//	- CpipesStartReducingLambda
 	// --------------------------------------------------------------------------------------------------------------
 	jsComp.BuildCpipesLambdas(scope, stack, props)
-
+	if jsComp.DeployCpipesNative {
+		jsComp.BuildCpipesNativeSM(scope, stack, props)
+	}
 	// Build the cpipes State Machine (cpipesSM)
 	jsComp.BuildCpipesSM(scope, stack, props)
 
@@ -312,15 +387,20 @@ func NewJetstoreOneStack(scope constructs.Construct, id string, props *jetstores
 	// permission to execute the StateMachines
 	// These execution are performed in code so must give permission explicitly
 	// ---------------------------------------
+	resources := []*string{
+		jsComp.LoaderSM.StateMachineArn(),
+		jsComp.ServerSM.StateMachineArn(),
+		jsComp.Serverv2SM.StateMachineArn(),
+		jsComp.CpipesSM.StateMachineArn(),
+		jsComp.ReportsSM.StateMachineArn(),
+	}
+	if jsComp.DeployCpipesNative {
+		resources = append(resources, jsComp.CpipesNativeSM.StateMachineArn())
+	}
+
 	jsComp.EcsTaskRole.AddToPolicy(awsiam.NewPolicyStatement(&awsiam.PolicyStatementProps{
-		Actions: jsii.Strings("states:StartExecution"),
-		Resources: &[]*string{
-			jsComp.LoaderSM.StateMachineArn(),
-			jsComp.ServerSM.StateMachineArn(),
-			jsComp.Serverv2SM.StateMachineArn(),
-			jsComp.CpipesSM.StateMachineArn(),
-			jsComp.ReportsSM.StateMachineArn(),
-		},
+		Actions:   jsii.Strings("states:StartExecution"),
+		Resources: &resources,
 	}))
 	// Also to status update & register key lambda
 	jsComp.StatusUpdateLambda.AddToRolePolicy(awsiam.NewPolicyStatement(&awsiam.PolicyStatementProps{
@@ -358,97 +438,13 @@ func NewJetstoreOneStack(scope constructs.Construct, id string, props *jetstores
 	// ---------------------------------------
 	jsComp.BuildUiService(scope, stack, props)
 
-	// JETS_ELB_MODE == public: deploy ELB in public subnet and public facing
-	// JETS_ELB_MODE != public: (private or empty) deploy ELB in private subnet and not public facing
-	elbSubnetSelection := jsComp.IsolatedSubnetSelection
-	if os.Getenv("JETS_ELB_MODE") == "public" {
-		internetFacing := false
-		if os.Getenv("JETS_ELB_INTERNET_FACING") == "true" {
-			internetFacing = true
-			elbSubnetSelection = jsComp.PublicSubnetSelection
-		}
-		var elbSecurityGroup awsec2.ISecurityGroup
-		if os.Getenv("JETS_ELB_NO_ALL_INCOMING") == "true" {
-			elbSecurityGroup = awsec2.NewSecurityGroup(stack, jsii.String("UiElbSecurityGroup"), &awsec2.SecurityGroupProps{
-				Vpc:              jsComp.Vpc,
-				Description:      jsii.String("UI public ELB Security Group without all incoming traffic"),
-				AllowAllOutbound: jsii.Bool(false),
-			})
-		}
-		jsComp.UiLoadBalancer = awselb.NewApplicationLoadBalancer(stack, jsii.String("UIELB"), &awselb.ApplicationLoadBalancerProps{
-			Vpc:                                  jsComp.Vpc,
-			InternetFacing:                       jsii.Bool(internetFacing),
-			VpcSubnets:                           elbSubnetSelection,
-			SecurityGroup:                        elbSecurityGroup,
-			XAmznTlsVersionAndCipherSuiteHeaders: jsii.Bool(true),
-			IdleTimeout:                          awscdk.Duration_Minutes(jsii.Number(20)),
-		})
-		if phiTagName != nil {
-			awscdk.Tags_Of(jsComp.UiLoadBalancer).Add(phiTagName, jsii.String("true"), nil)
-		}
-		if piiTagName != nil {
-			awscdk.Tags_Of(jsComp.UiLoadBalancer).Add(piiTagName, jsii.String("true"), nil)
-		}
-		if descriptionTagName != nil {
-			awscdk.Tags_Of(jsComp.UiLoadBalancer).Add(descriptionTagName, jsii.String("Application Load Balancer for JetStore Platform microservices and UI"), nil)
-		}
-	} else {
-		jsComp.UiLoadBalancer = awselb.NewApplicationLoadBalancer(stack, jsii.String("UIELB"), &awselb.ApplicationLoadBalancerProps{
-			Vpc:                                  jsComp.Vpc,
-			InternetFacing:                       jsii.Bool(false),
-			VpcSubnets:                           jsComp.IsolatedSubnetSelection,
-			XAmznTlsVersionAndCipherSuiteHeaders: jsii.Bool(true),
-			IdleTimeout:                          awscdk.Duration_Minutes(jsii.Number(20)),
-		})
-		if phiTagName != nil {
-			awscdk.Tags_Of(jsComp.UiLoadBalancer).Add(phiTagName, jsii.String("true"), nil)
-		}
-		if piiTagName != nil {
-			awscdk.Tags_Of(jsComp.UiLoadBalancer).Add(piiTagName, jsii.String("true"), nil)
-		}
-		if descriptionTagName != nil {
-			awscdk.Tags_Of(jsComp.UiLoadBalancer).Add(descriptionTagName, jsii.String("Application Load Balancer for JetStore Platform microservices and UI"), nil)
-		}
-	}
-	var err error
-	var uiPort float64 = 8080
-	if os.Getenv("JETS_UI_PORT") != "" {
-		uiPort, err = strconv.ParseFloat(os.Getenv("JETS_UI_PORT"), 64)
-		if err != nil {
-			uiPort = 8080
-		}
-	}
-	var listener awselb.ApplicationListener
-	if os.Getenv("JETS_ELB_MODE") == "public" {
-		listener = jsComp.UiLoadBalancer.AddListener(jsii.String("Listener"), &awselb.BaseApplicationListenerProps{
-			Port:      jsii.Number(uiPort),
-			Open:      jsii.Bool(true),
-			Protocol:  awselb.ApplicationProtocol_HTTPS,
-			SslPolicy: awselb.SslPolicy_TLS13_EXT1,
-			Certificates: &[]awselb.IListenerCertificate{
-				awselb.NewListenerCertificate(jsii.String(os.Getenv("JETS_CERT_ARN"))),
-			},
-		})
-	} else {
-		listener = jsComp.UiLoadBalancer.AddListener(jsii.String("Listener"), &awselb.BaseApplicationListenerProps{
-			Port:     jsii.Number(uiPort),
-			Open:     jsii.Bool(true),
-			Protocol: awselb.ApplicationProtocol_HTTP,
-		})
-	}
-	// Register the UI service to the ELB
-	jsComp.EcsUiService.RegisterLoadBalancerTargets(&awsecs.EcsTarget{
-		ContainerName:    jsComp.UiTaskContainer.ContainerName(),
-		ContainerPort:    jsii.Number(8443),
-		Protocol:         awsecs.Protocol_TCP,
-		NewTargetGroupId: jsii.String("UI"),
-		Listener: awsecs.ListenerConfig_ApplicationListener(listener, &awselb.AddApplicationTargetsProps{
-			Protocol: awselb.ApplicationProtocol_HTTPS,
-			HealthCheck: &awselb.HealthCheck{
-				Path: jsii.String("/healthcheck/status"),
-			},
-		}),
-	})
+	// ---------------------------------------
+	// Build the UI ELB
+	// ---------------------------------------
+	jsComp.BuildELB(scope, stack, props)
+
+	// Attach Web ACL (WAFv2) to ELB
+	jsComp.BuildWAFV2(scope, stack, props)
 
 	// Add the ELB alerts
 	jetstorestack.AddElbAlarms(stack, "UiElb", jsComp.UiLoadBalancer, alarmAction, props)
@@ -500,6 +496,8 @@ func NewJetstoreOneStack(scope constructs.Construct, id string, props *jetstores
 // JETS_CPIPES_TASK_MEM_LIMIT_MB memory limit, based on fargate table
 // JETS_CPIPES_LAMBDA_MEM_LIMIT_MB memory limit for cpipes execution node lambda
 // JETS_CPIPES_SM_TIMEOUT_MIN (optional) state machine timeout for CPIPES_SM, default 60 min
+// JETS_TEMP_DATA (optional) JetStore temp directory for containers, default /jetsdata
+// TMPDIR (optional) temp directory for containers, default ${JETS_TEMP_DATA}/tmp
 // CPIPES_STATUS_NOTIFICATION_ENDPOINT api gateway endpoint to send start and end notifications
 // CPIPES_STATUS_NOTIFICATION_ENDPOINT_JSON api gateway endpoints based on file key component to send start and end notifications
 // CPIPES_START_NOTIFICATION_JSON template for the cpipes start notification
@@ -513,12 +511,14 @@ func NewJetstoreOneStack(scope constructs.Construct, id string, props *jetstores
 // JETS_DOMAIN_KEY_SEPARATOR used as separator to domain key elements
 // JETS_ECR_REPO_ARN (required)
 // CPIPES_ECR_REPO_ARN (required for cpipes server)
+// CPIPES_LAMBDA_ECR_REPO_ARN (required for cpipes native lambdas)
 // JETS_ELB_INTERNET_FACING (not required unless JETS_ELB_MODE==public, values: true, false)
 // JETS_ELB_MODE (defaults private)
 // JETS_ELB_NO_ALL_INCOMING UI ELB SG w/o all incoming traffic (not required unless JETS_ELB_INTERNET_FACING==true, default false, values: true, false)
 // JETS_GIT_ACCESS (optional) value is list of SCM e.g. 'github,bitbucket'
 // JETS_IMAGE_TAG (required)
 // CPIPES_IMAGE_TAG (required for cpipes server)
+// DEPLOY_CPIPES_NATIVE (required for cpipes native task and lambdas, values: TRUE, FALSE, requires JETS_IMAGE_TAG)
 // JETS_INPUT_ROW_JETS_KEY_ALGO (values: uuid, row_hash, domain_key (default: uuid))
 // JETS_INVALID_CODE (optional) code value when client code is not is the code value mapping, default return the client value
 // JETS_LOADER_CHUNCK_SIZE loader file partition size
@@ -538,6 +538,11 @@ func NewJetstoreOneStack(scope constructs.Construct, id string, props *jetstores
 // JETS_SERVER_SM_TIMEOUT_MIN (optional) state machine timeout for SERVER_SM, default 60 min
 // JETS_SNS_ALARM_TOPIC_ARN (optional, sns topic for sending alarm)
 // JETS_SQS_REGISTER_KEY_LAMBDA_ENTRY (optional, path to handler code for sqs register key lambda)
+// JETS_API_GATEWAY_LAMBDA_ENTRY (optional, path to handler code for api gateway lambda)
+// JETS_API_GATEWAY_EXEC_ROLE_NAME (optional, exec role of api gateway, required when api gateway is deployed)
+// JETS_API_GATEWAY_EXTERNAL_ROLES_ARN (optional, list of external roles that can assume the exec role of api gateway)
+// JETS_API_GATEWAY_DEPLOY_TEST_LAMBDA (optional, set to TRUE to deploy test lambda for api gateway)
+// JETS_API_GATEWAY_RESOURCE_POLICY_JSON (optional, api gateway resource policy in json format)
 // JETS_SQS_REGISTER_KEY_VPC_ID (optional, external vpc to attached the sqs register key lambda)
 // JETS_SQS_REGISTER_KEY_SG_ID (optional, external security group for the sqs register key vpc)
 // JETS_STACK_ID (optional, stack id, default: JetstoreOneStack)
@@ -551,6 +556,23 @@ func NewJetstoreOneStack(scope constructs.Construct, id string, props *jetstores
 // JETS_TAG_VALUE_OWNER (optional, stack-level tag value for owner)
 // JETS_TAG_VALUE_PROD (optional, stack-level tag value for indicating it's a production env)
 // JETS_UI_PORT (defaults 8080)
+// JETS_VPC_ID (optional, use existing vpc by id, must be in the same region as AWS_REGION)
+// when JETS_VPC_ID is set the following env vars must be set as well:
+//   - JETS_VPC_ID
+//   - JETS_VPC_ENDPOINTS_SG_ID
+//   - JETS_API_GATEWAY_VPC_ENDPOINT_ID (needed when using the api gateway)
+//
+// and the following env vars are ignored:
+//   - JETS_NBR_NAT_GATEWAY
+//   - JETS_VPC_INTERNET_GATEWAY
+//   - JETS_VPC_CIDR
+//   - AWS_PREFIX_LIST_ROUTE53_HEALTH_CHECK
+//   - AWS_PREFIX_LIST_S3
+//
+// JETS_VPC_ENDPOINTS_SG_ID (optional, security group id to use for ecs tasks, required if JETS_VPC_ID is set)
+// JETS_API_GATEWAY_VPC_ENDPOINT_ID (optional, API gateway VPC endpoint id, required if JETS_VPC_ID is set)
+// JETS_API_GATEWAY_CODECOMMIT_REPO_ARN (optional, API gateway codecommit repo arn, required for lmm endpoint)
+// JETS_API_GATEWAY_LAMBDA_ASSUME_ROLE_ARN (optional, API gateway lambda assume role arn, required for cross account access)
 // JETS_VPC_CIDR VPC cidr block, default 10.10.0.0/16
 // JETS_VPC_INTERNET_GATEWAY (optional, default to false), set to true to create VPC with internet gateway, if false JETS_NBR_NAT_GATEWAY is set to 0
 // JETS_DB_VERSION (optional, default to latest version supported by jetstore, expected values are 14.5, 15.10 etc. only specific versions are supported)
@@ -564,12 +586,11 @@ func NewJetstoreOneStack(scope constructs.Construct, id string, props *jetstores
 // WORKSPACE (required, indicate active workspace)
 // WORKSPACE_BRANCH to indicate the active workspace
 // WORKSPACE_URI (optional, if set it will lock the workspace uri and will not take the ui value)
-// WORKSPACES_HOME (required, to copy test files from workspace data folder)
+// WORKSPACES_HOME  this is taken from container env (dockerfile) or hardcoded in lambda definition
 // WORKSPACE_FILE_KEY_LABEL_RE (optional) regex to extract label from file_key in UI
 func main() {
 	defer jsii.Close()
 	var err error
-
 	fmt.Println("Got following env var")
 	fmt.Println("env ACTIVE_WORKSPACE_URI:", os.Getenv("ACTIVE_WORKSPACE_URI"))
 	fmt.Println("env AWS_ACCOUNT:", os.Getenv("AWS_ACCOUNT"))
@@ -585,6 +606,8 @@ func main() {
 	fmt.Println("env JETS_CPIPES_TASK_MEM_LIMIT_MB:", os.Getenv("JETS_CPIPES_TASK_MEM_LIMIT_MB"))
 	fmt.Println("env JETS_CPIPES_LAMBDA_MEM_LIMIT_MB:", os.Getenv("JETS_CPIPES_LAMBDA_MEM_LIMIT_MB"))
 	fmt.Println("env JETS_CPIPES_SM_TIMEOUT_MIN:", os.Getenv("JETS_CPIPES_SM_TIMEOUT_MIN"))
+	fmt.Println("env JETS_TEMP_DATA:", os.Getenv("JETS_TEMP_DATA"))
+	fmt.Println("env TMPDIR:", os.Getenv("TMPDIR"))
 	fmt.Println("env CPIPES_STATUS_NOTIFICATION_ENDPOINT:", os.Getenv("CPIPES_STATUS_NOTIFICATION_ENDPOINT"))
 	fmt.Println("env CPIPES_STATUS_NOTIFICATION_ENDPOINT_JSON:", os.Getenv("CPIPES_STATUS_NOTIFICATION_ENDPOINT_JSON"))
 	fmt.Println("env CPIPES_START_NOTIFICATION_JSON:", os.Getenv("CPIPES_START_NOTIFICATION_JSON"))
@@ -601,12 +624,14 @@ func main() {
 	fmt.Println("env JETS_DOMAIN_KEY_SEPARATOR:", os.Getenv("JETS_DOMAIN_KEY_SEPARATOR"))
 	fmt.Println("env JETS_ECR_REPO_ARN:", os.Getenv("JETS_ECR_REPO_ARN"))
 	fmt.Println("env CPIPES_ECR_REPO_ARN:", os.Getenv("CPIPES_ECR_REPO_ARN"))
+	fmt.Println("env CPIPES_LAMBDA_ECR_REPO_ARN:", os.Getenv("CPIPES_LAMBDA_ECR_REPO_ARN"))
 	fmt.Println("env JETS_ELB_INTERNET_FACING:", os.Getenv("JETS_ELB_INTERNET_FACING"))
 	fmt.Println("env JETS_ELB_MODE:", os.Getenv("JETS_ELB_MODE"))
 	fmt.Println("env JETS_ELB_NO_ALL_INCOMING:", os.Getenv("JETS_ELB_NO_ALL_INCOMING"))
 	fmt.Println("env JETS_GIT_ACCESS:", os.Getenv("JETS_GIT_ACCESS"))
 	fmt.Println("**** env JETS_IMAGE_TAG:", os.Getenv("JETS_IMAGE_TAG"))
 	fmt.Println("env CPIPES_IMAGE_TAG:", os.Getenv("CPIPES_IMAGE_TAG"))
+	fmt.Println("env DEPLOY_CPIPES_NATIVE:", os.Getenv("DEPLOY_CPIPES_NATIVE"))
 	fmt.Println("env JETS_INPUT_ROW_JETS_KEY_ALGO:", os.Getenv("JETS_INPUT_ROW_JETS_KEY_ALGO"))
 	fmt.Println("env JETS_INVALID_CODE:", os.Getenv("JETS_INVALID_CODE"))
 	fmt.Println("env JETS_LOADER_CHUNCK_SIZE:", os.Getenv("JETS_LOADER_CHUNCK_SIZE"))
@@ -625,6 +650,11 @@ func main() {
 	fmt.Println("env JETS_LOADER_TASK_MEM_LIMIT_MB:", os.Getenv("JETS_LOADER_TASK_MEM_LIMIT_MB"))
 	fmt.Println("env JETS_SNS_ALARM_TOPIC_ARN:", os.Getenv("JETS_SNS_ALARM_TOPIC_ARN"))
 	fmt.Println("env JETS_SQS_REGISTER_KEY_LAMBDA_ENTRY:", os.Getenv("JETS_SQS_REGISTER_KEY_LAMBDA_ENTRY"))
+	fmt.Println("env JETS_API_GATEWAY_LAMBDA_ENTRY:", os.Getenv("JETS_API_GATEWAY_LAMBDA_ENTRY"))
+	fmt.Println("env JETS_API_GATEWAY_EXTERNAL_ROLES_ARN:", os.Getenv("JETS_API_GATEWAY_EXTERNAL_ROLES_ARN"))
+	fmt.Println("env JETS_API_GATEWAY_RESOURCE_POLICY_JSON:", os.Getenv("JETS_API_GATEWAY_RESOURCE_POLICY_JSON"))
+	fmt.Println("env JETS_API_GATEWAY_EXEC_ROLE_NAME:", os.Getenv("JETS_API_GATEWAY_EXEC_ROLE_NAME"))
+	fmt.Println("env JETS_API_GATEWAY_DEPLOY_TEST_LAMBDA:", os.Getenv("JETS_API_GATEWAY_DEPLOY_TEST_LAMBDA"))
 	fmt.Println("env JETS_SQS_REGISTER_KEY_VPC_ID:", os.Getenv("JETS_SQS_REGISTER_KEY_VPC_ID"))
 	fmt.Println("env JETS_SQS_REGISTER_KEY_SG_ID:", os.Getenv("JETS_SQS_REGISTER_KEY_SG_ID"))
 	fmt.Println("env JETS_STACK_ID:", os.Getenv("JETS_STACK_ID"))
@@ -639,6 +669,11 @@ func main() {
 	fmt.Println("env JETS_TAG_VALUE_PROD:", os.Getenv("JETS_TAG_VALUE_PROD"))
 	fmt.Println("env JETS_UI_PORT:", os.Getenv("JETS_UI_PORT"))
 	fmt.Println("env JETS_VPC_CIDR:", os.Getenv("JETS_VPC_CIDR"))
+	fmt.Println("env JETS_VPC_ID:", os.Getenv("JETS_VPC_ID"))
+	fmt.Println("env JETS_VPC_ENDPOINTS_SG_ID:", os.Getenv("JETS_VPC_ENDPOINTS_SG_ID"))
+	fmt.Println("env JETS_API_GATEWAY_VPC_ENDPOINT_ID:", os.Getenv("JETS_API_GATEWAY_VPC_ENDPOINT_ID"))
+	fmt.Println("env JETS_API_GATEWAY_CODECOMMIT_REPO_ARN:", os.Getenv("JETS_API_GATEWAY_CODECOMMIT_REPO_ARN"))
+	fmt.Println("env JETS_API_GATEWAY_LAMBDA_ASSUME_ROLE_ARN:", os.Getenv("JETS_API_GATEWAY_LAMBDA_ASSUME_ROLE_ARN"))
 	fmt.Println("env JETS_VPC_INTERNET_GATEWAY:", os.Getenv("JETS_VPC_INTERNET_GATEWAY"))
 	fmt.Println("env NBR_SHARDS:", os.Getenv("NBR_SHARDS"))
 	fmt.Println("env JETS_PIPELINE_THROTTLING_JSON:", os.Getenv("JETS_PIPELINE_THROTTLING_JSON"))
@@ -649,7 +684,7 @@ func main() {
 	fmt.Println("env WORKSPACE_FILE_KEY_LABEL_RE:", os.Getenv("WORKSPACE_FILE_KEY_LABEL_RE"))
 	fmt.Println("env WORKSPACE_URI:", os.Getenv("WORKSPACE_URI"))
 	fmt.Println("env WORKSPACE:", os.Getenv("WORKSPACE"))
-	fmt.Println("env WORKSPACES_HOME:", os.Getenv("WORKSPACES_HOME"))
+	// WORKSPACES_HOME is taken from the container env var
 	fmt.Println("env EXTERNAL_BUCKETS:", os.Getenv("EXTERNAL_BUCKETS"))
 	fmt.Println("env EXTERNAL_S3_KMS_KEY_ARN:", os.Getenv("EXTERNAL_S3_KMS_KEY_ARN"))
 	fmt.Println("env EXTERNAL_SQS_ARN:", os.Getenv("EXTERNAL_SQS_ARN"))

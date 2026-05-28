@@ -29,7 +29,7 @@ func (ctx *BuilderContext) StartFanOutPipe(spec *PipeSpec, source *InputChannel,
 			}
 		}
 		// Closing the output channels
-		fmt.Println("**!@@ FanOutPipe: Closing Output Channels")
+		fmt.Println("FanOutPipe: Closing Output Channels")
 		oc := make(map[string]bool)
 		for i := range spec.Apply {
 			// Make sure the output channel config is used (eg jetrules don't, it overrides it)
@@ -48,7 +48,7 @@ func (ctx *BuilderContext) StartFanOutPipe(spec *PipeSpec, source *InputChannel,
 			}
 		}
 		for name := range oc {
-			fmt.Println("**!@@ FanOutPipe: Closing Output Channel", name)
+			fmt.Println("FanOutPipe: Closing Output Channel", name)
 			ctx.channelRegistry.CloseChannel(name)
 		}
 		close(writePartitionsResultCh)
@@ -64,12 +64,14 @@ func (ctx *BuilderContext) StartFanOutPipe(spec *PipeSpec, source *InputChannel,
 	}
 
 	// fmt.Println("**!@@ start fan_out loop on source:", source.name)
-	for inRow := range source.channel {
+	for inRow := range source.Channel {
 		for i := range spec.Apply {
-			err = evaluators[i].Apply(&inRow)
-			if err != nil {
-				cpErr = fmt.Errorf("while calling Apply on PipeTransformationEvaluator (in fan_out): %v", err)
-				goto gotError
+			if evaluators[i] != nil {
+				err = evaluators[i].Apply(&inRow)
+				if err != nil {
+					cpErr = fmt.Errorf("while calling Apply on PipeTransformationEvaluator (in fan_out): %v", err)
+					goto gotError
+				}
 			}
 		}
 	}
@@ -78,8 +80,13 @@ func (ctx *BuilderContext) StartFanOutPipe(spec *PipeSpec, source *InputChannel,
 		if evaluators[i] != nil {
 			err = evaluators[i].Done()
 			if err != nil {
-				cpErr = fmt.Errorf("while calling done on PipeTransformationEvaluator (in fan_out): %v", err)
-				log.Println(cpErr)
+				if strings.Contains(err.Error(), "cannot perform file analysis") {
+					log.Printf("while calling done on PipeTransformationEvaluator (in fan_out): %v\n", err)
+					cpErr = err
+				} else {
+					cpErr = fmt.Errorf("while calling done on PipeTransformationEvaluator (in fan_out): %v", err)
+					log.Println(cpErr)
+				}
 				goto gotError
 			}
 		}

@@ -20,17 +20,17 @@ import (
 type LookupTableS3 struct {
 	spec         *LookupSpec
 	isEmptyTable bool
-	data         map[string]*[]interface{}
+	data         map[string]*[]any
 	columnsMap   map[string]int
 }
 
-func NewLookupTableS3(_ *pgxpool.Pool, spec *LookupSpec, env map[string]interface{}, isVerbose bool) (LookupTable, error) {
+func NewLookupTableS3(_ *pgxpool.Pool, spec *LookupSpec, env map[string]any, isVerbose bool) (LookupTable, error) {
 	if spec == nil || spec.CsvSource == nil {
 		return nil, fmt.Errorf("error: lookup table of type s3_csv_lookup must have csv_source configured")
 	}
 	tbl := &LookupTableS3{
 		spec:       spec,
-		data:       make(map[string]*[]interface{}),
+		data:       make(map[string]*[]any),
 		columnsMap: make(map[string]int),
 	}
 
@@ -80,7 +80,7 @@ do_retry:
 	return tbl, nil
 }
 
-func (tbl *LookupTableS3) Lookup(key *string) (*[]interface{}, error) {
+func (tbl *LookupTableS3) Lookup(key *string) (*[]any, error) {
 	if key == nil {
 		return nil, fmt.Errorf("error: cannot do a lookup with a null key for lookup table %s", tbl.spec.Key)
 	}
@@ -90,7 +90,7 @@ func (tbl *LookupTableS3) Lookup(key *string) (*[]interface{}, error) {
 	return tbl.data[*key], nil
 }
 
-func (tbl *LookupTableS3) LookupValue(row *[]interface{}, columnName string) (interface{}, error) {
+func (tbl *LookupTableS3) LookupValue(row *[]any, columnName string) (any, error) {
 	if tbl.isEmptyTable {
 		return nil, nil
 	}
@@ -109,6 +109,11 @@ func (tbl *LookupTableS3) ColumnMap() map[string]int {
 // Return true only if there was no files found on s3
 func (tbl *LookupTableS3) IsEmptyTable() bool {
 	return tbl.isEmptyTable
+}
+
+// Return size of the lookup table
+func (tbl *LookupTableS3) Size() int64 {
+	return int64(len(tbl.data))
 }
 
 func (tbl *LookupTableS3) readCsvLookup(localFileName string) (int64, error) {
@@ -146,6 +151,12 @@ func (tbl *LookupTableS3) readCsvLookup(localFileName string) (int64, error) {
 		return 0, fmt.Errorf("error: unknown compression in readCsvLookup: %s", source.Compression)
 	}
 
+	// If the file format is csv, we will use the header row to determine 
+	// the column name -> pos mapping for the lookup table, and also update the column spec 
+	// in the lookup table spec with the inferred rdf type and array type (if applicable)
+	// Note: if the file format is headerless_csv, then it expect to the the column info to be 
+	// specified in the spec.Columns, and it will use the order of the columns in the spec.Columns 
+	// as the column name -> pos mapping for the lookup table
 	if source.Format == "csv" {
 		// Make a lookup of the current column spec
 		overrides := make(map[string]*TableColumnSpec)
@@ -207,13 +218,14 @@ func (tbl *LookupTableS3) readCsvLookup(localFileName string) (int64, error) {
 			lookupKey := strings.Join(keys, "")
 
 			// the associated values
-			lookupValues := make([]interface{}, len(tbl.spec.LookupValues))
+			lookupValues := make([]any, len(tbl.spec.LookupValues))
 			for i, name := range tbl.spec.LookupValues {
 				pos, ok := csvColumnsPos[name]
 				if !ok {
 					return 0, fmt.Errorf("error: lookup value column '%s' is not in the csv lookup table %s", name, tbl.spec.Key)
 				}
-				lookupValues[i], err = CastToRdfType(inRow[pos], tbl.spec.Columns[csvColumnsPos[name]].RdfType)
+				cspec := tbl.spec.Columns[csvColumnsPos[name]]
+				lookupValues[i], err = CastToRdfType(inRow[pos], cspec.RdfType, &cspec.IsArray)
 				if err != nil {
 					return 0, fmt.Errorf("while loading csv lookup table, error in casting to rdf type: %v", err)
 				}

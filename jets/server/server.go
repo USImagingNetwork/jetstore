@@ -119,7 +119,7 @@ func doJob() (pipelineResult *PipelineResult, err error) {
 	if !devMode {
 		// We're not in dev mode, sync the overriten workspace files
 		// We're only interested in /lookup.db and /workspace.db (both have content_type = 'sqlite')
-		err = workspace.SyncWorkspaceFiles(dbpool, os.Getenv("WORKSPACE"), "sqlite", false, true)
+		_, err = workspace.SyncWorkspaceFiles(dbpool, os.Getenv("WORKSPACE"), "sqlite", false, true)
 		if err != nil {
 			log.Println("Error while synching workspace file from db:", err)
 			return
@@ -229,6 +229,12 @@ func doJobAndReportStatus() error {
 		defer dbc.joinNodes[i].dbpool.Close()
 	}
 
+	// Insert in pipeline_execution_details table
+	err = InsertPipelineExecutionDetails(dbpool, *pipelineExecKey, *shardId)
+	if err != nil {
+		return fmt.Errorf("error while inserting into pipeline_execution_status: %v", err)
+	}
+
 	// Load configuration and execute pipeline
 	pipelineResult, err := doJob()
 	if pipelineResult == nil {
@@ -242,7 +248,7 @@ func doJobAndReportStatus() error {
 	if err != nil {
 		pipelineResult.Status = "failed"
 		errMessage = err.Error()
-		err2 := pipelineResult.UpdatePipelineExecutionStatus(dbpool, *pipelineExecKey, *shardId, errMessage)
+		err2 := pipelineResult.UpdatePipelineExecutionDetails(dbpool, *pipelineExecKey, *shardId, errMessage)
 		if err2 != nil {
 			log.Printf("error while writing pipeline status: %v", err2)
 		}
@@ -261,7 +267,7 @@ func doJobAndReportStatus() error {
 	if errCount > 0 {
 		pipelineResult.Status = "errors"
 	}
-	err2 := pipelineResult.UpdatePipelineExecutionStatus(dbpool, *pipelineExecKey, *shardId, errMessage)
+	err2 := pipelineResult.UpdatePipelineExecutionDetails(dbpool, *pipelineExecKey, *shardId, errMessage)
 	if err2 != nil {
 		log.Printf("error while writing pipeline status: %v", err2)
 	}
@@ -274,7 +280,7 @@ func main() {
 	flag.Parse()
 	start := time.Now()
 	defer func ()  {
-		log.Printf("Completed in %v", time.Since(start))
+		log.Printf("%s server completed in %v", *outSessionId, time.Since(start))
 	}()
 
 	// validate command line arguments

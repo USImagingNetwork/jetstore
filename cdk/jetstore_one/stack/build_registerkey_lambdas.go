@@ -19,23 +19,11 @@ import (
 )
 
 func (jsComp *JetStoreStackComponents) BuildRegisterKeyLambdas(scope constructs.Construct, stack awscdk.Stack, props *JetstoreOneStackProps) {
-	// Create a Lambda function to register File Keys with JetStore DB
-	// Respond to new key event as well as new schema info
-	// Define a security group if internet access is required for Status Notification
-	var lambdaSecurityGroups *[]awsec2.ISecurityGroup
-	switch strings.ToUpper(os.Getenv("JETS_SQS_REGISTER_KEY_VPC_ID")) {
-	case "JETSTORE_VPC_WITH_INTERNET_ACCESS":
-		lambdaSecurityGroups = &[]awsec2.ISecurityGroup{
-			jsComp.PrivateSecurityGroup,
-			awsec2.NewSecurityGroup(stack, jsii.String("RegKeyLambdaAccesInternet"), &awsec2.SecurityGroupProps{
-				Vpc:              jsComp.Vpc,
-				Description:      jsii.String("Allow network access to internet"),
-				AllowAllOutbound: jsii.Bool(true),
-			})}
-	default:
-		lambdaSecurityGroups = &[]awsec2.ISecurityGroup{jsComp.PrivateSecurityGroup}
-	}
-
+	// Define the log group
+	registerKeyV2LambdaLogGroup := awslogs.NewLogGroup(stack, jsii.String("RegisterKeyV2LambdaLogGroup"), &awslogs.LogGroupProps{
+		Retention: awslogs.RetentionDays_THREE_MONTHS,
+	})
+	// Define the lambda
 	jsComp.RegisterKeyV2Lambda = awslambdago.NewGoFunction(stack, jsii.String("registerKeyV2"), &awslambdago.GoFunctionProps{
 		Description: jsii.String("Lambda function to register file key with jetstore db, v2"),
 		Runtime:     awslambda.Runtime_PROVIDED_AL2023(),
@@ -67,6 +55,7 @@ func (jsComp *JetStoreStackComponents) BuildRegisterKeyLambdas(scope constructs.
 			"JETS_SERVER_SM_ARN":                       jsii.String(jsComp.ServerSmArn),
 			"JETS_SERVER_SM_ARNv2":                     jsii.String(jsComp.ServerSmArnv2),
 			"JETS_CPIPES_SM_ARN":                       jsii.String(jsComp.CpipesSmArn),
+			"JETS_CPIPES_NATIVE_SM_ARN":                jsii.String(jsComp.CpipesNativeSmArn),
 			"JETS_REPORTS_SM_ARN":                      jsii.String(jsComp.ReportsSmArn),
 			"CPIPES_STATUS_NOTIFICATION_ENDPOINT":      jsii.String(os.Getenv("CPIPES_STATUS_NOTIFICATION_ENDPOINT")),
 			"CPIPES_STATUS_NOTIFICATION_ENDPOINT_JSON": jsii.String(os.Getenv("CPIPES_STATUS_NOTIFICATION_ENDPOINT_JSON")),
@@ -77,7 +66,7 @@ func (jsComp *JetStoreStackComponents) BuildRegisterKeyLambdas(scope constructs.
 			"TASK_MAX_CONCURRENCY":                     jsii.String(os.Getenv("TASK_MAX_CONCURRENCY")),
 			"NBR_SHARDS":                               jsii.String(props.NbrShards),
 			"ENVIRONMENT":                              jsii.String(os.Getenv("ENVIRONMENT")),
-			"WORKSPACES_HOME":                          jsii.String("/tmp/jetstore/workspaces"),
+			"WORKSPACES_HOME":                          jsii.String("/tmp/workspaces"),
 			"WORKSPACE":                                jsii.String(os.Getenv("WORKSPACE")),
 			"EXTERNAL_SQS_ARN":                         jsii.String(os.Getenv("EXTERNAL_SQS_ARN")),
 		},
@@ -85,8 +74,8 @@ func (jsComp *JetStoreStackComponents) BuildRegisterKeyLambdas(scope constructs.
 		Timeout:        awscdk.Duration_Seconds(jsii.Number(30)),
 		Vpc:            jsComp.Vpc,
 		VpcSubnets:     jsComp.PrivateSubnetSelection,
-		SecurityGroups: lambdaSecurityGroups,
-		LogRetention:   awslogs.RetentionDays_THREE_MONTHS,
+		SecurityGroups: &[]awsec2.ISecurityGroup{jsComp.VpcEndpointsSg, jsComp.RdsAccessSg},
+		LogGroup:       registerKeyV2LambdaLogGroup,
 	})
 	if phiTagName != nil {
 		awscdk.Tags_Of(jsComp.RegisterKeyV2Lambda).Add(phiTagName, jsii.String("false"), nil)
@@ -97,7 +86,6 @@ func (jsComp *JetStoreStackComponents) BuildRegisterKeyLambdas(scope constructs.
 	if descriptionTagName != nil {
 		awscdk.Tags_Of(jsComp.RegisterKeyV2Lambda).Add(descriptionTagName, jsii.String("JetStore lambda for handling new file key events"), nil)
 	}
-	jsComp.RegisterKeyV2Lambda.Connections().AllowTo(jsComp.RdsCluster, awsec2.Port_Tcp(jsii.Number(5432)), jsii.String("Allow connection from RegisterKeyV2Lambda"))
 	jsComp.RdsSecret.GrantRead(jsComp.RegisterKeyV2Lambda, nil)
 	jsComp.SourceBucket.GrantReadWrite(jsComp.RegisterKeyV2Lambda, nil)
 
@@ -133,17 +121,11 @@ func (jsComp *JetStoreStackComponents) BuildRegisterKeyLambdas(scope constructs.
 		case "JETSTORE_VPC_WITH_INTERNET_ACCESS":
 			sqsVpc = jsComp.Vpc
 			sqsVpcSubnets = jsComp.PrivateSubnetSelection
-			sqsSecurityGroups = &[]awsec2.ISecurityGroup{
-				jsComp.PrivateSecurityGroup,
-				awsec2.NewSecurityGroup(stack, jsii.String("SqsLambdaAccesInternet"), &awsec2.SecurityGroupProps{
-					Vpc:              sqsVpc,
-					Description:      jsii.String("Allow network access to internet"),
-					AllowAllOutbound: jsii.Bool(true),
-				})}
+			sqsSecurityGroups = &[]awsec2.ISecurityGroup{jsComp.VpcEndpointsSg, jsComp.RdsAccessSg, jsComp.InternetAccessSg}
 		case "JETSTORE_VPC":
 			sqsVpc = jsComp.Vpc
 			sqsVpcSubnets = jsComp.PrivateSubnetSelection
-			sqsSecurityGroups = &[]awsec2.ISecurityGroup{jsComp.PrivateSecurityGroup}
+			sqsSecurityGroups = &[]awsec2.ISecurityGroup{jsComp.VpcEndpointsSg, jsComp.RdsAccessSg}
 		case "":
 			// Not attached to a vpc
 		default:
@@ -159,6 +141,11 @@ func (jsComp *JetStoreStackComponents) BuildRegisterKeyLambdas(scope constructs.
 			}
 		}
 
+		// Define the log group
+		sqsRegisterKeyLambdaLogGroup := awslogs.NewLogGroup(stack, jsii.String("SqsRegisterKeyLambdaLogGroup"), &awslogs.LogGroupProps{
+			Retention: awslogs.RetentionDays_THREE_MONTHS,
+		})
+		// Define the lambda
 		jsComp.SqsRegisterKeyLambda = awslambdago.NewGoFunction(stack, jsii.String("SqsRegisterKeyLambda"), &awslambdago.GoFunctionProps{
 			Description: jsii.String("JetStore One Lambda function to Register File Key from SQS Events"),
 			Runtime:     awslambda.Runtime_PROVIDED_AL2023(),
@@ -190,6 +177,7 @@ func (jsComp *JetStoreStackComponents) BuildRegisterKeyLambdas(scope constructs.
 				"JETS_SERVER_SM_ARN":                       jsii.String(jsComp.ServerSmArn),
 				"JETS_SERVER_SM_ARNv2":                     jsii.String(jsComp.ServerSmArnv2),
 				"JETS_CPIPES_SM_ARN":                       jsii.String(jsComp.CpipesSmArn),
+				"JETS_CPIPES_NATIVE_SM_ARN":                jsii.String(jsComp.CpipesNativeSmArn),
 				"JETS_REPORTS_SM_ARN":                      jsii.String(jsComp.ReportsSmArn),
 				"CPIPES_STATUS_NOTIFICATION_ENDPOINT":      jsii.String(os.Getenv("CPIPES_STATUS_NOTIFICATION_ENDPOINT")),
 				"CPIPES_STATUS_NOTIFICATION_ENDPOINT_JSON": jsii.String(os.Getenv("CPIPES_STATUS_NOTIFICATION_ENDPOINT_JSON")),
@@ -200,16 +188,17 @@ func (jsComp *JetStoreStackComponents) BuildRegisterKeyLambdas(scope constructs.
 				"TASK_MAX_CONCURRENCY":                     jsii.String(os.Getenv("TASK_MAX_CONCURRENCY")),
 				"NBR_SHARDS":                               jsii.String(props.NbrShards),
 				"ENVIRONMENT":                              jsii.String(os.Getenv("ENVIRONMENT")),
-				"WORKSPACES_HOME":                          jsii.String("/tmp/jetstore/workspaces"),
+				"WORKSPACES_HOME":                          jsii.String("/tmp/workspaces"),
 				"WORKSPACE":                                jsii.String(os.Getenv("WORKSPACE")),
 			},
 			MemorySize: jsii.Number(128),
 			// EphemeralStorageSize: awscdk.Size_Mebibytes(jsii.Number(2048)),
 			Timeout:        awscdk.Duration_Seconds(jsii.Number(30)),
+			Role:           jsComp.LambdaExecutionRole,
 			Vpc:            sqsVpc,
 			VpcSubnets:     sqsVpcSubnets,
 			SecurityGroups: sqsSecurityGroups,
-			LogRetention:   awslogs.RetentionDays_THREE_MONTHS,
+			LogGroup:       sqsRegisterKeyLambdaLogGroup,
 		})
 		if phiTagName != nil {
 			awscdk.Tags_Of(jsComp.SqsRegisterKeyLambda).Add(phiTagName, jsii.String("false"), nil)
@@ -219,15 +208,6 @@ func (jsComp *JetStoreStackComponents) BuildRegisterKeyLambdas(scope constructs.
 		}
 		if descriptionTagName != nil {
 			awscdk.Tags_Of(jsComp.SqsRegisterKeyLambda).Add(descriptionTagName, jsii.String("JetStore lambda for sqs events"), nil)
-		}
-
-		jsComp.SqsRegisterKeyLambda.Connections().AllowTo(jsComp.RdsCluster, awsec2.Port_Tcp(jsii.Number(5432)), jsii.String("Allow connection from SqsRegisterKeyLambda"))
-		jsComp.RdsSecret.GrantRead(jsComp.SqsRegisterKeyLambda, nil)
-
-		jsComp.SourceBucket.GrantReadWrite(jsComp.SqsRegisterKeyLambda, nil)
-		jsComp.GrantReadWriteFromExternalBuckets(stack, jsComp.SqsRegisterKeyLambda)
-		if jsComp.ExternalKmsKey != nil {
-			jsComp.ExternalKmsKey.GrantEncryptDecrypt(jsComp.SqsRegisterKeyLambda)
 		}
 
 		sqsArn := os.Getenv("EXTERNAL_SQS_ARN")

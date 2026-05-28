@@ -29,11 +29,32 @@ import (
 
 // *TODO no need to pass bucket and region to this module
 var jetstoreOwnBucket, jetstoreOwnRegion, kmsKeyArn string
+var jetsS3InputPrefix, jetsS3StagePrefix, jetsS3OutputPrefix, jetsS3SchemaEventsPrefix string
 
 func init() {
+	jetsS3InputPrefix = os.Getenv("JETS_s3_INPUT_PREFIX")
+	jetsS3StagePrefix = os.Getenv("JETS_s3_STAGE_PREFIX")
+	jetsS3OutputPrefix = os.Getenv("JETS_s3_OUTPUT_PREFIX")
+	jetsS3SchemaEventsPrefix = os.Getenv("JETS_s3_SCHEMA_TRIGGERS")
 	kmsKeyArn = os.Getenv("JETS_S3_KMS_KEY_ARN")
 	jetstoreOwnBucket = os.Getenv("JETS_BUCKET")
 	jetstoreOwnRegion = os.Getenv("JETS_REGION")
+}
+
+func JetStoreInputPrefix() string {
+	return jetsS3InputPrefix
+}
+
+func JetStoreStagePrefix() string {
+	return jetsS3StagePrefix
+}
+
+func JetStoreSchemaEventsPrefix() string {
+	return jetsS3SchemaEventsPrefix
+}
+
+func JetStoreOutputPrefix() string {
+	return jetsS3OutputPrefix
 }
 
 func JetStoreBucket() string {
@@ -243,19 +264,34 @@ func NewS3Client() (*s3.Client, error) {
 	return s3.NewFromConfig(cfg), nil
 }
 
+// GetObjectSize gets the size of the object in bytes
+// Does up to 4 attempts in case of failure
 func GetObjectSize(s3Client *s3.Client, s3bucket string, key string) (int64, error) {
 	if len(s3bucket) == 0 {
 		s3bucket = jetstoreOwnBucket
 	}
-	result, err := s3Client.GetObjectAttributes(context.TODO(), &s3.GetObjectAttributesInput{
+	params := &s3.GetObjectAttributesInput{
 		Bucket: aws.String(s3bucket),
 		Key:    aws.String(key),
 		ObjectAttributes: []types.ObjectAttributes{
 			types.ObjectAttributesObjectSize,
 		},
-	})
+	}
+	sleepDuration := 500 * time.Millisecond
+	retry := 0
+
+do_retry:
+	result, err := s3Client.GetObjectAttributes(context.TODO(), params)
 	if err != nil {
-		return 0, err
+		if retry < 4 && !strings.Contains(err.Error(), "context canceled") {
+			log.Printf(
+				"Got error in s3Client.GetObjectAttributes '%v' for part %s (retrying)", err, key)
+			retry++
+			time.Sleep(sleepDuration)
+			sleepDuration *= 2
+			goto do_retry
+		}
+		return 0, fmt.Errorf("while getting partition size (after 4 attempts): %v", err)
 	}
 	return *result.ObjectSize, nil
 }
@@ -284,6 +320,7 @@ func ListS3ObjectsV2(s3Client *s3.Client, externalBucket string, prefix *string)
 		result, err := s3Client.ListObjectsV2(context.TODO(), &s3.ListObjectsV2Input{
 			Bucket:            aws.String(externalBucket),
 			Prefix:            prefix,
+			MaxKeys:           aws.Int32(500),
 			ContinuationToken: token,
 		})
 		if err != nil {
@@ -304,6 +341,46 @@ func ListS3ObjectsV2(s3Client *s3.Client, externalBucket string, prefix *string)
 		token = result.NextContinuationToken
 	}
 	return keys, nil
+}
+
+// CountS3ObjectsWithPrefix counts non-"folder" objects in the given bucket matching the prefix,
+// and skips any objects with size 0. If externalBucket is empty, it uses the JetStore default bucket.
+func CountS3ObjectsWithPrefix(s3Client *s3.Client, externalBucket, prefix string) (int64, string, error) {
+	if externalBucket == "" {
+		externalBucket = jetstoreOwnBucket
+	}
+
+	var count int64
+	p := s3.NewListObjectsV2Paginator(s3Client, &s3.ListObjectsV2Input{
+		Bucket: aws.String(externalBucket),
+		Prefix: aws.String(prefix),
+	})
+
+	var fileKey string
+	for p.HasMorePages() {
+		out, err := p.NextPage(context.TODO())
+		if err != nil {
+			return 0, "", fmt.Errorf("while listing objects from bucket '%s': %v", externalBucket, err)
+		}
+		for _, obj := range out.Contents {
+			// Skip common-prefix "folders" and zero-sized objects
+			if strings.HasSuffix(aws.ToString(obj.Key), "/") || aws.ToInt64(obj.Size) == 0 {
+				continue
+			}
+			fileKey = aws.ToString(obj.Key)
+			count++
+		}
+	}
+	return count, fileKey, nil
+}
+
+// CountS3Objects is a convenience wrapper that creates a client and uses the default bucket.
+func CountS3Objects(prefix string) (int64, string, error) {
+	s3Client, err := NewS3Client()
+	if err != nil {
+		return 0, "", fmt.Errorf("while creating s3 client: %v", err)
+	}
+	return CountS3ObjectsWithPrefix(s3Client, "", prefix)
 }
 
 // Download obj from s3 into fileHd (must be writable), return size of download in bytes
@@ -362,7 +439,7 @@ do_retry:
 	if err != nil {
 		if retry < 6 {
 			retry++
-			time.Sleep(time.Duration(500 * retry) * time.Millisecond)
+			time.Sleep(time.Duration(500*retry) * time.Millisecond)
 			goto do_retry
 		}
 		return n, fmt.Errorf("failed to download s3 file 's3://%s/%s': %v", bucket, objKey, err)
@@ -407,7 +484,7 @@ do_retry:
 	if err != nil {
 		if retry < 6 {
 			retry++
-			time.Sleep(time.Duration(500 * retry) * time.Millisecond)
+			time.Sleep(time.Duration(500*retry) * time.Millisecond)
 			goto do_retry
 		}
 		return fmt.Errorf("failed to upload file to s3 bucket '%s': %v", externalBucket, err)
@@ -420,7 +497,7 @@ func UploadBufToS3(bucket, objKey string, buf []byte) error {
 	return UploadToS3FromReader(bucket, objKey, bytes.NewReader(buf))
 }
 
-// upload buf to S3, reading the obj from in-memory buffer
+// download buf from S3, returning the obj
 func DownloadBufFromS3(objKey string) ([]byte, error) {
 	s3Client, err := NewS3Client()
 	if err != nil {
@@ -440,7 +517,7 @@ do_retry:
 	if err != nil {
 		if retry < 6 {
 			retry++
-			time.Sleep(time.Duration(500 * retry) * time.Millisecond)
+			time.Sleep(time.Duration(500*retry) * time.Millisecond)
 			goto do_retry
 		}
 		return nil, fmt.Errorf("failed to download s3 file 's3://%s/%s': %v", jetstoreOwnBucket, objKey, err)

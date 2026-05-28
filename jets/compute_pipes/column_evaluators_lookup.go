@@ -14,8 +14,8 @@ type lookupColumnTransformationEval struct {
 
 // type to evaluate the lookup key and returned values
 type lookupColumnEval interface {
-	EvalKey(input *[]interface{}) (string, error)
-	EvalValue(currentValue *[]interface{}, input *[]interface{}) error
+	EvalKey(input *[]any) (string, error)
+	EvalValue(currentValue *[]any, input *[]any) error
 }
 
 type lceSelect struct {
@@ -24,7 +24,7 @@ type lceSelect struct {
 	outputPos  int
 }
 
-func (lce *lceSelect) EvalKey(input *[]interface{}) (string, error) {
+func (lce *lceSelect) EvalKey(input *[]any) (string, error) {
 	if input == nil || len(*input) <= lce.inputPos {
 		return "",
 			fmt.Errorf("error lceSelect.EvalKey cannot have nil input or invalid column position for lookup %s",
@@ -37,7 +37,7 @@ func (lce *lceSelect) EvalKey(input *[]interface{}) (string, error) {
 	}
 	return key, nil
 }
-func (lce *lceSelect) EvalValue(output *[]interface{}, input *[]interface{}) error {
+func (lce *lceSelect) EvalValue(output *[]any, input *[]any) error {
 	if output == nil || input == nil {
 		return fmt.Errorf("error lceSelect.EvalValue cannot have nil output or input for lookup %s",
 			*lce.lookupName)
@@ -51,11 +51,11 @@ func (lce *lceSelect) EvalValue(output *[]interface{}, input *[]interface{}) err
 
 type lceValue struct {
 	lookupName *string
-	value      interface{}
+	value      any
 	outputPos  int
 }
 
-func (lce *lceValue) EvalKey(input *[]interface{}) (string, error) {
+func (lce *lceValue) EvalKey(input *[]any) (string, error) {
 	if input == nil {
 		return "",
 			fmt.Errorf("error lceValue.EvalKey cannot have nil input for lookup %s", *lce.lookupName)
@@ -66,7 +66,7 @@ func (lce *lceValue) EvalKey(input *[]interface{}) (string, error) {
 	}
 	return key, nil
 }
-func (lce *lceValue) EvalValue(output *[]interface{}, _ *[]interface{}) error {
+func (lce *lceValue) EvalValue(output *[]any, _ *[]any) error {
 	if output == nil {
 		return fmt.Errorf("error lceValue.EvalValue cannot have nil output for lookup %s", *lce.lookupName)
 	}
@@ -77,8 +77,7 @@ func (lce *lceValue) EvalValue(output *[]interface{}, _ *[]interface{}) error {
 	return nil
 }
 
-func (ctx *lookupColumnTransformationEval) InitializeCurrentValue(currentValue *[]interface{}) {}
-func (ctx *lookupColumnTransformationEval) Update(output *[]interface{}, input *[]interface{}) error {
+func (ctx *lookupColumnTransformationEval) Update(output *[]any, input *[]any) error {
 	// lookup update
 	// build the lookup key using input row
 	// get the lookup record, update output row with lookup values
@@ -119,7 +118,7 @@ func (ctx *lookupColumnTransformationEval) Update(output *[]interface{}, input *
 	}
 	return nil
 }
-func (ctx *lookupColumnTransformationEval) Done(currentValue *[]interface{}) error {
+func (ctx *lookupColumnTransformationEval) Done(currentValue *[]any) error {
 	return nil
 }
 
@@ -135,14 +134,14 @@ func (ctx *BuilderContext) BuildLookupTCEvaluator(source *InputChannel, outCh *O
 	// build the key evaluators
 	for i := range spec.LookupKey {
 		columnSpec := &spec.LookupKey[i]
-		switch columnSpec.Type {
+		switch strings.ToLower(columnSpec.Type) {
 		case "select":
 			keyEvaluator[i] = &lceSelect{
 				lookupName: spec.LookupName,
-				inputPos:   (*source.columns)[*columnSpec.Expr],
+				inputPos:   (*source.Columns)[*columnSpec.Expr],
 			}
 		case "value":
-			value, err := ctx.parseValue(columnSpec.Expr)
+			value, err := ctx.parseValue(columnSpec.Expr, columnSpec.MaxEnvVarSubstitution)
 			if err != nil {
 				return nil, fmt.Errorf("while building key evaluator of type 'value' for lookup %s: %v",
 					*spec.LookupName, err)
@@ -163,14 +162,14 @@ func (ctx *BuilderContext) BuildLookupTCEvaluator(source *InputChannel, outCh *O
 		// build the lookup value evaluators
 		for i := range spec.LookupValues {
 			columnSpec := &spec.LookupValues[i]
-			switch columnSpec.Type {
+			switch strings.ToLower(columnSpec.Type) {
 			case "select":
 				inputPos, ok := lookupTable.ColumnMap()[*columnSpec.Expr]
 				if !ok {
 					return nil, fmt.Errorf("error: lookup table '%s' does not have column '%s'",
 						*spec.LookupName, *columnSpec.Expr)
 				}
-				outputPos, ok := (*outCh.columns)[columnSpec.Name]
+				outputPos, ok := (*outCh.Columns)[columnSpec.Name]
 				if !ok {
 					return nil, fmt.Errorf("error: output column '%s' is not valid for lookup table '%s' (buildLookupEvaluator)",
 						columnSpec.Name, *spec.LookupName)
@@ -181,12 +180,12 @@ func (ctx *BuilderContext) BuildLookupTCEvaluator(source *InputChannel, outCh *O
 					outputPos:  outputPos,
 				}
 			case "value":
-				value, err := ctx.parseValue(columnSpec.Expr)
+				value, err := ctx.parseValue(columnSpec.Expr, columnSpec.MaxEnvVarSubstitution)
 				if err != nil {
 					return nil, fmt.Errorf("while building lookup value evaluator of type 'value' for lookup %s: %v",
 						*spec.LookupName, err)
 				}
-				outputPos, ok := (*outCh.columns)[columnSpec.Name]
+				outputPos, ok := (*outCh.Columns)[columnSpec.Name]
 				if !ok {
 					return nil, fmt.Errorf("error: output column '%s' is not valid for lookup table '%s' (buildLookupEvaluator)",
 						columnSpec.Name, *spec.LookupName)

@@ -7,6 +7,7 @@ import (
 	"log"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/artisoft-io/jetstore/jets/bridge"
 	"github.com/artisoft-io/jetstore/jets/cleansing_functions"
@@ -164,6 +165,7 @@ func (rw *ReteWorkspace) ExecuteRules(
 		if err != nil {
 			return &result, fmt.Errorf("while creating rdf session: %v", err)
 		}
+		start := time.Now()
 
 		for iset, ruleset := range rw.ruleset {
 			if glogv > 0 {
@@ -259,6 +261,8 @@ func (rw *ReteWorkspace) ExecuteRules(
 			log.Println("ExecuteRule() Completed, the rdf sesion contains:")
 			rdfSession.DumpRdfGraph()
 		}
+		reteCompleted := time.Since(start)
+		start = time.Now()
 
 		// Get the jets:exception(s)
 		ctor, err := rdfSession.Find(ri.jets__istate, ri.jets__exception, nil)
@@ -279,7 +283,7 @@ func (rw *ReteWorkspace) ExecuteRules(
 						br.ReteSessionSaved = "Y"
 						b, errx := rdf.RDFSessionAsTableJsonV2(rdfSession, rw.js)
 						if errx != nil {
-							log.Println("Error extracting RDFSessionAsTableJson: %v", errx)
+							log.Println("Error extracting RDFSessionAsTableJson:", errx)
 							br.ReteSessionSaved = "N"
 						} else {
 							br.ReteSessionTriples = sql.NullString{
@@ -296,6 +300,8 @@ func (rw *ReteWorkspace) ExecuteRules(
 			}
 			ctor.ReleaseIterator()	
 		}
+		extractExceptions := time.Since(start)
+		start = time.Now()
 
 		// pulling the data out of the rete session
 		for tableName, tableSpec := range outputSpecs {
@@ -348,7 +354,7 @@ func (rw *ReteWorkspace) ExecuteRules(
 					ncol := len(tableSpec.Columns)
 					// Compute the Domain Keys and ShardIds
 					entityRow := make([]interface{}, ncol)
-					for i := 0; i < ncol; i++ {
+					for i := range ncol {
 						domainColumn := &tableSpec.Columns[i]
 						// log.Println("Found entity with subject:",subject.AsTextSilent(), "with column",domainColumn.ColumnName,"of type",domainColumn.DataType)
 						switch {
@@ -461,8 +467,13 @@ func (rw *ReteWorkspace) ExecuteRules(
 			}
 			ctor.ReleaseIterator()
 		}
+		dataExtracted := time.Since(start)
+		start = time.Now()
 		result.ExecuteRulesCount += 1
 		rdfSession.ReleaseRDFSession()
+		sessionReleased := time.Since(start)
+		log.Printf("%s retex %v, exceptions %v, extract %v, release %v",
+			*outSessionId, reteCompleted, extractExceptions, dataExtracted, sessionReleased)
 	}
 	return &result, nil
 }

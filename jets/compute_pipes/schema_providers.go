@@ -2,6 +2,8 @@ package compute_pipes
 
 import (
 	"fmt"
+	"log"
+	"strings"
 
 	"github.com/jackc/pgx/v4/pgxpool"
 )
@@ -10,13 +12,13 @@ import (
 
 type SchemaManager struct {
 	spec            []*SchemaProviderSpec
-	envSettings     map[string]interface{}
+	envSettings     map[string]any
 	isDebugMode     bool
 	schemaProviders map[string]SchemaProvider
 }
 
 func NewSchemaManager(spec []*SchemaProviderSpec,
-	envSettings map[string]interface{}, isDebugMode bool) *SchemaManager {
+	envSettings map[string]any, isDebugMode bool) *SchemaManager {
 	return &SchemaManager{
 		spec:            spec,
 		envSettings:     envSettings,
@@ -27,19 +29,22 @@ func NewSchemaManager(spec []*SchemaProviderSpec,
 
 type SchemaProvider interface {
 	Initialize(dbpool *pgxpool.Pool, spec *SchemaProviderSpec,
-		envSettings map[string]interface{}, isDebugMode bool) error
+		envSettings map[string]any, isDebugMode bool) error
 	Key() string
 	Env() map[string]any
 	AdjustColumnWidth(width map[string]int) error
 	BadRowsConfig() *BadRowsSpec
+	BlankFieldMarkers() *BlankFieldMarkers
 	Bucket() string
 	ColumnNames() []string
 	Columns() []SchemaColumnSpec
 	Compression() string
 	Delimiter() rune
 	DetectEncoding() bool
+	DiscardFileHeaders() bool
 	DomainClass() string
 	DomainKeys() map[string]any
+	DropExcedentHeaders() bool
 	Encoding() string
 	EnforceRowMaxLength() bool
 	EnforceRowMinLength() bool
@@ -50,16 +55,23 @@ type SchemaProvider interface {
 	IsPartFiles() bool
 	NbrRowsInRecord() int64
 	NoQuotes() bool
+	OutputEncoding() string
 	ParquetSchema() *ParquetSchemaInfo
 	QuoteAllRecords() bool
 	ReadBatchSize() int64
 	ReadDateLayout() string
+	ReorderColumnsOnRead() []int
 	SchemaName() string
+	SetParquetSchema(schema *ParquetSchemaInfo)
 	TrimColumns() bool
 	UseLazyQuotes() bool
 	UseLazyQuotesSpecial() bool
 	VariableFieldsPerRecord() bool
 	WriteDateLayout() string
+	CapDobYears() int
+	SetDodToJan1() bool
+	SetDobToJan1() bool
+	SetAllDatesToJan1() bool
 }
 
 // columnNames is the list of file headers for fixed_width
@@ -101,7 +113,8 @@ func (sm *SchemaManager) GetSchemaProvider(key string) SchemaProvider {
 }
 
 func (sp *DefaultSchemaProvider) Initialize(_ *pgxpool.Pool, spec *SchemaProviderSpec,
-	envSettings map[string]interface{}, isDebugMode bool) error {
+	_ map[string]any, isDebugMode bool) error {
+
 	sp.spec = spec
 	sp.isDebugMode = isDebugMode
 	// Ensure a default compression algo
@@ -183,6 +196,13 @@ func (sp *DefaultSchemaProvider) SchemaName() string {
 	return sp.spec.SchemaName
 }
 
+func (sp *DefaultSchemaProvider) SetParquetSchema(schema *ParquetSchemaInfo) {
+	if sp == nil {
+		return
+	}
+	sp.spec.ParquetSchema = schema
+}
+
 func (sp *DefaultSchemaProvider) Format() string {
 	if sp == nil {
 		return ""
@@ -218,6 +238,13 @@ func (sp *DefaultSchemaProvider) Encoding() string {
 	return sp.spec.Encoding
 }
 
+func (sp *DefaultSchemaProvider) OutputEncoding() string {
+	if sp == nil {
+		return ""
+	}
+	return sp.spec.OutputEncoding
+}
+
 func (sp *DefaultSchemaProvider) Compression() string {
 	if sp == nil {
 		return ""
@@ -230,6 +257,20 @@ func (sp *DefaultSchemaProvider) DetectEncoding() bool {
 		return false
 	}
 	return sp.spec.DetectEncoding
+}
+
+func (sp *DefaultSchemaProvider) DiscardFileHeaders() bool {
+	if sp == nil {
+		return false
+	}
+	return sp.spec.DiscardFileHeaders
+}
+
+func (sp *DefaultSchemaProvider) DropExcedentHeaders() bool {
+	if sp == nil {
+		return false
+	}
+	return sp.spec.DropExcedentHeaders
 }
 
 func (sp *DefaultSchemaProvider) InputFormatDataJson() string {
@@ -309,6 +350,30 @@ func (sp *DefaultSchemaProvider) BadRowsConfig() *BadRowsSpec {
 	return sp.spec.BadRowsConfig
 }
 
+func (sp *DefaultSchemaProvider) BlankFieldMarkers() *BlankFieldMarkers {
+	if sp == nil {
+		return nil
+	}
+	var blankMarkers *BlankFieldMarkers
+	blankMarkersSpec := sp.spec.BlankFieldMarkers
+	if blankMarkersSpec != nil {
+			markers := blankMarkersSpec.Markers
+			if len(markers) > 0 {
+				if !blankMarkersSpec.CaseSensitive {
+					for i := range markers {
+						markers[i] = strings.ToUpper(markers[i])
+					}
+				}
+				blankMarkers = &BlankFieldMarkers{
+					CaseSensitive: blankMarkersSpec.CaseSensitive,
+					Markers:       markers,
+				}
+				log.Printf("SchemaProvider: blank field markers: case_sensitive=%v, markers=%v", blankMarkers.CaseSensitive, blankMarkers.Markers)
+			}
+		}
+	return blankMarkers
+}
+
 func (sp *DefaultSchemaProvider) QuoteAllRecords() bool {
 	if sp == nil {
 		return false
@@ -351,9 +416,62 @@ func (sp *DefaultSchemaProvider) ReadDateLayout() string {
 	return sp.spec.ReadDateLayout
 }
 
+func (sp *DefaultSchemaProvider) ReorderColumnsOnRead() []int {
+	if sp == nil {
+		return nil
+	}
+	return sp.spec.ReorderColumnsOnRead
+}
+
 func (sp *DefaultSchemaProvider) WriteDateLayout() string {
 	if sp == nil {
 		return ""
 	}
 	return sp.spec.WriteDateLayout
+}
+
+func (sp *DefaultSchemaProvider) CapDobYears() int {
+	if sp == nil {
+		return 0
+	}
+	return sp.spec.CapDobYears
+}
+
+func (sp *DefaultSchemaProvider) SetDodToJan1() bool {
+	if sp == nil {
+		return false
+	}
+	return sp.spec.SetDodToJan1
+}
+
+func (sp *DefaultSchemaProvider) SetDobToJan1() bool {
+	if sp == nil {
+		return false
+	}
+	return sp.spec.SetDobToJan1
+}
+
+func (sp *DefaultSchemaProvider) SetAllDatesToJan1() bool {
+	if sp == nil {
+		return false
+	}
+	return sp.spec.SetAllDatesToJan1
+}
+
+func GetSchemaProviderConfigByKey(schemaProviders []*SchemaProviderSpec, key string) *SchemaProviderSpec {
+	for i := range schemaProviders {
+		if schemaProviders[i].Key == key {
+			return schemaProviders[i]
+		}
+	}
+	return nil
+}
+
+func GetSchemaProviderConfigBySourceType(schemaProviders []*SchemaProviderSpec, sourceType string) *SchemaProviderSpec {
+	for i := range schemaProviders {
+		if schemaProviders[i].SourceType == sourceType {
+			return schemaProviders[i]
+		}
+	}
+	return nil
 }

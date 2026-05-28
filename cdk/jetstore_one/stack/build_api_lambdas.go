@@ -1,0 +1,423 @@
+package stack
+
+// Build the API Gateway Lambda function if defined in env variable JETS_API_GATEWAY_LAMBDA_ENTRY
+
+import (
+	"encoding/json"
+	"log"
+	"os"
+	"strings"
+
+	awscdk "github.com/aws/aws-cdk-go/awscdk/v2"
+	"github.com/aws/aws-cdk-go/awscdk/v2/awsapigateway"
+	"github.com/aws/aws-cdk-go/awscdk/v2/awsec2"
+	"github.com/aws/aws-cdk-go/awscdk/v2/awsiam"
+	"github.com/aws/aws-cdk-go/awscdk/v2/awslambda"
+	"github.com/aws/aws-cdk-go/awscdk/v2/awslogs"
+	awslambdago "github.com/aws/aws-cdk-go/awscdklambdagoalpha/v2"
+	constructs "github.com/aws/constructs-go/constructs/v10"
+	jsii "github.com/aws/jsii-runtime-go"
+)
+
+func (jsComp *JetStoreStackComponents) BuildApiLambdas(scope constructs.Construct, stack awscdk.Stack, props *JetstoreOneStackProps) {
+
+	// Lambda Function for api gateway endpoints, this may be installation specific
+	lambdaEntry := os.Getenv("JETS_API_GATEWAY_LAMBDA_ENTRY")
+	if len(lambdaEntry) == 0 {
+		return
+	}
+
+	if jsComp.ApiGatewayVpcEndpoint == nil {
+		log.Println("error: JETS_API_GATEWAY_VPC_ENDPOINT_ID must be set or created when JETS_API_GATEWAY_LAMBDA_ENTRY is set")
+		return
+	}
+
+	//Check if deploy test lambda
+	deployTestLambda := false
+	dtl := strings.ToUpper(os.Getenv("JETS_API_GATEWAY_DEPLOY_TEST_LAMBDA"))
+	if dtl == "TRUE" || dtl == "1" {
+		deployTestLambda = true
+	}
+
+	// Define the log group
+	apiLambdaLogGroup := awslogs.NewLogGroup(stack, jsii.String("ApiLambdaLogGroup"), &awslogs.LogGroupProps{
+		Retention: awslogs.RetentionDays_THREE_MONTHS,
+	})
+	// Define the lambda
+	jsComp.ApiGatewayLambda = awslambdago.NewGoFunction(stack, jsii.String("ApiGatewayLambda"), &awslambdago.GoFunctionProps{
+		Description: jsii.String("JetStore Lambda function API Gateway"),
+		Runtime:     awslambda.Runtime_PROVIDED_AL2023(),
+		Entry:       jsii.String(lambdaEntry),
+		Bundling: &awslambdago.BundlingOptions{
+			GoBuildFlags: &[]*string{jsii.String(`-buildvcs=false -ldflags "-s -w"`)},
+		},
+		Environment: &map[string]*string{
+			"JETS_BUCKET":                              jsComp.SourceBucket.BucketName(),
+			"JETS_DOMAIN_KEY_HASH_ALGO":                jsii.String(os.Getenv("JETS_DOMAIN_KEY_HASH_ALGO")),
+			"JETS_DOMAIN_KEY_HASH_SEED":                jsii.String(os.Getenv("JETS_DOMAIN_KEY_HASH_SEED")),
+			"JETS_DSN_SECRET":                          jsComp.RdsSecret.SecretName(),
+			"JETS_ADMIN_EMAIL":                         jsii.String(os.Getenv("JETS_ADMIN_EMAIL")),
+			"JETS_INPUT_ROW_JETS_KEY_ALGO":             jsii.String(os.Getenv("JETS_INPUT_ROW_JETS_KEY_ALGO")),
+			"JETS_INVALID_CODE":                        jsii.String(os.Getenv("JETS_INVALID_CODE")),
+			"JETS_LOADER_CHUNCK_SIZE":                  jsii.String(os.Getenv("JETS_LOADER_CHUNCK_SIZE")),
+			"JETS_LOADER_SM_ARN":                       jsii.String(jsComp.LoaderSmArn),
+			"CPIPES_DB_POOL_SIZE":                      jsii.String(os.Getenv("CPIPES_DB_POOL_SIZE")),
+			"JETS_REGION":                              jsii.String(os.Getenv("AWS_REGION")),
+			"REGION":                                   jsii.String(os.Getenv("AWS_REGION")),
+			"JETS_PIVOT_YEAR_TIME_PARSING":             jsii.String(os.Getenv("JETS_PIVOT_YEAR_TIME_PARSING")),
+			"JETS_s3_INPUT_PREFIX":                     jsii.String(os.Getenv("JETS_s3_INPUT_PREFIX")),
+			"JETS_s3_OUTPUT_PREFIX":                    jsii.String(os.Getenv("JETS_s3_OUTPUT_PREFIX")),
+			"JETS_s3_STAGE_PREFIX":                     jsii.String(GetS3StagePrefix()),
+			"JETS_s3_SCHEMA_TRIGGERS":                  jsii.String(GetS3SchemaTriggersPrefix()),
+			"JETS_S3_KMS_KEY_ARN":                      jsii.String(os.Getenv("JETS_S3_KMS_KEY_ARN")),
+			"JETS_SENTINEL_FILE_NAME":                  jsii.String(os.Getenv("JETS_SENTINEL_FILE_NAME")),
+			"JETS_PIPELINE_THROTTLING_JSON":            jsii.String(os.Getenv("JETS_PIPELINE_THROTTLING_JSON")),
+			"JETS_CPIPES_SM_TIMEOUT_MIN":               jsii.String(os.Getenv("JETS_CPIPES_SM_TIMEOUT_MIN")),
+			"JETS_SERVER_SM_ARN":                       jsii.String(jsComp.ServerSmArn),
+			"JETS_SERVER_SM_ARNv2":                     jsii.String(jsComp.ServerSmArnv2),
+			"JETS_CPIPES_SM_ARN":                       jsii.String(jsComp.CpipesSmArn),
+			"JETS_CPIPES_NATIVE_SM_ARN":                jsii.String(jsComp.CpipesNativeSmArn),
+			"JETS_REPORTS_SM_ARN":                      jsii.String(jsComp.ReportsSmArn),
+			"CPIPES_STATUS_NOTIFICATION_ENDPOINT":      jsii.String(os.Getenv("CPIPES_STATUS_NOTIFICATION_ENDPOINT")),
+			"CPIPES_STATUS_NOTIFICATION_ENDPOINT_JSON": jsii.String(os.Getenv("CPIPES_STATUS_NOTIFICATION_ENDPOINT_JSON")),
+			"CPIPES_CUSTOM_FILE_KEY_NOTIFICATION":      jsii.String(os.Getenv("CPIPES_CUSTOM_FILE_KEY_NOTIFICATION")),
+			"CPIPES_START_NOTIFICATION_JSON":           jsii.String(os.Getenv("CPIPES_START_NOTIFICATION_JSON")),
+			"CPIPES_COMPLETED_NOTIFICATION_JSON":       jsii.String(os.Getenv("CPIPES_COMPLETED_NOTIFICATION_JSON")),
+			"CPIPES_FAILED_NOTIFICATION_JSON":          jsii.String(os.Getenv("CPIPES_FAILED_NOTIFICATION_JSON")),
+			"JETS_API_GATEWAY_LAMBDA_ASSUME_ROLE_ARN":  jsii.String(os.Getenv("JETS_API_GATEWAY_LAMBDA_ASSUME_ROLE_ARN")),
+			"TASK_MAX_CONCURRENCY":                     jsii.String(os.Getenv("TASK_MAX_CONCURRENCY")),
+			"NBR_SHARDS":                               jsii.String(props.NbrShards),
+			"ENVIRONMENT":                              jsii.String(os.Getenv("ENVIRONMENT")),
+			"WORKSPACES_HOME":                          jsii.String("/tmp/workspaces"),
+			"WORKSPACE":                                jsii.String(os.Getenv("WORKSPACE")),
+		},
+		MemorySize: jsii.Number(256), // start with 256mb, can be increased later if needed, also consider using AWS Lambda Power Tuning for optimal memory configuration
+		// EphemeralStorageSize: awscdk.Size_Mebibytes(jsii.Number(2048)),
+		Timeout:        awscdk.Duration_Minutes(jsii.Number(1)), // since the api gateway limits to 29 seconds
+		Role:           jsComp.LambdaExecutionRole,
+		Vpc:            jsComp.Vpc,
+		VpcSubnets:     jsComp.PrivateSubnetSelection,
+		SecurityGroups: &[]awsec2.ISecurityGroup{jsComp.VpcEndpointsSg, jsComp.RdsAccessSg, jsComp.InternetAccessSg},
+		LogGroup:       apiLambdaLogGroup,
+	})
+	if phiTagName != nil {
+		awscdk.Tags_Of(jsComp.ApiGatewayLambda).Add(phiTagName, jsii.String("false"), nil)
+	}
+	if piiTagName != nil {
+		awscdk.Tags_Of(jsComp.ApiGatewayLambda).Add(piiTagName, jsii.String("false"), nil)
+	}
+	if descriptionTagName != nil {
+		awscdk.Tags_Of(jsComp.ApiGatewayLambda).Add(descriptionTagName, jsii.String("JetStore lambda for api gateway"), nil)
+	}
+
+	// Grant read access to same account codecommit repo to Lambda role
+	codeCommitRepoArn := os.Getenv("JETS_API_GATEWAY_CODECOMMIT_REPO_ARN")
+	if len(codeCommitRepoArn) > 0 {
+		log.Println("Granting API Gateway Lambda access to CodeCommit repo:", codeCommitRepoArn)
+		jsComp.ApiGatewayLambda.AddToRolePolicy(awsiam.NewPolicyStatement(&awsiam.PolicyStatementProps{
+			Effect: awsiam.Effect_ALLOW,
+			Actions: &[]*string{
+				jsii.String("codecommit:GetFile"),
+				jsii.String("codecommit:ListBranches"),
+				jsii.String("codecommit:ListRepositories"),
+			},
+			Resources: &[]*string{
+				jsii.String(codeCommitRepoArn),
+			},
+		}))
+	}
+
+	// Grant cross account assume role permissions to Lambda execution role if env variable is set
+	assumeRoleArn := os.Getenv("JETS_API_GATEWAY_LAMBDA_ASSUME_ROLE_ARN")
+	if len(assumeRoleArn) > 0 {
+		log.Println("Granting API Gateway Lambda assume role permissions to:", assumeRoleArn)
+		jsComp.ApiGatewayLambda.AddToRolePolicy(awsiam.NewPolicyStatement(&awsiam.PolicyStatementProps{
+			Effect: awsiam.Effect_ALLOW,
+			Actions: &[]*string{
+				jsii.String("sts:AssumeRole"),
+			},
+			Resources: &[]*string{
+				jsii.String(assumeRoleArn),
+			},
+		}))
+	}
+
+	roleName := os.Getenv("JETS_API_GATEWAY_EXEC_ROLE_NAME")
+	if len(roleName) == 0 {
+		log.Println("error: env JETS_API_GATEWAY_EXEC_ROLE_NAME is not set, cannot deploy api gateway")
+		return
+	}
+
+	// Create system account IAM role to invoke API
+	jsComp.JetsApiExecutionRole = awsiam.NewRole(stack, jsii.String("SystemAccountRole"), &awsiam.RoleProps{
+		AssumedBy: awsiam.NewCompositePrincipal(
+			awsiam.NewAccountRootPrincipal(),
+		),
+		RoleName: jsii.String(roleName),
+	})
+
+	// Prepare the external roles that can assume the system role
+	externalPrincipals := make([]awsiam.IPrincipal, 0)
+	externalRolesEnv := os.Getenv("JETS_API_GATEWAY_EXTERNAL_ROLES_ARN")
+	if len(externalRolesEnv) > 0 {
+		for roleArn := range strings.SplitSeq(externalRolesEnv, ",") {
+			externalPrincipals = append(externalPrincipals, awsiam.NewArnPrincipal(jsii.String(roleArn)))
+		}
+	}
+
+	// Test lambda role
+	var testLambdaRole awsiam.Role
+	if deployTestLambda {
+		// Create test Lambda execution role with VPC access and assume role permissions
+		testLambdaRole = awsiam.NewRole(stack, jsii.String("TestLambdaExecutionRole"), &awsiam.RoleProps{
+			AssumedBy: awsiam.NewServicePrincipal(jsii.String("lambda.amazonaws.com"), nil),
+			ManagedPolicies: &[]awsiam.IManagedPolicy{
+				awsiam.ManagedPolicy_FromAwsManagedPolicyName(jsii.String("service-role/AWSLambdaBasicExecutionRole")),
+				awsiam.ManagedPolicy_FromAwsManagedPolicyName(jsii.String("service-role/AWSLambdaVPCAccessExecutionRole")),
+			},
+		})
+
+		// Allow test Lambda role to assume the system role
+		externalPrincipals = append(externalPrincipals, testLambdaRole)
+
+		// Grant assume role permission to test Lambda role
+		testLambdaRole.AddToPolicy(awsiam.NewPolicyStatement(&awsiam.PolicyStatementProps{
+			Effect: awsiam.Effect_ALLOW,
+			Actions: &[]*string{
+				jsii.String("sts:AssumeRole"),
+			},
+			Resources: &[]*string{
+				jsComp.JetsApiExecutionRole.RoleArn(),
+			},
+		}))
+	}
+
+	// Add external roles to assume the system role
+	if len(externalPrincipals) > 0 {
+		jsComp.JetsApiExecutionRole.AssumeRolePolicy().AddStatements(
+			awsiam.NewPolicyStatement(&awsiam.PolicyStatementProps{
+				Effect:     awsiam.Effect_ALLOW,
+				Principals: &externalPrincipals,
+				Actions: &[]*string{
+					jsii.String("sts:AssumeRole"),
+				},
+			}),
+		)
+	}
+
+	// Define resource policy for API Gateway
+	var resourcePolicy awsiam.PolicyDocument
+	policyJson := os.Getenv("JETS_API_GATEWAY_RESOURCE_POLICY_JSON")
+	if len(policyJson) > 0 {
+		// Use custom resource policy from environment variable
+		var policyDocument ApiGatewayProxyPolicyDocument
+		err := json.Unmarshal([]byte(policyJson), &policyDocument)
+		if err != nil {
+			log.Fatalf("error: failed to parse JETS_API_GATEWAY_RESOURCE_POLICY_JSON: %v\n", err)
+		}
+		// Build the statements of the policy
+		statements := make([]awsiam.PolicyStatement, 0)
+		for _, stmt := range policyDocument.Statement {
+			var principals *[]awsiam.IPrincipal
+			switch strings.ToLower(stmt.Principal) {
+			case "aws:*":
+				principals = &[]awsiam.IPrincipal{awsiam.NewAnyPrincipal()}
+			case "*":
+				principals = &[]awsiam.IPrincipal{awsiam.NewStarPrincipal()}
+			case "":
+				// No principals
+			default:
+				arnPrincipal := awsiam.NewArnPrincipal(jsii.String(stmt.Principal))
+				principals = &[]awsiam.IPrincipal{arnPrincipal}
+			}
+			var effect awsiam.Effect
+			switch strings.ToLower(stmt.Effect) {
+			case "allow":
+				effect = awsiam.Effect_ALLOW
+			case "deny":
+				effect = awsiam.Effect_DENY
+			default:
+				log.Fatalf("error: invalid effect '%s' in API Gateway resource policy\n", stmt.Effect)
+			}
+
+			policyStmt := awsiam.NewPolicyStatement(&awsiam.PolicyStatementProps{
+				Effect:     effect,
+				Principals: principals,
+				Actions: &[]*string{
+					jsii.String(stmt.Action),
+				},
+				Resources: &[]*string{
+					jsii.String(stmt.Resource),
+				},
+			})
+			statements = append(statements, policyStmt)
+		}
+		resourcePolicy = awsiam.NewPolicyDocument(&awsiam.PolicyDocumentProps{
+			Statements: &statements,
+		})
+	} else {
+		// Create the default resource policy for private API (only system role, not test lambda role)
+		resourcePolicy = awsiam.NewPolicyDocument(&awsiam.PolicyDocumentProps{
+			Statements: &[]awsiam.PolicyStatement{
+				awsiam.NewPolicyStatement(&awsiam.PolicyStatementProps{
+					Effect: awsiam.Effect_ALLOW,
+					Principals: &[]awsiam.IPrincipal{
+						jsComp.JetsApiExecutionRole, // Only system role in resource policy
+					},
+					Actions: &[]*string{
+						jsii.String("execute-api:Invoke"),
+					},
+					Resources: &[]*string{
+						jsii.String("*"),
+					},
+					Conditions: &map[string]any{
+						"StringEquals": map[string]any{
+							"aws:sourceVpce": jsComp.ApiGatewayVpcEndpoint.VpcEndpointId(),
+						},
+					},
+				}),
+				awsiam.NewPolicyStatement(&awsiam.PolicyStatementProps{
+					Effect: awsiam.Effect_DENY,
+					Principals: &[]awsiam.IPrincipal{
+						awsiam.NewAnyPrincipal(),
+					},
+					Actions: &[]*string{
+						jsii.String("execute-api:Invoke"),
+					},
+					Resources: &[]*string{
+						jsii.String("*"),
+					},
+					Conditions: &map[string]any{
+						"StringNotEquals": map[string]any{
+							"aws:sourceVpce": *jsComp.ApiGatewayVpcEndpoint.VpcEndpointId(),
+						},
+					},
+				}),
+			},
+		})
+	}
+
+	// Create private REST API
+	// Access log group for API Gateway stage
+	apiAccessLogGroup := awslogs.NewLogGroup(stack, jsii.String("ApiGatewayAccessLogs"), &awslogs.LogGroupProps{
+		Retention: awslogs.RetentionDays_THREE_MONTHS,
+	})
+
+	jsComp.JetsApi = awsapigateway.NewRestApi(stack, jsii.String("PrivateRestApi"), &awsapigateway.RestApiProps{
+		RestApiName: jsii.String("jetsapi"),
+		Description: jsii.String("JetStore Private REST API with Lambda integration"),
+		EndpointConfiguration: &awsapigateway.EndpointConfiguration{
+			Types: &[]awsapigateway.EndpointType{
+				awsapigateway.EndpointType_PRIVATE,
+			},
+			VpcEndpoints: &[]awsec2.IVpcEndpoint{jsComp.ApiGatewayVpcEndpoint},
+		},
+		Policy:         resourcePolicy,
+		CloudWatchRole: jsii.Bool(true),
+		DeployOptions: &awsapigateway.StageOptions{
+			LoggingLevel:         awsapigateway.MethodLoggingLevel_INFO,
+			DataTraceEnabled:     jsii.Bool(true),
+			MetricsEnabled:       jsii.Bool(true),
+			TracingEnabled:       jsii.Bool(true),
+			AccessLogDestination: awsapigateway.NewLogGroupLogDestination(apiAccessLogGroup),
+			AccessLogFormat:      awsapigateway.AccessLogFormat_Clf(),
+		},
+		DefaultMethodOptions: &awsapigateway.MethodOptions{
+			AuthorizationType: awsapigateway.AuthorizationType_IAM,
+		},
+	})
+
+	// Grant invoke permissions to system role
+	jsComp.JetsApiExecutionRole.AddToPolicy(awsiam.NewPolicyStatement(&awsiam.PolicyStatementProps{
+		Effect: awsiam.Effect_ALLOW,
+		Actions: &[]*string{
+			jsii.String("execute-api:Invoke"),
+		},
+		Resources: &[]*string{
+			jsii.String(*jsComp.JetsApi.ArnForExecuteApi(jsii.String("*"), jsii.String("/"), jsii.String("*"))),
+		},
+	}))
+
+	// Deploy test lambda
+	if deployTestLambda {
+		// Define the log group
+		apiTestLambdaLogGroup := awslogs.NewLogGroup(stack, jsii.String("ApiTestLambdaLogGroup"), &awslogs.LogGroupProps{
+			Retention: awslogs.RetentionDays_THREE_MONTHS,
+		})
+		// Define the lambda
+		jsComp.ApiGatewayTestLambda = awslambdago.NewGoFunction(stack, jsii.String("ApiTestLambda"), &awslambdago.GoFunctionProps{
+			Description: jsii.String("JetStore Test Lambda function API Gateway"),
+			Runtime:     awslambda.Runtime_PROVIDED_AL2023(),
+			Entry:       jsii.String("./lambdas/api_gateway/test_lambda"),
+			Bundling: &awslambdago.BundlingOptions{
+				GoBuildFlags: &[]*string{jsii.String(`-buildvcs=false -ldflags "-s -w"`)},
+			},
+			Environment: &map[string]*string{
+				"API_ENDPOINT":    jsComp.JetsApi.Url(),
+				"VPC_ENDPOINT_ID": jsComp.ApiGatewayVpcEndpoint.VpcEndpointId(),
+				"SYSTEM_ROLE_ARN": jsComp.JetsApiExecutionRole.RoleArn(),
+			},
+			Timeout:        awscdk.Duration_Minutes(jsii.Number(2)),
+			Role:           testLambdaRole,
+			Vpc:            jsComp.Vpc,
+			VpcSubnets:     jsComp.PrivateSubnetSelection,
+			SecurityGroups: &[]awsec2.ISecurityGroup{jsComp.VpcEndpointsSg, jsComp.RdsAccessSg, jsComp.InternetAccessSg},
+			LogGroup:       apiTestLambdaLogGroup,
+		})
+		if phiTagName != nil {
+			awscdk.Tags_Of(jsComp.ApiGatewayTestLambda).Add(phiTagName, jsii.String("false"), nil)
+		}
+		if piiTagName != nil {
+			awscdk.Tags_Of(jsComp.ApiGatewayTestLambda).Add(piiTagName, jsii.String("false"), nil)
+		}
+		if descriptionTagName != nil {
+			awscdk.Tags_Of(jsComp.ApiGatewayTestLambda).Add(descriptionTagName, jsii.String("JetStore test lambda for api gateway"), nil)
+		}
+	}
+
+	// Create Lambda integration
+	lambdaIntegration := awsapigateway.NewLambdaIntegration(
+		jsComp.ApiGatewayLambda, &awsapigateway.LambdaIntegrationOptions{})
+
+	// Add methods to API
+	jsComp.JetsApi.Root().AddMethod(jsii.String("GET"), lambdaIntegration, &awsapigateway.MethodOptions{
+		AuthorizationType: awsapigateway.AuthorizationType_IAM,
+	})
+	jsComp.JetsApi.Root().AddMethod(jsii.String("POST"), lambdaIntegration, &awsapigateway.MethodOptions{
+		AuthorizationType: awsapigateway.AuthorizationType_IAM,
+	})
+
+	// Add resource and methods
+	resource := jsComp.JetsApi.Root().AddResource(jsii.String("jetsapi"), nil)
+	resource.AddMethod(jsii.String("GET"), lambdaIntegration, &awsapigateway.MethodOptions{
+		AuthorizationType: awsapigateway.AuthorizationType_IAM,
+	})
+	resource.AddMethod(jsii.String("POST"), lambdaIntegration, &awsapigateway.MethodOptions{
+		AuthorizationType: awsapigateway.AuthorizationType_IAM,
+	})
+
+	// Grant invoke permissions to system account role
+	jsComp.ApiGatewayLambda.GrantInvoke(jsComp.JetsApiExecutionRole)
+
+	// Add important outputs
+	awscdk.NewCfnOutput(stack, jsii.String("ApiGatewayVpcEndpointId"), &awscdk.CfnOutputProps{
+		Value:       jsComp.ApiGatewayVpcEndpoint.VpcEndpointId(),
+		Description: jsii.String("JetStore Private API VPC Endpoint ID"),
+	})
+
+	awscdk.NewCfnOutput(stack, jsii.String("JetsApiUrl"), &awscdk.CfnOutputProps{
+		Value:       jsComp.JetsApi.Url(),
+		Description: jsii.String("JetStore Private API URL"),
+	})
+
+	awscdk.NewCfnOutput(stack, jsii.String("ApiExecutionRoleArn"), &awscdk.CfnOutputProps{
+		Value:       jsComp.JetsApiExecutionRole.RoleArn(),
+		Description: jsii.String("API Execution Role ARN"),
+	})
+
+	awscdk.NewCfnOutput(stack, jsii.String("ApiLambdaExecutionRoleArn"), &awscdk.CfnOutputProps{
+		Value:       jsComp.ApiGatewayLambda.Role().RoleArn(),
+		Description: jsii.String("API Lambda Execution Role ARN"),
+	})
+
+}

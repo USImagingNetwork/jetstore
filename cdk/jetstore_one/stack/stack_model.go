@@ -4,9 +4,11 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path"
 	"strings"
 
 	awscdk "github.com/aws/aws-cdk-go/awscdk/v2"
+	"github.com/aws/aws-cdk-go/awscdk/v2/awsapigateway"
 	"github.com/aws/aws-cdk-go/awscdk/v2/awsec2"
 	"github.com/aws/aws-cdk-go/awscdk/v2/awsecs"
 	awselb "github.com/aws/aws-cdk-go/awscdk/v2/awselasticloadbalancingv2"
@@ -16,6 +18,7 @@ import (
 	"github.com/aws/aws-cdk-go/awscdk/v2/awss3"
 	awssm "github.com/aws/aws-cdk-go/awscdk/v2/awssecretsmanager"
 	sfn "github.com/aws/aws-cdk-go/awscdk/v2/awsstepfunctions"
+	"github.com/aws/aws-cdk-go/awscdk/v2/awswafv2"
 	awslambdago "github.com/aws/aws-cdk-go/awscdklambdagoalpha/v2"
 	jsii "github.com/aws/jsii-runtime-go"
 )
@@ -40,13 +43,27 @@ func (props *JetstoreOneStackProps) MkId(name string) *string {
 	return &id
 }
 
+// Proxy policy document struct
+type ApiGatewayProxyPolicyDocument struct {
+	Version   string                           `json:"Version"`
+	Statement []ApiGatewayProxyPolicyStatement `json:"Statement"`
+}
+
+type ApiGatewayProxyPolicyStatement struct {
+	Effect    string `json:"Effect"`
+	Principal string `json:"Principal"`
+	Action    string `json:"Action"`
+	Resource  string `json:"Resource"`
+}
+
 // Struct to hold the stack components
 type JetStoreStackComponents struct {
-	LoaderSmArn   string
-	ServerSmArn   string
-	ServerSmArnv2 string
-	CpipesSmArn   string
-	ReportsSmArn  string
+	LoaderSmArn       string
+	ServerSmArn       string
+	ServerSmArnv2     string
+	CpipesSmArn       string
+	CpipesNativeSmArn string
+	ReportsSmArn      string
 
 	ApiSecret           awssm.Secret
 	AdminPwdSecret      awssm.Secret
@@ -56,12 +73,16 @@ type JetStoreStackComponents struct {
 	ExternalBuckets []awss3.IBucket
 	ExternalKmsKey  awskms.IKey
 
-	Vpc                     awsec2.Vpc
+	Vpc                     awsec2.IVpc
 	PublicSubnetSelection   *awsec2.SubnetSelection
 	PrivateSubnetSelection  *awsec2.SubnetSelection
 	IsolatedSubnetSelection *awsec2.SubnetSelection
 
-	PrivateSecurityGroup awsec2.SecurityGroup
+	VpcEndpointsSg   awsec2.ISecurityGroup
+	RdsAccessSg      awsec2.ISecurityGroup
+	InternetAccessSg awsec2.ISecurityGroup
+	// ElbInboundSg     awsec2.ISecurityGroup
+
 	RdsSecret            awsrds.DatabaseSecret
 	RdsCluster           awsrds.DatabaseCluster
 	EcsCluster           awsecs.Cluster
@@ -70,19 +91,39 @@ type JetStoreStackComponents struct {
 	JetStoreImage        awsecs.EcrImage
 	CpipesImage          awsecs.EcrImage
 
-	RunreportTaskDefinition awsecs.FargateTaskDefinition
-	RunreportsContainerDef  awsecs.ContainerDefinition
-	LoaderTaskDefinition    awsecs.FargateTaskDefinition
-	LoaderContainerDef      awsecs.ContainerDefinition
-	ServerTaskDefinition    awsecs.FargateTaskDefinition
-	ServerContainerDef      awsecs.ContainerDefinition
-	CpipesTaskDefinition    awsecs.FargateTaskDefinition
-	CpipesContainerDef      awsecs.ContainerDefinition
-	UiTaskDefinition        awsecs.FargateTaskDefinition
-	UiTaskContainer         awsecs.ContainerDefinition
-	EcsUiService            awsecs.FargateService
+	RunreportTaskDefinition    awsecs.FargateTaskDefinition
+	RunreportsContainerDef     awsecs.ContainerDefinition
 
-	UiLoadBalancer awselb.ApplicationLoadBalancer
+	LoaderTaskDefinition       awsecs.FargateTaskDefinition
+	LoaderContainerDef         awsecs.ContainerDefinition
+	
+	ServerTaskDefinition       awsecs.FargateTaskDefinition
+	ServerContainerDef         awsecs.ContainerDefinition
+	
+	Serverv2TaskDefinition     awsecs.FargateTaskDefinition
+	Serverv2ContainerDef       awsecs.ContainerDefinition
+	
+	CpipesTaskDefinition       awsecs.FargateTaskDefinition
+	CpipesContainerDef         awsecs.ContainerDefinition
+	
+	UiTaskDefinition           awsecs.FargateTaskDefinition
+	UiTaskContainer            awsecs.ContainerDefinition
+	EcsUiService               awsecs.FargateService
+
+	UiLoadBalancer    awselb.ApplicationLoadBalancer
+	WebAcl            awswafv2.CfnWebACL
+	WebACLAssociation awswafv2.CfnWebACLAssociation
+
+	ApiGatewayVpcEndpoint awsec2.IInterfaceVpcEndpoint
+	JetsApi               awsapigateway.RestApi
+	JetsApiExecutionRole  awsiam.Role
+
+	DeployCpipesNative bool
+
+	// Lambdas Execution Role
+	// applicable to: RunReportsLambda, CpipesRunReportsLambda, CpipesNodeLambda, CpipesNativeNodeLambda,
+	// CpipesStartShardingLambda, CpipesStartReducingLambda, SqsRegisterKeyLambda, ApiGatewayLambda
+	LambdaExecutionRole       awsiam.Role
 
 	StatusUpdateLambda        awslambdago.GoFunction
 	SecretRotationLambda      awslambdago.GoFunction
@@ -91,17 +132,21 @@ type JetStoreStackComponents struct {
 	PurgeDataLambda           awslambdago.GoFunction
 	serverv2NodeLambda        awslambdago.GoFunction
 	CpipesNodeLambda          awslambdago.GoFunction
+	CpipesNativeNodeLambda    awslambdago.GoFunction
 	CpipesStartShardingLambda awslambdago.GoFunction
 	CpipesStartReducingLambda awslambdago.GoFunction
 	RegisterKeyV2Lambda       awslambdago.GoFunction
 	SqsRegisterKeyLambda      awslambdago.GoFunction
+	ApiGatewayLambda          awslambdago.GoFunction
+	ApiGatewayTestLambda      awslambdago.GoFunction
 
-	LoaderSM    sfn.StateMachine
-	ReportsSM   sfn.StateMachine
-	ServerSM    sfn.StateMachine
-	Serverv2SM  sfn.StateMachine
-	CpipesSM    sfn.StateMachine
-	BastionHost awsec2.BastionHostLinux
+	LoaderSM       sfn.StateMachine
+	ReportsSM      sfn.StateMachine
+	ServerSM       sfn.StateMachine
+	Serverv2SM     sfn.StateMachine
+	CpipesSM       sfn.StateMachine
+	CpipesNativeSM sfn.StateMachine
+	BastionHost    awsec2.BastionHostLinux
 }
 
 func MkCatchProps() *sfn.CatchProps {
@@ -125,6 +170,24 @@ func GetS3SchemaTriggersPrefix() string {
 		return prefix
 	}
 	return strings.Replace(os.Getenv("JETS_s3_INPUT_PREFIX"), "/input", "/schema_triggers", 1)
+}
+
+func (jsComp *JetStoreStackComponents) JetsTempData() string {
+	var jetsTempData string
+	jetsTempData = os.Getenv("JETS_TEMP_DATA")
+	if jetsTempData == "" {
+		jetsTempData = "/jetsdata"
+	}
+	return jetsTempData
+}
+
+func (jsComp *JetStoreStackComponents) TempDir() string {
+	var tmpDir string
+	tmpDir = os.Getenv("TMPDIR")
+		if tmpDir == "" {
+		tmpDir = path.Join(jsComp.JetsTempData(), "tmp")
+	}
+	return tmpDir
 }
 
 func (jsComp *JetStoreStackComponents) ResolveExternalBuckets(stack awscdk.Stack) {
@@ -154,7 +217,7 @@ func (jsComp *JetStoreStackComponents) ResolveExternalKmsKey(stack awscdk.Stack)
 }
 
 func (jsComp *JetStoreStackComponents) GrantReadWriteFromExternalBuckets(stack awscdk.Stack, identity awsiam.IGrantable) {
-	if jsComp.ExternalBuckets == nil {
+	if len(jsComp.ExternalBuckets) == 0 {
 		return
 	}
 	for _, ibucket := range jsComp.ExternalBuckets {

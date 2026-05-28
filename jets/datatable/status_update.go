@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/artisoft-io/jetstore/jets/utils"
 	"github.com/jackc/pgx/v4"
 	"github.com/jackc/pgx/v4/pgxpool"
 )
@@ -207,15 +208,30 @@ func DoNotifyApiGateway(fileKey, apiEndpoint, apiEndpointJson, notificationTempl
 	}
 
 	// Do substitution using key/value provided by cpipes config and main schema provider
+	replaceEnv:
 	for key, value := range envSettings {
 		str, ok := value.(string)
-		if ok && strings.HasPrefix(key, "$") {
-			notificationTemplate = strings.ReplaceAll(notificationTemplate, fmt.Sprintf("{{%s}}", key[1:]), str)
+		if ok {
+			var replace string
+			switch {
+			case strings.HasPrefix(key, "${"):
+				replace = fmt.Sprintf("{%s}", key[1:])
+			case strings.HasPrefix(key, "$"):
+				replace = fmt.Sprintf("{{%s}}", key[1:])
+			default:
+				continue replaceEnv
+			}			
+			notificationTemplate = strings.ReplaceAll(notificationTemplate, replace, str)
 			if len(apiEndpoint) == 0 {
-				apiEndpointJson = strings.ReplaceAll(apiEndpointJson, fmt.Sprintf("{{%s}}", key[1:]), str)
+				apiEndpointJson = strings.ReplaceAll(apiEndpointJson, replace, str)
 			}
 		}
 	}
+	// remove residual unreplaced placeholder in the template to avoid confusion on the receiving end
+	notificationTemplate = utils.RemoveUnreplacedPlaceholder(notificationTemplate)
+	apiEndpointJson = utils.RemoveUnreplacedPlaceholder(apiEndpointJson)
+	log.Println("Final notificationTemplate after substitution:", notificationTemplate)
+	log.Println("Final apiEndpointJson after substitution:", apiEndpointJson)
 
 	// Identify the endpoint where to send the request
 	if len(apiEndpoint) == 0 {
@@ -287,7 +303,8 @@ func (ca *StatusUpdate) CoordinateWork() error {
 		return fmt.Errorf("error: StatusUpdate.CoordinateWork is expecting to have an opened db connections")
 	}
 
-	// Need to get the main input schema provider to see if there is an override on the notification template
+	// Need to get the main input schema provider to see if there is an override on the notification template and
+	// it is needed to register db_table as input source when specified by env var ${REGISTER_DB_TABLE}
 	// Getting session id as well, so doing the call even if apiEndpoint is not specified
 	schemaProviderJson, sessionId, err := GetSchemaProviderJsonFromPipelineKey(ca.Dbpool, ca.PeKey)
 	log.Printf("%s Status '%s' for %s\n", sessionId, ca.Status, ca.FileKey)
@@ -372,6 +389,8 @@ func (ca *StatusUpdate) CoordinateWork() error {
 		log.Printf("%s %s\n", sessionId, err)
 		return err
 	}
+	var isJetsLoader bool
+
 	if ca.CpipesMode {
 		// Put cpipes run stats in cpipes_execution_status_details table
 		// this is to track file size and help set the thresholds for nbr_nodes (nbr_nodes_lookup)
@@ -383,6 +402,7 @@ func (ca *StatusUpdate) CoordinateWork() error {
 				nbr_nodes,
 				total_input_files_size_mb,
 				total_input_records_count,
+				total_input_bad_records_count,
 				total_output_records_count
 			) (
 				SELECT 
@@ -392,6 +412,7 @@ func (ca *StatusUpdate) CoordinateWork() error {
 					count(*) AS nbr_nodes,
 					sum(ped.input_files_size_mb) AS total_input_files_size_mb,
 					sum(ped.input_records_count) AS total_input_records_count,
+					sum(ped.input_bad_records_count) AS total_input_bad_records_count,
 					sum(ped.output_records_count) AS total_output_records_count
 				FROM jetsapi.pipeline_execution_details ped,
 					jetsapi.pipeline_execution_status pe
@@ -404,38 +425,84 @@ func (ca *StatusUpdate) CoordinateWork() error {
 			)`
 		_, err = ca.Dbpool.Exec(context.Background(), stmt, ca.PeKey)
 		if err != nil {
-			return fmt.Errorf("while inserting in jetsapi.cpipes_execution_status_details: %v", err)
+			err = fmt.Errorf("while inserting in jetsapi.cpipes_execution_status_details: %v", err)
+			log.Printf("%s %s\n", sessionId, err)
+			return err
+		}
+		ilkey := ca.CpipesEnv["$INPUT_LOADER_STATUS_KEY"]
+		if ilkey != nil {
+			// Update input_loader_status since process is "Jets_Loader"
+			// log.Printf("%s Updating input_loader_status status to '%s' for key %v\n", sessionId, ca.Status, ilkey)
+			stmt := `
+				UPDATE jetsapi.input_loader_status
+				SET
+					status = $1,
+					load_count = es.total_input_records_count,
+					bad_row_count = es.total_input_bad_records_count,
+          error_message = $2,
+					last_update = DEFAULT
+				FROM jetsapi.cpipes_execution_status_details AS es
+				WHERE	es.session_id = $3
+				  AND input_loader_status.key = $4
+				;`
+			_, err = ca.Dbpool.Exec(context.Background(), stmt, ca.Status, ca.FailureDetails, sessionId, ilkey)
+			if err != nil {
+				log.Printf("%s while updating input_loader_status status:%s\n", sessionId, err)
+				err = fmt.Errorf("while updating input_loader_status status: %v", err)
+				return err
+			}
+			// Register origin file to input_registry since process is "Jets_Loader"
+			isJetsLoader = true
+			// log.Printf("%s Registering origin file input source in input_registry for Jets_Loader session_id %s\n", sessionId, sessionId)
+			err = ca.RegisterFileInputSource()
+			if err != nil {
+				log.Printf("%s while registering file to input_registry: %v\n", sessionId, err)
+				return fmt.Errorf("while registering file to input_registry: %v", err)
+			}
 		}
 	}
-	// Check for pending tasks ready to start
-	// Get the stateMachineName of the current task
-	var stateMachineName string
-	err = ca.Dbpool.QueryRow(context.Background(),
-		`SELECT pc.state_machine_name	FROM jetsapi.process_config pc, jetsapi.pipeline_execution_status pe 
-		   WHERE pc.process_name = pe.process_name AND pe.key = $1`,
-		ca.PeKey).Scan(&stateMachineName)
-	if err != nil {
-		return fmt.Errorf("while queryRow on pipeline_execution_status failed: %v", err)
-	}
-	ctx := NewDataTableContext(ca.Dbpool, ca.UsingSshTunnel, ca.UsingSshTunnel, nil, nil)
-	err = ctx.StartPendingTasks(stateMachineName)
-	if err != nil {
-		log.Printf("%s Warning: while starting pending task: %v", sessionId, err)
-		err = nil
-	}
 
-	// Register outTables
-	outTables, err := GetOutputTables(ca.Dbpool, ca.PeKey)
-	if err != nil {
-		log.Printf("%s while getting output tables: %v", sessionId, err)
-		return err
-	}
-	// Register out tables
-	if ca.Status != "failed" && len(outTables) > 0 && getOutputRecordCount(ca.Dbpool, ca.PeKey) > 0 {
-		err = RegisterDomainTables(ca.Dbpool, ca.UsingSshTunnel, ca.PeKey)
+	if !isJetsLoader {
+		// Check for pending tasks ready to start
+		ctx := NewDataTableContext(ca.Dbpool, ca.UsingSshTunnel, ca.UsingSshTunnel, nil, nil)
+		err = ctx.StartPendingTasks()
 		if err != nil {
-			log.Printf("%s while registrying output tables: %v", sessionId, err)
-			return fmt.Errorf("while registrying out tables to input_registry: %v", err)
+			log.Printf("%s Warning: while starting pending task: %v", sessionId, err)
+			err = nil
+		}
+		// Register outTables
+		outTables, err := GetOutputTables(ca.Dbpool, ca.PeKey)
+		if err != nil {
+			log.Printf("%s while getting output tables: %v", sessionId, err)
+			return err
+		}
+		// Register out tables
+		if ca.Status != "failed" && len(outTables) > 0 && getOutputRecordCount(ca.Dbpool, ca.PeKey) > 0 {
+			err = ca.RegisterDomainTables()
+			if err != nil {
+				log.Printf("%s while registrying output tables: %v", sessionId, err)
+				return fmt.Errorf("while registrying out tables to input_registry: %v", err)
+			}
+		}
+		registerDbTable := ca.CpipesEnv["${REGISTER_DB_TABLE}"]
+		log.Println("Env var ${REGISTER_DB_TABLE}:", registerDbTable)
+		if registerDbTable != nil && ca.Status != "failed" {
+			doIt, err := utils.ToIntWithEnv(registerDbTable, ca.CpipesEnv)
+			if err != nil {
+				err := fmt.Errorf("%s while parsing ${REGISTER_DB_TABLE} value '%v' to int: %v. Will skip registering db_table to input_registry", sessionId, registerDbTable, err)
+				log.Println(err)
+				return err
+			}
+			if doIt != 0 {
+				// Register db_table and session in input_registry
+				err = ca.RegisterDbTableInputSource(schemaProviderJson)
+				if err != nil {
+					log.Printf("%s while registering db_table to input_registry: %v", sessionId, err)
+					return fmt.Errorf("while registering db_table to input_registry: %v", err)
+				}
+			} else {
+				log.Printf("%s Skipping registering db_table to input_registry since ${REGISTER_DB_TABLE} is set to %v which is not a non zero int", sessionId, registerDbTable)
+			}
 		}
 	}
 
