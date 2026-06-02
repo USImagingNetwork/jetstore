@@ -95,6 +95,7 @@ nextAction:
 		case string:
 			upperValue := strings.ToUpper(vv)
 			if upperValue == "NULL" {
+				(*input)[action.inputColumn] = nil
 				continue nextAction
 			}
 			if ctx.blankMarkers != nil {
@@ -103,6 +104,7 @@ nextAction:
 					txt = &vv
 				}
 				if slices.Contains(ctx.blankMarkers.Markers, *txt) {
+					(*input)[action.inputColumn] = nil
 					continue nextAction
 				}
 			}
@@ -226,6 +228,8 @@ nextAction:
 					if ctx.setAllDatesToJan1 {
 						month = time.January
 					}
+				case "date_to_jan1":
+					month = time.January
 				}
 
 				anonymizeDate := time.Date(year, month, 1, 0, 0, 0, 0, time.UTC)
@@ -267,12 +271,18 @@ nextAction:
 		switch vv := value.(type) {
 		case string:
 			if strings.ToUpper(vv) == "NULL" {
+				(*input)[icol] = nil
 				continue
 			}
 			inputStr = vv
 		default:
 			inputStr = fmt.Sprintf("%v", vv)
 		}
+		if slices.Contains(ctx.blankMarkers.Markers, inputStr) {
+			(*input)[icol] = nil
+			continue
+		}
+
 		ctx.hasher.Reset()
 		ctx.hasher.Write([]byte(inputStr))
 		hashedValue = fmt.Sprintf("%016x", ctx.hasher.Sum64())
