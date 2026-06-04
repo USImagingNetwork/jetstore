@@ -1,6 +1,7 @@
 package rete
 
 import (
+	"slices"
 	"encoding/json"
 	"log"
 	"os"
@@ -10,9 +11,21 @@ import (
 // This component list the main rule files of the workspace,
 // known as ruleSets, and the ruleSeq which are sequences
 // of ruleSets.
+
+// WorkspaceControl defines the main rule files and rule sequences of a workspace
+// This is currently user authored and stored in workspace_control.json
+// in the root of the workspace directory.
+// UseCompilerV2 indicates if the workspace should be compiled with the v2 compiler.
+// UseTraceMode indicates if the workspace should be compiled with tracing enabled (applied to v2)
+// AutoAddResources indicates if resources in rules should be automatically added when not explicitly defined
+// in the resource section of the rule file. (applied to v2)
 type WorkspaceControl struct {
-	RuleSets      []string       `json:"rule_sets"`
-	RuleSequences []RuleSequence `json:"rule_sequences"`
+	WorkspaceName    string         `json:"workspace_name,omitempty"`
+	UseCompilerV2    bool           `json:"use_compiler_v2,omitzero"`
+	UseTraceMode     bool           `json:"use_trace_mode,omitzero"`
+	AutoAddResources bool           `json:"auto_add_resources,omitzero"`
+	RuleSets         []string       `json:"rule_sets,omitempty"`
+	RuleSequences    []RuleSequence `json:"rule_sequences,omitempty"`
 }
 
 func NewWorkspaceControl(ruleSets []string, ruleSequences []RuleSequence) *WorkspaceControl {
@@ -51,7 +64,7 @@ func LoadWorkspaceControl(fpath string) (*WorkspaceControl, error) {
 
 // Provide rule file names (ending in .jr) for a logical ruleFileName
 // which may correspong to a RuleSequence or an individual main rule file.
-func (wc *WorkspaceControl) MainRuleFileNames(ruleFileName string) []string {
+func (wc *WorkspaceControl) RuleFileNames(ruleFileName string) []string {
 	if wc == nil {
 		return nil
 	}
@@ -60,10 +73,22 @@ func (wc *WorkspaceControl) MainRuleFileNames(ruleFileName string) []string {
 			return wc.RuleSequences[i].RuleSets
 		}
 	}
-	for i := range wc.RuleSets {
-		if wc.RuleSets[i] == ruleFileName {
+	if slices.Contains(wc.RuleSets, ruleFileName) {
 			return []string{ruleFileName}
 		}
-	}
 	return nil
+}
+
+// Check if a rule file name corresponds to a RuleSequence
+// returns false otherwise (single ruleset or if workspace control is nil)
+func (wc *WorkspaceControl) IsRuleSequence(ruleFileName string) bool {
+	if wc == nil {
+		return false
+	}
+	for i := range wc.RuleSequences {
+		if wc.RuleSequences[i].Name == ruleFileName {
+			return true
+		}
+	}
+	return false
 }

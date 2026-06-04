@@ -10,6 +10,7 @@ import (
 
 	"github.com/artisoft-io/jetstore/cdk/jetstore_one/lambdas/dbc"
 	"github.com/artisoft-io/jetstore/jets/compute_pipes"
+	"github.com/artisoft-io/jetstore/jets/compute_pipes/jetrules_go_adaptor"
 	"github.com/aws/aws-lambda-go/lambda"
 )
 
@@ -24,6 +25,18 @@ import (
 // JETS_REGION
 // NBR_SHARDS default nbr_nodes of cluster
 // JETS_S3_KMS_KEY_ARN
+
+type JetRulesProxyImpl struct {
+}
+func (j *JetRulesProxyImpl) GetDefaultFactory() compute_pipes.JetRulesFactory {
+	return jetrules_go_adaptor.NewJetRulesFactory()
+}
+func (j *JetRulesProxyImpl) GetGoFactory() compute_pipes.JetRulesFactory {
+	return jetrules_go_adaptor.NewJetRulesFactory()
+}
+func (j *JetRulesProxyImpl) GetNativeFactory() compute_pipes.JetRulesFactory {
+	return nil
+}
 
 var dbPoolSize int
 var awsRegion string
@@ -91,5 +104,6 @@ func handler(ctx context.Context, arg compute_pipes.ComputePipesNodeArgs) error 
 	if err != nil {
 		return fmt.Errorf("while checking if db credential have been updated: %v", err)
 	}
-	return (&arg).CoordinateComputePipes(ctx, dbpool)
+
+	return (&arg).CoordinateComputePipes(ctx, dbpool, &JetRulesProxyImpl{})
 }

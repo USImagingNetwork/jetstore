@@ -13,12 +13,14 @@ import (
 )
 
 // Start process based on matching criteria:
-//   - find pipelines that are ready to start with the input input_registry key.
+//   - find pipelines that are ready to start with the input_registry key.
 //   - Pipeline must have automated flag on
 //
 // Note: the argument inputSessionId is the inputRegistryKey sessionId
 func (ctx *DataTableContext) StartPipelinesForInputRegistryV2(inputRegistryKey, sourcePeriodKey int,
 	inputSessionId, client, objectType, fileKey, token string) error {
+
+	log.Printf("%s StartPipelinesForInputRegistryV2 called with inputRegistryKey %d", inputSessionId, inputRegistryKey)
 
 	processInputKeys, err := getProcessInputKeys(ctx.Dbpool, inputRegistryKey)
 	if err != nil {
@@ -113,6 +115,11 @@ pipelineConfigLoop:
 			// Submit the pipeline
 			// Reserve a session_id
 			sessionId, err := reserveSessionId(ctx.Dbpool, &baseSessionId)
+			if err != nil {
+				return err
+			}
+			// Get the FileKey for the main input
+			fileKey, err := getFileKeyForInputRegistry(ctx.Dbpool, mainIr)
 			if err != nil {
 				return err
 			}
@@ -241,6 +248,23 @@ func getPipelineConfig(dbpool *pgxpool.Pool, processInputKeys []int) ([]pipeline
 		})
 	}
 	return results, rows.Err()
+}
+
+// Get the file_key for the input_registry key, if any
+func getFileKeyForInputRegistry(dbpool *pgxpool.Pool, inputRegistryKey int) (string, error) {
+	stmt := `SELECT file_key FROM jetsapi.input_registry WHERE key = $1`
+	var fileKey sql.NullString
+	err := dbpool.QueryRow(context.TODO(), stmt, inputRegistryKey).Scan(&fileKey)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return "", nil
+		}
+		return "", err
+	}
+	if fileKey.Valid {
+		return fileKey.String, nil
+	}
+	return "", nil
 }
 
 // Return a slice of pair (piKey, irKey)

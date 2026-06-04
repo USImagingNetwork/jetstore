@@ -9,7 +9,9 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/artisoft-io/jetstore/jets/datatable"
 	"github.com/artisoft-io/jetstore/jets/workspace"
 	"github.com/jackc/pgx/v4/pgxpool"
 )
@@ -21,30 +23,89 @@ func init() {
 	wsPrefix = os.Getenv("WORKSPACE")
 }
 
+func WorkspaceHome() string {
+	return workspaceHome
+}
+
+func WorkspacePrefix() string {
+	return wsPrefix
+}
+
 // Collect and prepare cpipes configuration for both sharding and reducing steps.
 // InputColumns correspond to the domain column in the main input file, which
 // can be a subset of the columns in the main_input schema provider based on
 // source_config table.
 // InputColumns can be empty if needs to be read from the input file.
+// InputColumnsOriginal is the original input columns before uniquefying them.
+// It is empty if InputColumns is empty or already unique.
 // MainInputDomainKeysSpec contains the domain keys spec based on source_config
 // table, which can be overriden by value from the main schema provider.
 // MainInputDomainClass applies when input_registry.input_type = 'domain_table'
 type CpipesStartup struct {
-	CpConfig                      ComputePipesConfig
-	ProcessName                   string
-	InputColumns                  []string
-	MainInputSchemaProviderConfig *SchemaProviderSpec
-	MainInputDomainKeysSpec       *DomainKeysSpec
-	MainInputDomainClass          string
-	DomainKeysSpecByClass         map[string]*DomainKeysSpec
-	EnvSettings                   map[string]any
-	PipelineConfigKey             int
-	InputSessionId                string
-	SourcePeriodKey               int
-	OperatorEmail                 string
+	CpConfig                      ComputePipesConfig         `json:"compute_pipes_config"`
+	ProcessName                   string                     `json:"process_name,omitempty"`
+	InputColumns                  []string                   `json:"input_columns,omitempty"`
+	InputColumnsOriginal          []string                   `json:"input_columns_original,omitempty"`
+	MainInputSchemaProviderConfig *SchemaProviderSpec        `json:"main_input_schema_provider_config,omitzero"`
+	MainInputDomainKeysSpec       *DomainKeysSpec            `json:"main_input_domain_keys_spec,omitzero"`
+	MainInputDomainClass          string                     `json:"main_input_domain_class,omitempty"`
+	DomainKeysSpecByClass         map[string]*DomainKeysSpec `json:"domain_keys_spec_by_class,omitzero"`
+	EnvSettings                   map[string]any             `json:"env_settings,omitzero"`
+	PipelineConfigKey             int                        `json:"pipeline_config_key,omitempty"`
+	InputSessionId                string                     `json:"input_session_id,omitempty"`
+	SourcePeriodKey               int                        `json:"source_period_key,omitempty"`
+	OperatorEmail                 string                     `json:"operator_email,omitempty"`
 }
 
-func (args *StartComputePipesArgs) initializeCpipes(ctx context.Context, dbpool *pgxpool.Pool) (*CpipesStartup, error) {
+func (args *StartComputePipesArgs) reducingInitializeCpipes(ctx context.Context, dbpool *pgxpool.Pool) (*CpipesStartup, error) {
+	// Get the cpipes startup info from cpipes_execution_status table
+	stmt := "SELECT cpipes_startup_json, input_parquet_schema_json, input_row_columns_json FROM jetsapi.cpipes_execution_status WHERE session_id = $1"
+	var cpipesStartupJson string
+	var inputParquetSchemaJson string
+	var inputRowColumnsJson string
+	var cpipesStartup = CpipesStartup{}
+	err := dbpool.QueryRow(ctx, stmt, args.SessionId).Scan(&cpipesStartupJson, &inputParquetSchemaJson, &inputRowColumnsJson)
+	if err != nil {
+		return nil, fmt.Errorf("error while getting cpipes startup info: %v", err)
+	}
+
+	// Unmarshal the cpipesStartupJson
+	err = json.Unmarshal([]byte(cpipesStartupJson), &cpipesStartup)
+	if err != nil {
+		return nil, fmt.Errorf("error while unmarshalling cpipes startup json: %v", err)
+	}
+
+	// Connect the MainInputSchemaProviderConfig pointer
+	cpipesStartup.MainInputSchemaProviderConfig = GetSchemaProviderConfigBySourceType(cpipesStartup.CpConfig.SchemaProviders, "main_input")
+	if cpipesStartup.MainInputSchemaProviderConfig == nil {
+		return nil, fmt.Errorf("error: main_input schema provider not found in cpipes config")
+	}
+
+	// Unmarshal the inputParquetSchemaJson into MainInputSchemaProvider.ParquetSchema
+	var schema ParquetSchemaInfo
+	err = json.Unmarshal([]byte(inputParquetSchemaJson), &schema)
+	if err != nil {
+		return nil, fmt.Errorf("while unmarshalling input_parquet_schema_json ->%s<-: %v", inputParquetSchemaJson, err)
+	}
+	if len(schema.Fields) > 0 {
+		cpipesStartup.MainInputSchemaProviderConfig.ParquetSchema = &schema
+	}
+
+	// Unmarshal the inputRowColumnsJson into InputColumns and InputColumnsOriginal
+	var inputRowColumns InputRowColumns
+	err = json.Unmarshal([]byte(inputRowColumnsJson), &inputRowColumns)
+	if err != nil {
+		return nil, fmt.Errorf("while unmarshalling input_row_columns_json ->%s<-: %v", inputRowColumnsJson, err)
+	}
+	cpipesStartup.InputColumns = inputRowColumns.MainInput
+	cpipesStartup.InputColumnsOriginal = inputRowColumns.OriginalHeaders
+
+	// Set the Cpipes env settings to be the same as the  schema provider env
+	cpipesStartup.EnvSettings = cpipesStartup.MainInputSchemaProviderConfig.Env
+	return &cpipesStartup, nil
+}
+
+func (args *StartComputePipesArgs) shardingInitializeCpipes(ctx context.Context, dbpool *pgxpool.Pool) (*CpipesStartup, error) {
 	cpipesStartup := &CpipesStartup{}
 	var err error
 
@@ -57,34 +118,33 @@ func (args *StartComputePipesArgs) initializeCpipes(ctx context.Context, dbpool 
 	// get pe info and pipeline config
 	// cpipesConfigFN is cpipes config file name within workspace
 	// tableName is the input_registry.table_name, needed when source_type = 'domain_table' since it correspond to className
-	var client, org, objectType, inputFormat, compression, tableName, sourceType string
+	// Read schema_provider_json from source_config and env_json from process_config.
+	var client, org, objectType, tableName, sourceType string
 	var schemaProviderJson string
-	var isPartFile int
-	var cpipesConfigFN, icJson, icPosCsv, icDomainKeys, inputFormatDataJson sql.NullString
+	var cpipesConfigFN, envJson sql.NullString
+	var monthPeriod, weekPeriod, dayPeriod int
+	var year, month, day int
 	log.Println("CPIPES, loading pipeline configurations")
 	stmt := `
 	SELECT	ir.client, ir.org, ir.object_type, ir.source_period_key, ir.schema_provider_json, 
 		ir.table_name, ir.source_type,
 		pe.pipeline_config_key, pe.process_name, pe.input_session_id, pe.user_email,
-		sc.input_columns_json, sc.input_columns_positions_csv, sc.domain_keys_json, 
-		sc.input_format, sc.compression, sc.is_part_files, sc.input_format_data_json,
-		pc.main_rules
+		pc.main_rules, pc.env_json,
+		sp.month_period, sp.week_period, sp.day_period,
+		sp.year, sp.month, sp.day
 	FROM 
 		jetsapi.pipeline_execution_status pe,
 		jetsapi.input_registry ir,
-		jetsapi.source_config sc,
-		jetsapi.process_config pc
+		jetsapi.process_config pc,
+		jetsapi.source_period sp
 	WHERE pe.main_input_registry_key = ir.key
 		AND pe.key = $1
-		AND sc.client = ir.client
-		AND sc.org = ir.org
-		AND sc.object_type = ir.object_type
-		AND pc.process_name = pe.process_name`
+		AND pc.process_name = pe.process_name
+		AND sp.key = ir.source_period_key`
 	err = dbpool.QueryRow(ctx, stmt, args.PipelineExecKey).Scan(
 		&client, &org, &objectType, &cpipesStartup.SourcePeriodKey, &schemaProviderJson, &tableName, &sourceType,
 		&cpipesStartup.PipelineConfigKey, &cpipesStartup.ProcessName, &cpipesStartup.InputSessionId, &cpipesStartup.OperatorEmail,
-		&icJson, &icPosCsv, &icDomainKeys, &inputFormat, &compression, &isPartFile, &inputFormatDataJson,
-		&cpipesConfigFN)
+		&cpipesConfigFN, &envJson, &monthPeriod, &weekPeriod, &dayPeriod, &year, &month, &day)
 	if err != nil {
 		return cpipesStartup, fmt.Errorf("query pipeline configurations failed: %v", err)
 	}
@@ -103,7 +163,179 @@ func (args *StartComputePipesArgs) initializeCpipes(ctx context.Context, dbpool 
 		return cpipesStartup, fmt.Errorf("while unmarshaling compute pipes json (initializeCpipes): %s", err)
 	}
 
+	// Get the schema provider from schemaProviderJson:
+	//   - Populate the input columns (cpipesStartup.InputColumns)
+	//   - Populate inputFormat, compression, delimiter, detect_encoding
+	//   - Populate inputFormatDataJson for xlsx
+	//   - Put SchemaName into env (done in CoordinateComputePipes)
+	//   - Put the schema provider in compute pipes json
+	// First find if a schema provider already exist for "main_input"
+	cpipesStartup.MainInputSchemaProviderConfig = GetSchemaProviderConfigBySourceType(cpipesStartup.CpConfig.SchemaProviders, "main_input")
+	if cpipesStartup.MainInputSchemaProviderConfig == nil {
+		// Create and initialize a default SchemaProviderSpec
+		cpipesStartup.MainInputSchemaProviderConfig = &SchemaProviderSpec{
+			Type:       "default",
+			Key:        "_main_input_",
+			SourceType: "main_input",
+			Client:     client,
+			Vendor:     org,
+			ObjectType: objectType,
+			Env:        make(map[string]any),
+		}
+		if cpipesStartup.CpConfig.SchemaProviders == nil {
+			cpipesStartup.CpConfig.SchemaProviders = make([]*SchemaProviderSpec, 0)
+		}
+		cpipesStartup.CpConfig.SchemaProviders = append(cpipesStartup.CpConfig.SchemaProviders, cpipesStartup.MainInputSchemaProviderConfig)
+	} else {
+		// Initialize unspecified value in main schema provider using the source_config table values
+		if cpipesStartup.MainInputSchemaProviderConfig.Client == "" {
+			cpipesStartup.MainInputSchemaProviderConfig.Client = client
+		}
+		if cpipesStartup.MainInputSchemaProviderConfig.Vendor == "" {
+			cpipesStartup.MainInputSchemaProviderConfig.Vendor = org
+		}
+		if cpipesStartup.MainInputSchemaProviderConfig.ObjectType == "" {
+			cpipesStartup.MainInputSchemaProviderConfig.ObjectType = objectType
+		}
+		if cpipesStartup.MainInputSchemaProviderConfig.Bucket == "" {
+			cpipesStartup.MainInputSchemaProviderConfig.Bucket = bucketName
+		}
+		if cpipesStartup.MainInputSchemaProviderConfig.FileKey == "" {
+			cpipesStartup.MainInputSchemaProviderConfig.FileKey = args.FileKey
+		}
+	}
+	mainInputSchemaProvider := cpipesStartup.MainInputSchemaProviderConfig
+	if len(schemaProviderJson) > 0 {
+		err = json.Unmarshal([]byte(schemaProviderJson), mainInputSchemaProvider)
+		if err != nil {
+			return cpipesStartup, fmt.Errorf("while unmarshaling schema_provider_json: %s", err)
+		}
+	}
+
+	// Set the period ID env vars for lookback_periods
+	mainInputSchemaProvider.Env["${MONTH_PERIOD}"] = monthPeriod
+	mainInputSchemaProvider.Env["${WEEK_PERIOD}"] = weekPeriod
+	mainInputSchemaProvider.Env["${DAY_PERIOD}"] = dayPeriod
+	mainInputSchemaProvider.Env["$DATE_FILE_KEY"] = time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.UTC).Format("2006-01-02")
+	mainInputSchemaProvider.Env["$YEAR"] = year
+	mainInputSchemaProvider.Env["$MONTH"] = month
+	mainInputSchemaProvider.Env["$DAY"] = day
+	// Merge the env var from process_config with mainInputSchemaProvider.Env
+	if envJson.Valid && len(envJson.String) > 0 {
+		err = json.Unmarshal([]byte(envJson.String), &mainInputSchemaProvider.Env)
+		if err != nil {
+			return cpipesStartup, fmt.Errorf("while unmarshaling env_json: %s", err)
+		}
+	}
+
+	// Don't overrite client and object type if already set (Jets_Loader use case)
+	if mainInputSchemaProvider.Env["$CLIENT"] == nil {
+		mainInputSchemaProvider.Env["$CLIENT"] = client
+	}
+	if mainInputSchemaProvider.Env["$OBJECT_TYPE"] == nil {
+		mainInputSchemaProvider.Env["$OBJECT_TYPE"] = objectType
+	}
+
+	// Add tableName and source_type to mainInputSchemaProvider.Env
+	mainInputSchemaProvider.Env["${TABLE_NAME}"] = tableName
+	mainInputSchemaProvider.Env["${SOURCE_TYPE}"] = sourceType
+
+	var icJson, icDomainKeys, icPosCsv sql.NullString
+	if sourceType == "file" {
+		// log.Printf("*** sourceType is 'file', mainInputSchemaProvider after merging with process_config env: %+v\n", mainInputSchemaProvider)
+		// Get the source_config information
+		var scClient, scOrg, scObjectType string
+		var isPartFile int
+		var inputFormat, compression string
+		var inputFormatDataJson, scSchemaProviderJson sql.NullString
+		scTableName := tableName
+		if mainInputSchemaProvider.UseOriginSourceConfig {
+			env := mainInputSchemaProvider.Env
+			scTableName, _ = env["${TABLE_NAME}"].(string)
+		}
+		stmt = `
+	SELECT sc.client, sc.org, sc.object_type,
+		sc.input_columns_json, sc.input_columns_positions_csv, sc.domain_keys_json, 
+		sc.input_format, sc.compression, sc.is_part_files, sc.input_format_data_json, sc.schema_provider_json
+	FROM 
+		jetsapi.source_config sc
+	WHERE sc.table_name = $1`
+		err = dbpool.QueryRow(ctx, stmt, scTableName).Scan(
+			&scClient, &scOrg, &scObjectType,
+			&icJson, &icPosCsv, &icDomainKeys, &inputFormat, &compression, &isPartFile, &inputFormatDataJson, &scSchemaProviderJson)
+		if err != nil {
+			return cpipesStartup, fmt.Errorf("query source_config failed for table: %s, error: %v", scTableName, err)
+		}
+
+		// Merge a sub-set of fields from the source_config schema_provider_json into mainInputSchemaProvider
+		type SchemaProviderSourceConfig struct {
+			BlankFieldMarkers         *BlankFieldMarkersSpec `json:"blank_field_markers,omitempty"`
+			Delimiter                 rune                   `json:"delimiter,omitzero"`
+			DetectCrAsEol             bool                   `json:"detect_cr_as_eol,omitzero"`
+			DiscardFileHeaders        bool                   `json:"discard_file_headers,omitzero"`
+			DropExcedentHeaders       bool                   `json:"drop_excedent_headers,omitzero"`
+			Encoding                  string                 `json:"encoding,omitempty"`
+			EnforceRowMaxLength       bool                   `json:"enforce_row_max_length,omitzero"`
+			EnforceRowMinLength       bool                   `json:"enforce_row_min_length,omitzero"`
+			Env                       map[string]any         `json:"env,omitempty"`
+			EolByte                   byte                   `json:"eol_byte,omitzero"`
+			MultiColumnsInput         bool                   `json:"multi_columns_input,omitzero"`
+			NoQuotes                  bool                   `json:"no_quotes,omitzero"`
+			OutputEncoding            string                 `json:"output_encoding,omitempty"`
+			OutputEncodingSameAsInput bool                   `json:"output_encoding_same_as_input,omitempty"`
+			QuoteAllRecords           bool                   `json:"quote_all_records,omitzero"`
+			ReadDateLayout            string                 `json:"read_date_layout,omitempty"`
+			ReorderColumnsOnRead      []int                  `json:"reorder_columns_on_read,omitempty"`
+			TrimColumns               bool                   `json:"trim_columns,omitzero"`
+			UseLazyQuotes             bool                   `json:"use_lazy_quotes,omitzero"`
+			UseLazyQuotesSpecial      bool                   `json:"use_lazy_quotes_special,omitzero"`
+			VariableFieldsPerRecord   bool                   `json:"variable_fields_per_record,omitzero"`
+			WriteDateLayout           string                 `json:"write_date_layout,omitempty"`
+		}
+		if scSchemaProviderJson.Valid && len(scSchemaProviderJson.String) > 0 {
+			mainInputSchemaProviderFromSC := &SchemaProviderSourceConfig{}
+			err = json.Unmarshal([]byte(scSchemaProviderJson.String), mainInputSchemaProviderFromSC)
+			if err != nil {
+				return cpipesStartup, fmt.Errorf("while unmarshaling schema_provider_json from source_config: %s", err)
+			}
+			// Merge the fields, via json marshal/unmarshal
+			b, err := json.Marshal(mainInputSchemaProviderFromSC)
+			if err != nil {
+				return cpipesStartup, fmt.Errorf("while marshaling schema_provider_json from source_config: %s", err)
+			}
+			err = json.Unmarshal(b, mainInputSchemaProvider)
+			if err != nil {
+				return cpipesStartup, fmt.Errorf("while unmarshaling merged schema_provider_json: %s", err)
+			}
+		}
+
+		// Put the scource_config client, org, and object_type in mainInputSchemaProvider.Env
+		mainInputSchemaProvider.Env["$CLIENT"] = scClient
+		mainInputSchemaProvider.Env["$ORG"] = scOrg
+		mainInputSchemaProvider.Env["$OBJECT_TYPE"] = scObjectType
+
+		if isPartFile == 1 {
+			mainInputSchemaProvider.IsPartFiles = true
+		}
+
+		if mainInputSchemaProvider.FileKey == "" {
+			mainInputSchemaProvider.FileKey = args.FileKey
+		}
+
+		if mainInputSchemaProvider.Format == "" {
+			mainInputSchemaProvider.Format = inputFormat
+		}
+
+		if mainInputSchemaProvider.Compression == "" {
+			mainInputSchemaProvider.Compression = compression
+		}
+
+		if mainInputSchemaProvider.InputFormatDataJson == "" {
+			mainInputSchemaProvider.InputFormatDataJson = inputFormatDataJson.String
+		}
+	}
 	// Adjust ChannelSpec having columns specified by a jetrules class
+	// ----------------------------------------------------------------
 	classNames := make(map[string]bool)
 	if sourceType == "domain_table" {
 		classNames[tableName] = true // since domain class name is the table_name for source_type = 'domain_table'
@@ -140,7 +372,7 @@ func (args *StartComputePipesArgs) initializeCpipes(ctx context.Context, dbpool 
 		var buf strings.Builder
 		buf.WriteString("SELECT entity_rdf_type, object_types, domain_keys_json FROM jetsapi.domain_keys_registry WHERE entity_rdf_type IN (")
 		first := true
-		for c, _ := range classNames {
+		for c := range classNames {
 			if !first {
 				buf.WriteString(",")
 			}
@@ -206,85 +438,11 @@ func (args *StartComputePipesArgs) initializeCpipes(ctx context.Context, dbpool 
 		}
 	}
 
-	// Get the schema provider from schemaProviderJson:
-	//   - Populate the input columns (cpipesStartup.InputColumns)
-	//   - Populate inputFormat, compression, delimiter, detect_encoding
-	//   - Populate inputFormatDataJson for xlsx
-	//   - Put SchemaName into env (done in CoordinateComputePipes)
-	//   - Put the schema provider in compute pipes json
-	// First find if a schema provider already exist for "main_input"
-	for _, sp := range cpipesStartup.CpConfig.SchemaProviders {
-		if sp.SourceType == "main_input" {
-			cpipesStartup.MainInputSchemaProviderConfig = sp
-			break
-		}
-	}
-	if cpipesStartup.MainInputSchemaProviderConfig == nil {
-		// Create and initialize a default SchemaProviderSpec
-		cpipesStartup.MainInputSchemaProviderConfig = &SchemaProviderSpec{
-			Type:       "default",
-			Key:        "_main_input_",
-			SourceType: "main_input",
-			Client:     client,
-			Vendor:     org,
-			ObjectType: objectType,
-			FileConfig: FileConfig{
-				Format:              inputFormat,
-				Compression:         compression,
-				Bucket:              bucketName,
-				FileKey:             args.FileKey,
-				InputFormatDataJson: inputFormatDataJson.String,
-			},
-			Env: make(map[string]any),
-		}
-		if isPartFile == 1 {
-			cpipesStartup.MainInputSchemaProviderConfig.IsPartFiles = true
-		}
-		if cpipesStartup.CpConfig.SchemaProviders == nil {
-			cpipesStartup.CpConfig.SchemaProviders = make([]*SchemaProviderSpec, 0)
-		}
-		cpipesStartup.CpConfig.SchemaProviders = append(cpipesStartup.CpConfig.SchemaProviders, cpipesStartup.MainInputSchemaProviderConfig)
-	} else {
-		// Initialize unspecified value in main schema provider using the source_config table values
-		if cpipesStartup.MainInputSchemaProviderConfig.Client == "" {
-			cpipesStartup.MainInputSchemaProviderConfig.Client = client
-		}
-		if cpipesStartup.MainInputSchemaProviderConfig.Vendor == "" {
-			cpipesStartup.MainInputSchemaProviderConfig.Vendor = org
-		}
-		if cpipesStartup.MainInputSchemaProviderConfig.ObjectType == "" {
-			cpipesStartup.MainInputSchemaProviderConfig.ObjectType = objectType
-		}
-		if cpipesStartup.MainInputSchemaProviderConfig.Format == "" {
-			cpipesStartup.MainInputSchemaProviderConfig.Format = inputFormat
-		}
-		if cpipesStartup.MainInputSchemaProviderConfig.Compression == "" {
-			cpipesStartup.MainInputSchemaProviderConfig.Compression = compression
-		}
-		if cpipesStartup.MainInputSchemaProviderConfig.Bucket == "" {
-			cpipesStartup.MainInputSchemaProviderConfig.Bucket = bucketName
-		}
-		if cpipesStartup.MainInputSchemaProviderConfig.FileKey == "" {
-			cpipesStartup.MainInputSchemaProviderConfig.FileKey = args.FileKey
-		}
-		if cpipesStartup.MainInputSchemaProviderConfig.InputFormatDataJson == "" {
-			cpipesStartup.MainInputSchemaProviderConfig.InputFormatDataJson = inputFormatDataJson.String
-		}
-	}
-	mainInputSchemaProvider := cpipesStartup.MainInputSchemaProviderConfig
-	if len(schemaProviderJson) > 0 {
-		err = json.Unmarshal([]byte(schemaProviderJson), mainInputSchemaProvider)
-		if err != nil {
-			return cpipesStartup, fmt.Errorf("while unmarshaling schema_provider_json: %s", err)
-		}
-	}
-	cpipesStartup.EnvSettings = PrepareCpipesEnv(&cpipesStartup.CpConfig, mainInputSchemaProvider)
-
 	// Parse the Domain Key Info from source_config and main input schema provider
 	switch sourceType {
 	case "file":
-		// Main input file is an external file
-		// log.Printf("*** sourceType is 'file', icDomainKeys: %s\n", icDomainKeys.String)
+		// Main input file
+		log.Printf("*** sourceType is 'file', icDomainKeys: %s\n", icDomainKeys.String)
 		var dkInfo any
 		switch {
 		case len(mainInputSchemaProvider.DomainKeys) > 0:
@@ -328,6 +486,12 @@ func (args *StartComputePipesArgs) initializeCpipes(ctx context.Context, dbpool 
 	// Set the fixed_width column spec to the schema provider
 	if len(icPosCsv.String) > 0 {
 		mainInputSchemaProvider.FixedWidthColumnsCsv = icPosCsv.String
+	}
+
+	// Setup the cpipes env variable
+	cpipesStartup.EnvSettings, err = prepareCpipesEnv(args, cpipesStartup)
+	if err != nil {
+		return cpipesStartup, fmt.Errorf("while preparing cpipes env: %s", err)
 	}
 
 	// InputColumns - the main input file domain columns, order of priority:
@@ -375,10 +539,7 @@ func GetMaxConcurrency(nbrNodes, defaultMaxConcurrency int) int {
 		}
 	}
 
-	maxConcurrency := defaultMaxConcurrency
-	if maxConcurrency < 1 {
-		maxConcurrency = 1
-	}
+	maxConcurrency := max(defaultMaxConcurrency, 1)
 	return maxConcurrency
 }
 
@@ -404,7 +565,7 @@ func SelectActiveLookupTable(lookupConfig []*LookupSpec, pipeConfig []PipeSpec) 
 					spec := lookupMap[*name]
 					if spec == nil {
 						return nil,
-							fmt.Errorf("error: lookup table '%s' is not defined, please verify the column transformation", *name)
+							fmt.Errorf("error: (1) lookup table '%s' is not defined, please verify the column transformation", *name)
 					}
 					activeTables = append(activeTables, spec)
 				}
@@ -412,16 +573,31 @@ func SelectActiveLookupTable(lookupConfig []*LookupSpec, pipeConfig []PipeSpec) 
 			switch transformationSpec.Type {
 			case "analyze":
 				// Check for Analyze transformation using lookup tables
-				if transformationSpec.AnalyzeConfig != nil && transformationSpec.AnalyzeConfig.LookupTokens != nil {
-					for k := range transformationSpec.AnalyzeConfig.LookupTokens {
-						lookupTokenNode := &transformationSpec.AnalyzeConfig.LookupTokens[k]
-						spec := lookupMap[lookupTokenNode.Name]
-						if spec == nil {
-							return nil,
-								fmt.Errorf(
-									"error: lookup table '%s' is not defined, please verify the column transformation", lookupTokenNode.Name)
+				if transformationSpec.AnalyzeConfig != nil {
+					if transformationSpec.AnalyzeConfig.LookupTokens != nil {
+						for k := range transformationSpec.AnalyzeConfig.LookupTokens {
+							lookupTokenNode := &transformationSpec.AnalyzeConfig.LookupTokens[k]
+							spec := lookupMap[lookupTokenNode.Name]
+							if spec == nil {
+								return nil,
+									fmt.Errorf(
+										"error: (2) lookup table '%s' is not defined, please verify the column transformation", lookupTokenNode.Name)
+							}
+							activeTables = append(activeTables, spec)
 						}
-						activeTables = append(activeTables, spec)
+					}
+					for i := range transformationSpec.AnalyzeConfig.FunctionTokens {
+						functionTokenNode := &transformationSpec.AnalyzeConfig.FunctionTokens[i]
+						if functionTokenNode.ParseDateConfig != nil && functionTokenNode.ParseDateConfig.DateFormatLookup != nil {
+							lookupName := functionTokenNode.ParseDateConfig.DateFormatLookup.LookupName
+							spec := lookupMap[lookupName]
+							if spec == nil {
+								return nil,
+									fmt.Errorf(
+										"error: (3) lookup table '%s' is not defined, please verify the column transformation", lookupName)
+							}
+							activeTables = append(activeTables, spec)
+						}
 					}
 				}
 			case "anonymize":
@@ -434,6 +610,15 @@ func SelectActiveLookupTable(lookupConfig []*LookupSpec, pipeConfig []PipeSpec) 
 							return nil,
 								fmt.Errorf(
 									"error: lookup table '%s' used by anonymize operator is not defined, please verify the configuration", name)
+						}
+						activeTables = append(activeTables, spec)
+					}
+					for _, lookupTable := range transformationSpec.AnonymizeConfig.DeidLookups {
+						spec := lookupMap[lookupTable]
+						if spec == nil {
+							return nil,
+								fmt.Errorf(
+									"error: lookup table '%s' used by anonymize operator is not defined, please verify the configuration", lookupTable)
 						}
 						activeTables = append(activeTables, spec)
 					}
@@ -470,6 +655,106 @@ func SelectActiveLookupTable(lookupConfig []*LookupSpec, pipeConfig []PipeSpec) 
 		}
 	}
 	return activeTables, nil
+}
+
+// Function to apply all conditional transformation spec in the pipeConfig
+func ApplyAllConditionalTransformationSpec(pipeConfig []PipeSpec, env map[string]any) error {
+	// Need to convert the conditional expression to evalExpression for evaluation
+	builderContext := ExprBuilderContext(env)
+
+	// Visit all transformation spec in the pipeConfig
+	for i := range pipeConfig {
+		pipeSpec := &pipeConfig[i]
+		for j := range pipeSpec.Apply {
+			transformationSpec := &pipeSpec.Apply[j]
+			if transformationSpec.ConditionalConfig != nil {
+
+				// build the evalExpression for each when condition
+				for _, conditionalSpec := range transformationSpec.ConditionalConfig {
+					evaluator, err := builderContext.BuildExprNodeEvaluator("conditional_config", nil, &conditionalSpec.When)
+					if err != nil {
+						return fmt.Errorf("error building evaluator for conditional transformation %d: %v", j, err)
+					}
+
+					// Evaluate the when condition
+					v, err := evaluator.Eval( env)
+					if err != nil {
+						return fmt.Errorf("error evaluating when condition for transformation %d: %v", j, err)
+					}
+					if ToBool(v) {
+						// Apply the Then spec
+						if len(conditionalSpec.Then.Type) > 0 {
+							// Replace the host transformationSpec altogether
+							*transformationSpec = conditionalSpec.Then
+						} else {
+							// Override the fields in the host transformationSpec
+							err := MergeTransformationSpec(transformationSpec, &conditionalSpec.Then)
+							if err != nil {
+								return fmt.Errorf("error merging conditional transformation %d: %v", j, err)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func MergeTransformationSpec(host, override *TransformationSpec) error {
+	// Merge the fields from the override spec into the host spec
+	if override == nil || host == nil {
+		return nil
+	}
+	// Check if we replace the host spec altogether
+	if len(override.Type) > 0 {
+		*host = *override
+		return nil
+	}
+	// Merge the non scalar fields
+	if len(override.Columns) > 0 {
+		host.Columns = override.Columns
+	}
+	if override.MapRecordConfig != nil {
+		host.MapRecordConfig = override.MapRecordConfig
+	}
+	if override.AnalyzeConfig != nil {
+		host.AnalyzeConfig = override.AnalyzeConfig
+	}
+	if len(override.HighFreqColumns) > 0 {
+		host.HighFreqColumns = override.HighFreqColumns
+	}
+	if override.PartitionWriterConfig != nil {
+		host.PartitionWriterConfig = override.PartitionWriterConfig
+	}
+	if override.AnonymizeConfig != nil {
+		host.AnonymizeConfig = override.AnonymizeConfig
+	}
+	if override.DistinctConfig != nil {
+		host.DistinctConfig = override.DistinctConfig
+	}
+	if override.ShufflingConfig != nil {
+		host.ShufflingConfig = override.ShufflingConfig
+	}
+	if override.GroupByConfig != nil {
+		host.GroupByConfig = override.GroupByConfig
+	}
+	if override.FilterConfig != nil {
+		host.FilterConfig = override.FilterConfig
+	}
+	if override.SortConfig != nil {
+		host.SortConfig = override.SortConfig
+	}
+	if override.JetrulesConfig != nil {
+		host.JetrulesConfig = override.JetrulesConfig
+	}
+	if override.ClusteringConfig != nil {
+		host.ClusteringConfig = override.ClusteringConfig
+	}
+	if override.OutputChannel.Name != "" {
+		host.OutputChannel = override.OutputChannel
+	}
+	return nil
 }
 
 // Function to prune the output tables and return only the tables used in pipeConfig
@@ -512,7 +797,8 @@ func GetOutputFileConfig(cpConfig *ComputePipesConfig, outputFileKey string) *Ou
 
 // Function to validate the PipeSpec output channel config
 // Apply a default snappy compression if compression is not specified
-// and channel Type 'stage'
+// and channel Type 'stage'.
+// This function also syncs the input and ouput channels with the associated schema provider.
 func (args *CpipesStartup) ValidatePipeSpecConfig(cpConfig *ComputePipesConfig, pipeConfig []PipeSpec) error {
 	for i := range pipeConfig {
 		pipeSpec := &pipeConfig[i]
@@ -547,7 +833,7 @@ func (args *CpipesStartup) ValidatePipeSpecConfig(cpConfig *ComputePipesConfig, 
 			if len(pipeSpec.InputChannel.Compression) == 0 {
 				pipeSpec.InputChannel.Compression = "snappy"
 			}
-		case "memory":
+		case "memory", "generator":
 		default:
 			return fmt.Errorf("configuration error: unknown input_channel.type: %s", pipeSpec.InputChannel.Type)
 		}
@@ -576,8 +862,8 @@ func (args *CpipesStartup) ValidatePipeSpecConfig(cpConfig *ComputePipesConfig, 
 		for j := range pipeSpec.Apply {
 			transformationConfig := &pipeSpec.Apply[j]
 			outputChConfig := &transformationConfig.OutputChannel
-			// log.Printf("*** VALIDATE PIPESPEC %s APPLY %s OUTPUT %s SP %s\n", 
-			// 	pipeSpec.Type, transformationConfig.Type, transformationConfig.OutputChannel.Name, 
+			// log.Printf("*** VALIDATE PIPESPEC %s APPLY %s OUTPUT %s SP %s\n",
+			// 	pipeSpec.Type, transformationConfig.Type, transformationConfig.OutputChannel.Name,
 			// 	transformationConfig.OutputChannel.SchemaProvider)
 			sp := getSchemaProvider(cpConfig.SchemaProviders, outputChConfig.SchemaProvider)
 			// validate transformation pipe config
@@ -623,10 +909,12 @@ func (args *CpipesStartup) ValidatePipeSpecConfig(cpConfig *ComputePipesConfig, 
 				if transformationConfig.AnonymizeConfig == nil {
 					return fmt.Errorf("configuration error: missing anonymize_config for anonymize operator")
 				}
-				keyOutputChannel := &transformationConfig.AnonymizeConfig.KeysOutputChannel
-				err := validateOutputChConfig(keyOutputChannel, getSchemaProvider(cpConfig.SchemaProviders, keyOutputChannel.SchemaProvider))
-				if err != nil {
-					return err
+				keyOutputChannel := transformationConfig.AnonymizeConfig.KeysOutputChannel
+				if keyOutputChannel != nil {
+					err := args.validateOutputChConfig(keyOutputChannel, getSchemaProvider(cpConfig.SchemaProviders, keyOutputChannel.SchemaProvider))
+					if err != nil {
+						return err
+					}
 				}
 			case "jetrules":
 				if transformationConfig.JetrulesConfig == nil {
@@ -637,9 +925,18 @@ func (args *CpipesStartup) ValidatePipeSpecConfig(cpConfig *ComputePipesConfig, 
 					transformationConfig.JetrulesConfig.PoolSize = 1
 				}
 				outputChConfig = nil // The outputChannel is replaced by JetrulesConfig.JetrulesOutput channels
+				// Validate the output channels in jetrules config
 				for k := range transformationConfig.JetrulesConfig.OutputChannels {
 					outCh := &transformationConfig.JetrulesConfig.OutputChannels[k]
-					err := validateOutputChConfig(outCh, getSchemaProvider(cpConfig.SchemaProviders, outCh.SchemaProvider))
+					err := args.validateOutputChConfig(outCh, getSchemaProvider(cpConfig.SchemaProviders, outCh.SchemaProvider))
+					if err != nil {
+						return err
+					}
+				}
+				// Validate the error output channel in jetrules config if specified
+				if transformationConfig.JetrulesConfig.ErrorChannel != nil {
+					err := args.validateOutputChConfig(transformationConfig.JetrulesConfig.ErrorChannel,
+						getSchemaProvider(cpConfig.SchemaProviders, transformationConfig.JetrulesConfig.ErrorChannel.SchemaProvider))
 					if err != nil {
 						return err
 					}
@@ -651,12 +948,12 @@ func (args *CpipesStartup) ValidatePipeSpecConfig(cpConfig *ComputePipesConfig, 
 						"configuration error: missing clustering_config or correlation_output_channel for clustering operator")
 				}
 				outCh := transformationConfig.ClusteringConfig.CorrelationOutputChannel
-				err := validateOutputChConfig(outCh, getSchemaProvider(cpConfig.SchemaProviders, outCh.SchemaProvider))
+				err := args.validateOutputChConfig(outCh, getSchemaProvider(cpConfig.SchemaProviders, outCh.SchemaProvider))
 				if err != nil {
 					return err
 				}
 			}
-			err := validateOutputChConfig(outputChConfig, sp)
+			err := args.validateOutputChConfig(outputChConfig, sp)
 			if err != nil {
 				return err
 			}
@@ -666,11 +963,15 @@ func (args *CpipesStartup) ValidatePipeSpecConfig(cpConfig *ComputePipesConfig, 
 }
 
 // Sync the following properties from FileConfig betwwen args inputChannel and schemaProvider:
+//   - BlankFieldMarkers
 //   - Compression
 //   - Delimiter
 //   - DetectEncoding
+//   - DiscardFileHeaders
 //   - DomainClass
 //   - DomainKeys
+//   - DropExcedentHeaders
+//   - DetectCrAsEol
 //   - Encoding
 //   - EnforceRowMaxLength
 //   - EnforceRowMinLength
@@ -682,6 +983,7 @@ func (args *CpipesStartup) ValidatePipeSpecConfig(cpConfig *ComputePipesConfig, 
 //   - QuoteAllRecords
 //   - ReadBatchSize
 //   - ReadDateLayout
+//   - ReorderColumnsOnRead
 //   - TrimColumns
 //   - UseLazyQuotes
 //   - UseLazyQuotesSpecial
@@ -691,6 +993,12 @@ func (args *CpipesStartup) ValidatePipeSpecConfig(cpConfig *ComputePipesConfig, 
 // Priority: inputChannelConfig, mainInputSchemaProvider, and then source_config table (which served
 // as defaults to mainInputSchemaProvider)
 func syncInputChannelWithSchemaProvider(ic *InputChannelConfig, sp *SchemaProviderSpec) {
+	if ic.BlankFieldMarkers == nil {
+		ic.BlankFieldMarkers = sp.BlankFieldMarkers
+	} else {
+		sp.BlankFieldMarkers = ic.BlankFieldMarkers
+	}
+
 	if ic.Compression == "" {
 		ic.Compression = sp.Compression
 	} else {
@@ -707,6 +1015,18 @@ func syncInputChannelWithSchemaProvider(ic *InputChannelConfig, sp *SchemaProvid
 		ic.DetectEncoding = sp.DetectEncoding
 	} else {
 		sp.DetectEncoding = ic.DetectEncoding
+	}
+
+	if !ic.DiscardFileHeaders {
+		ic.DiscardFileHeaders = sp.DiscardFileHeaders
+	} else {
+		sp.DiscardFileHeaders = ic.DiscardFileHeaders
+	}
+
+	if !ic.DropExcedentHeaders {
+		ic.DropExcedentHeaders = sp.DropExcedentHeaders
+	} else {
+		sp.DropExcedentHeaders = ic.DropExcedentHeaders
 	}
 
 	if !ic.DetectCrAsEol {
@@ -805,6 +1125,12 @@ func syncInputChannelWithSchemaProvider(ic *InputChannelConfig, sp *SchemaProvid
 		sp.ReadDateLayout = ic.ReadDateLayout
 	}
 
+	if len(ic.ReorderColumnsOnRead) == 0 {
+		ic.ReorderColumnsOnRead = sp.ReorderColumnsOnRead
+	} else {
+		sp.ReorderColumnsOnRead = ic.ReorderColumnsOnRead
+	}
+
 	if !ic.TrimColumns {
 		ic.TrimColumns = sp.TrimColumns
 	} else {
@@ -841,9 +1167,11 @@ func syncInputChannelWithSchemaProvider(ic *InputChannelConfig, sp *SchemaProvid
 //   - Delimiter
 //   - DomainClass
 //   - DomainKeys
+//   - Encoding
 //   - Format
 //   - NbrRowsInRecord
 //   - NoQuotes
+//   - OutputEncoding
 //   - ParquetSchema
 //   - QuoteAllRecords
 //   - ReadBatchSize
@@ -874,6 +1202,24 @@ func syncOutputChannelWithSchemaProvider(ic *OutputChannelConfig, sp *SchemaProv
 		ic.DomainKeys = sp.DomainKeys
 	} else {
 		sp.DomainKeys = ic.DomainKeys
+	}
+
+	if ic.Encoding == "" {
+		ic.Encoding = sp.Encoding
+	} else {
+		sp.Encoding = ic.Encoding
+	}
+
+	if ic.OutputEncoding == "" {
+		ic.OutputEncoding = sp.OutputEncoding
+	} else {
+		sp.OutputEncoding = ic.OutputEncoding
+	}
+	if sp.OutputEncoding == "" {
+		sp.OutputEncoding = sp.Encoding
+	}
+	if ic.OutputEncoding == "" {
+		ic.OutputEncoding = ic.Encoding
 	}
 
 	if ic.Format == "" {
@@ -931,7 +1277,7 @@ func syncOutputChannelWithSchemaProvider(ic *OutputChannelConfig, sp *SchemaProv
 	}
 }
 
-func validateOutputChConfig(outputChConfig *OutputChannelConfig, sp *SchemaProviderSpec) error {
+func (cpss *CpipesStartup) validateOutputChConfig(outputChConfig *OutputChannelConfig, sp *SchemaProviderSpec) error {
 	if outputChConfig == nil {
 		return nil
 	}
@@ -944,7 +1290,17 @@ func validateOutputChConfig(outputChConfig *OutputChannelConfig, sp *SchemaProvi
 			return fmt.Errorf("configuration error: must provide output_table_key when output_channel type is 'sql'")
 		}
 		outputChConfig.Name = outputChConfig.OutputTableKey
-		outputChConfig.SpecName = outputChConfig.OutputTableKey
+		// Get the spec name from the output table key
+		for _, tbl := range cpss.CpConfig.OutputTables {
+			if tbl.Key == outputChConfig.OutputTableKey {
+				outputChConfig.SpecName = tbl.ChannelSpecName
+				break
+			}
+		}
+		if len(outputChConfig.SpecName) == 0 {
+			return fmt.Errorf("configuration error: output_channel has reference to output_table_key '%s' which does not exist",
+				outputChConfig.OutputTableKey)
+		}
 	default:
 		if len(outputChConfig.Name) == 0 || outputChConfig.Name == outputChConfig.SpecName {
 			return fmt.Errorf(
@@ -952,6 +1308,7 @@ func validateOutputChConfig(outputChConfig *OutputChannelConfig, sp *SchemaProvi
 				outputChConfig.Name, outputChConfig.SpecName)
 		}
 		switch outputChConfig.Type {
+		
 		case "stage":
 			if sp != nil {
 				syncOutputChannelWithSchemaProvider(outputChConfig, sp)
@@ -977,14 +1334,18 @@ func validateOutputChConfig(outputChConfig *OutputChannelConfig, sp *SchemaProvi
 					outputChConfig.Format = "headerless_csv"
 				}
 			}
-
-			if len(outputChConfig.WriteStepId) == 0 {
-				return fmt.Errorf("configuration error: write_step_id is not specified in output_channel '%s' of type 'stage'",
+			if len(outputChConfig.WriteStepId) == 0 && len(outputChConfig.FileKey) == 0 {
+				return fmt.Errorf("configuration error: write_step_id (and file_key) is not specified in output_channel '%s' of type 'stage'",
 					outputChConfig.Name)
 			}
+
 		case "output":
 			if sp != nil {
 				syncOutputChannelWithSchemaProvider(outputChConfig, sp)
+			}
+			if outputChConfig.UseOriginalHeaders && outputChConfig.SpecName != "input_row" {
+				return fmt.Errorf(
+					"configuration error: output_channel.use_original_headers can only be true when output_channel.spec_name is 'input_row'")
 			}
 			if strings.HasPrefix(outputChConfig.Format, "parquet") {
 				outputChConfig.Format = "parquet"
@@ -1002,7 +1363,17 @@ func validateOutputChConfig(outputChConfig *OutputChannelConfig, sp *SchemaProvi
 					outputChConfig.Compression = "none"
 				}
 			}
-			if len(outputChConfig.OutputLocation()) == 0 {
+			switch outputChConfig.OutputLocation() {
+			case "jetstore_s3_schema_events":
+				if len(outputChConfig.WriteStepId) == 0 {
+					return fmt.Errorf("configuration error: write_step_id is not specified in output_channel '%s' writing to schema events location",
+						outputChConfig.Name)
+				}
+				if len(outputChConfig.FileName) > 0 {
+					return fmt.Errorf("configuration error: file_name is not allowed in output_channel '%s' writing to schema events location",
+						outputChConfig.Name)
+				}
+			case "":
 				outputChConfig.SetOutputLocation("jetstore_s3_output")
 			}
 
@@ -1043,30 +1414,87 @@ func GetChannelSpec(channels []ChannelSpec, name string) *ChannelSpec {
 	return nil
 }
 
-// Function to collect env settings from cpipes config and main schema provider.
+// Function to collect env settings from:
+//   - cpipes config context and main schema provider env;
+//   - file_key components, session_id, etc from args;
+//
 // Important for site specific configuration, in particular used in API gateway notification
-func PrepareCpipesEnv(cpConfig *ComputePipesConfig, mainSchemaProviderConfig *SchemaProviderSpec) map[string]any {
+func prepareCpipesEnv(args *StartComputePipesArgs, cpipesStartup *CpipesStartup) (map[string]any, error) {
+
+	var fileKeyPath, fileKeyName string // Components extracted from File_Key based on is_part_file
+	var fileKeyDate time.Time
+	var envSettings map[string]any
+	mainSchemaProviderConfig := cpipesStartup.MainInputSchemaProviderConfig
+	cpConfig := cpipesStartup.CpConfig
+
 	//* IMPORTANT: Make sure a key is not the prefix of another key
 	//  e.g. $FILE_KEY and $FILE_KEY_PATH is BAD since $FILE_KEY_PATH may get
 	//  the value of $FILE_KEY with a dandling _PATH
 	// The main schema provider env is used as the overall env context.
 	if mainSchemaProviderConfig.Env == nil {
-		mainSchemaProviderConfig.Env = make(map[string]any)
+		envSettings = make(map[string]any)
+		mainSchemaProviderConfig.Env = envSettings
+	} else {
+		envSettings = mainSchemaProviderConfig.Env
 	}
-	mainSchemaProviderConfig.Env["$INPUT_BUCKET"] = mainSchemaProviderConfig.Bucket
-	mainSchemaProviderConfig.Env["$MAIN_SCHEMA_NAME"] = mainSchemaProviderConfig.SchemaName
 
-	for i := range cpConfig.Context {
-		if cpConfig.Context[i].Type == "value" {
-			mainSchemaProviderConfig.Env[cpConfig.Context[i].Key] = cpConfig.Context[i].Expr
+	// Extract processing date from file key inFile
+	fileKeyComponents := make(map[string]any)
+	datatable.SplitFileKeyIntoComponents(fileKeyComponents, &args.FileKey)
+	if len(fileKeyComponents) > 0 {
+		year := fileKeyComponents["year"].(int)
+		month := fileKeyComponents["month"].(int)
+		day := fileKeyComponents["day"].(int)
+		fileKeyDate = time.Date(year, time.Month(month), day, 14, 0, 0, 0, time.UTC)
+		// log.Println("fileKeyDate:", fileKeyDate)
+	}
+
+	if mainSchemaProviderConfig.IsPartFiles {
+		fileKeyPath = args.FileKey
+	} else {
+		fileKey := args.FileKey
+		idx := strings.LastIndex(fileKey, "/")
+		if idx >= 0 && idx < len(fileKey)-1 {
+			fileKeyName = fileKey[idx+1:]
+			fileKeyPath = fileKey[0:idx]
+		} else {
+			fileKeyPath = fileKey
+		}
+	}
+
+	envSettings["$FILE_KEY"] = mainSchemaProviderConfig.FileKey
+	envSettings["$SESSIONID"] = args.SessionId
+	envSettings["$PROCESS_NAME"] = cpipesStartup.ProcessName
+	envSettings["$PATH_FILE_KEY"] = fileKeyPath
+	envSettings["$NAME_FILE_KEY"] = fileKeyName
+	// Don't override with file key date if already set via schema provider
+	if envSettings["$DATE_FILE_KEY"] == nil {
+		envSettings["$DATE_FILE_KEY"] = fileKeyDate
+	}
+	envSettings["$FULL_INPUT_FILE_KEY"] = fmt.Sprintf("%s/%s",
+		mainSchemaProviderConfig.Bucket, mainSchemaProviderConfig.FileKey)
+
+	envSettings["$INPUT_BUCKET"] = mainSchemaProviderConfig.Bucket
+	envSettings["$MAIN_SCHEMA_NAME"] = mainSchemaProviderConfig.SchemaName
+
+	// Add to envSettings based on compute pipe config
+	for _, contextSpec := range cpConfig.Context {
+		switch contextSpec.Type {
+		case "file_key_component":
+			envSettings[contextSpec.Key] = fileKeyComponents[contextSpec.Expr]
+		case "value":
+			envSettings[contextSpec.Key] = contextSpec.Expr
+		case "partfile_key_component":
+		default:
+			return nil, fmt.Errorf("error: unknown ContextSpec Type: %v", contextSpec.Type)
 		}
 	}
 
 	if cpConfig.ClusterConfig.IsDebugMode {
-		b, err := json.Marshal(mainSchemaProviderConfig.Env)
+		b, err := json.Marshal(envSettings)
 		log.Printf("PrepareCpipesEnv: Cpipes Env: %s, err? %v\n", string(b), err)
 	}
-	return mainSchemaProviderConfig.Env
+	return envSettings, nil
 }
 
 func (cpipesStartup *CpipesStartup) EvalUseEcsTask(stepId int) (bool, error) {
@@ -1080,7 +1508,7 @@ func (cpipesStartup *CpipesStartup) EvalUseEcsTask(stepId int) (bool, error) {
 			if err != nil {
 				return false, err
 			}
-			v, err := evaluator.eval(cpipesStartup.EnvSettings)
+			v, err := evaluator.Eval( cpipesStartup.EnvSettings)
 			if err != nil {
 				return false, err
 			}

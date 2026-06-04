@@ -2,28 +2,34 @@ package compute_pipes
 
 import (
 	"fmt"
+	"strings"
 )
 
 // build the runtime evaluator for the column transformation
 func (ctx *BuilderContext) BuildTransformationColumnEvaluator(source *InputChannel, outCh *OutputChannel, spec *TransformationColumnSpec) (TransformationColumnEvaluator, error) {
 
-	switch spec.Type {
+	switch strings.ToLower(spec.Type) {
 	// select, multi_select, value, eval, map, count, distinct_count, sum, min, case, hash, map_reduce, lookup
 	case "select":
 		if spec.Expr == nil {
 			return nil, fmt.Errorf("error: Type select must have Expr != nil")
 		}
-		inputPos, ok := (*source.columns)[*spec.Expr]
+		inputPos, ok := (*source.Columns)[*spec.Expr]
 		if !ok {
-			return nil, fmt.Errorf("error column %s not found in input source %s", *spec.Expr, source.name)
+			return nil, fmt.Errorf("error column %s not found in input source %s", *spec.Expr, source.Name)
 		}
-		outputPos, ok := (*outCh.columns)[spec.Name]
+		outputPos, ok := (*outCh.Columns)[spec.Name]
 		if !ok {
-			return nil, fmt.Errorf("error column %s not found in output source %s", spec.Name, outCh.name)
+			return nil, fmt.Errorf("error column %s not found in output source %s", spec.Name, outCh.Name)
+		}
+		var cast2RdfType *CastToRdfFnc
+		if spec.AsRdfType != "" {
+			cast2RdfType = NewCastToRdfFnc(spec.Name, spec.AsRdfType, new(false))
 		}
 		return &selectColumnEval{
-			inputPos:  inputPos,
-			outputPos: outputPos,
+			inputPos:     inputPos,
+			outputPos:    outputPos,
+			cast2RdfType: cast2RdfType,
 		}, nil
 
 	case "multi_select":
@@ -32,42 +38,52 @@ func (ctx *BuilderContext) BuildTransformationColumnEvaluator(source *InputChann
 		}
 		inputPos := make([]int, 0, len(spec.ExprArray))
 		for _, columnName := range spec.ExprArray {
-			inputPos = append(inputPos, (*source.columns)[columnName])
+			inputPos = append(inputPos, (*source.Columns)[columnName])
 		}
-		outputPos, ok := (*outCh.columns)[spec.Name]
+		outputPos, ok := (*outCh.Columns)[spec.Name]
 		if !ok {
-			return nil, fmt.Errorf("error column %s not found in output source %s", spec.Name, outCh.name)
+			return nil, fmt.Errorf("error column %s not found in output source %s", spec.Name, outCh.Name)
+		}
+		var cast2RdfType *CastToRdfFnc
+		if spec.AsRdfType != "" {
+			cast2RdfType = NewCastToRdfFnc(spec.Name, spec.AsRdfType, new(false))
 		}
 		return &multiSelectColumnEval{
-			inputPos:  inputPos,
-			outputPos: outputPos,
+			inputPos:     inputPos,
+			outputPos:    outputPos,
+			cast2RdfType: cast2RdfType,
 		}, nil
 
 	case "value":
 		if spec.Expr == nil {
 			return nil, fmt.Errorf("error: Type value must have Expr != nil")
 		}
-		value, err := ctx.parseValue(spec.Expr)
+		value, err := ctx.parseValue(spec.Expr, spec.MaxEnvVarSubstitution)
 		if err != nil {
 			return nil, err
 		}
-		outputPos, ok := (*outCh.columns)[spec.Name]
+		outputPos, ok := (*outCh.Columns)[spec.Name]
 		if !ok {
-			return nil, fmt.Errorf("error column %s not found in output source %s", spec.Name, outCh.name)
+			return nil, fmt.Errorf("error column %s not found in output source %s", spec.Name, outCh.Name)
+		}
+		var cast2RdfType *CastToRdfFnc
+		if spec.AsRdfType != "" {
+			cast2RdfType = NewCastToRdfFnc(spec.Name, spec.AsRdfType, new(false))
 		}
 		return &valueColumnEval{
-			value:     value,
-			outputPos: outputPos,
+			value:        value,
+			outputPos:    outputPos,
+			cast2RdfType: cast2RdfType,
 		}, nil
 
 	case "eval":
-		evalEpr, err := ctx.BuildExprNodeEvaluator(source.name, *source.columns, spec.EvalExpr)
+		evalEpr, err := ctx.BuildExprNodeEvaluator(source.Name, *source.Columns, spec.EvalExpr)
 		if err != nil {
 			return nil, fmt.Errorf("while calling BuildExprNodeEvaluator: %v", err)
 		}
-		outputPos, ok := (*outCh.columns)[spec.Name]
+		outputPos, ok := (*outCh.Columns)[spec.Name]
 		if !ok {
-			return nil, fmt.Errorf("error column %s not found in output source %s", spec.Name, outCh.name)
+			return nil, fmt.Errorf("error column %s not found in output source %s", spec.Name, outCh.Name)
 		}
 		return &evalExprColumnEval{
 			expr:      evalEpr,
@@ -103,11 +119,25 @@ func (ctx *BuilderContext) BuildTransformationColumnEvaluator(source *InputChann
 		return sumEvaluator, nil
 
 	case "min":
-		minEvaluator, err := ctx.BuildMinTCEvaluator(source, outCh, spec)
+		minEvaluator, err := ctx.BuildMinMaxTCEvaluator(source, outCh, spec, true)
 		if err != nil {
-			return nil, fmt.Errorf("while calling BuildMinTCEvaluator: %v", err)
+			return nil, fmt.Errorf("while calling BuildMinMaxTCEvaluator: %v", err)
 		}
 		return minEvaluator, nil
+
+	case "max":
+		maxEvaluator, err := ctx.BuildMinMaxTCEvaluator(source, outCh, spec, false)
+		if err != nil {
+			return nil, fmt.Errorf("while calling BuildMinMaxTCEvaluator: %v", err)
+		}
+		return maxEvaluator, nil
+
+	case "avrg":
+		avrgEvaluator, err := ctx.BuildAvrgTCEvaluator(source, outCh, spec)
+		if err != nil {
+			return nil, fmt.Errorf("while calling BuildAvrgTCEvaluator: %v", err)
+		}
+		return avrgEvaluator, nil
 
 	case "case":
 		return ctx.BuildCaseExprTCEvaluator(source, outCh, spec)
@@ -130,75 +160,98 @@ type evalExprColumnEval struct {
 	outputPos int
 }
 
-func (ctx *evalExprColumnEval) InitializeCurrentValue(currentValue *[]interface{}) {}
-func (ctx *evalExprColumnEval) Update(currentValue *[]interface{}, input *[]interface{}) error {
-	value, err := ctx.expr.eval(*input)
+func (ctx *evalExprColumnEval) Update(currentValue *[]any, input *[]any) error {
+	value, err := ctx.expr.Eval(*input)
 	if err != nil {
 		return err
 	}
 	(*currentValue)[ctx.outputPos] = value
 	return nil
 }
-func (ctx *evalExprColumnEval) Done(currentValue *[]interface{}) error {
+func (ctx *evalExprColumnEval) Done(currentValue *[]any) error {
 	return nil
 }
 
 // TransformationColumnSpec Type value
 type valueColumnEval struct {
-	value     interface{}
-	outputPos int
+	value        any
+	outputPos    int
+	cast2RdfType *CastToRdfFnc
 }
 
-func (ctx *valueColumnEval) Done(currentValue *[]interface{}) error {
+func (ctx *valueColumnEval) Done(currentValue *[]any) error {
 	return nil
 }
 
-func (ctx *valueColumnEval) InitializeCurrentValue(currentValue *[]interface{}) {}
-func (ctx *valueColumnEval) Update(currentValue *[]interface{}, _ *[]interface{}) error {
+func (ctx *valueColumnEval) Update(currentValue *[]any, _ *[]any) error {
 	if currentValue == nil {
 		return fmt.Errorf("error valueColumnEval.update cannot have nil currentValue")
 	}
-	(*currentValue)[ctx.outputPos] = ctx.value
+	value := ctx.value
+	if ctx.cast2RdfType != nil {
+		var err error
+		value, err = ctx.cast2RdfType.Cast(value)
+		if err != nil {
+			return err
+		}
+	}
+	(*currentValue)[ctx.outputPos] = value
 	return nil
 }
 
 // TransformationColumnSpec Type select
 type selectColumnEval struct {
-	inputPos  int
-	outputPos int
+	inputPos     int
+	outputPos    int
+	cast2RdfType *CastToRdfFnc
 }
 
-func (ctx *selectColumnEval) Done(currentValue *[]interface{}) error {
+func (ctx *selectColumnEval) Done(currentValue *[]any) error {
 	return nil
 }
 
-func (ctx *selectColumnEval) InitializeCurrentValue(currentValue *[]interface{}) {}
-func (ctx *selectColumnEval) Update(currentValue *[]interface{}, input *[]interface{}) error {
+func (ctx *selectColumnEval) Update(currentValue *[]any, input *[]any) error {
 	if currentValue == nil || input == nil {
 		return fmt.Errorf("error selectColumnEval.update cannot have nil currentValue or input")
 	}
-	(*currentValue)[ctx.outputPos] = (*input)[ctx.inputPos]
+	value := (*input)[ctx.inputPos]
+	if ctx.cast2RdfType != nil {
+		var err error
+		value, err = ctx.cast2RdfType.Cast(value)
+		if err != nil {
+			return err
+		}
+	}
+	(*currentValue)[ctx.outputPos] = value
 	return nil
 }
 
 // TransformationColumnSpec Type multi_select
 type multiSelectColumnEval struct {
-	inputPos  []int
-	outputPos int
+	inputPos     []int
+	outputPos    int
+	cast2RdfType *CastToRdfFnc
 }
 
-func (ctx *multiSelectColumnEval) Done(currentValue *[]interface{}) error {
+func (ctx *multiSelectColumnEval) Done(currentValue *[]any) error {
 	return nil
 }
 
-func (ctx *multiSelectColumnEval) InitializeCurrentValue(currentValue *[]interface{}) {}
-func (ctx *multiSelectColumnEval) Update(currentValue *[]interface{}, input *[]interface{}) error {
+func (ctx *multiSelectColumnEval) Update(currentValue *[]any, input *[]any) error {
 	if currentValue == nil || input == nil {
-		return fmt.Errorf("error selectColumnEval.update cannot have nil currentValue or input")
+		return fmt.Errorf("error multiSelectColumnEval.update cannot have nil currentValue or input")
 	}
 	value := make([]any, 0, len(ctx.inputPos))
 	for _, ipos := range ctx.inputPos {
-		value = append(value, (*input)[ipos])
+		v := (*input)[ipos]
+		if ctx.cast2RdfType != nil {
+			var err error
+			v, err = ctx.cast2RdfType.Cast(v)
+			if err != nil {
+				return err
+			}
+		}
+		value = append(value, v)
 	}
 	(*currentValue)[ctx.outputPos] = value
 	return nil

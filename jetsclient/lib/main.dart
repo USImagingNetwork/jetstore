@@ -1,9 +1,9 @@
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:adaptive_theme/adaptive_theme.dart';
-// ignore: avoid_web_libraries_in_flutter
-import 'dart:html' as html;
 import 'package:flutter/foundation.dart' as foundation;
 import 'package:jetsclient/http_client.dart';
+import 'package:jetsclient/button_config.dart';
 
 import 'package:jetsclient/routes/jets_route_information_parser.dart';
 import 'package:jetsclient/routes/jets_router_delegate.dart';
@@ -12,20 +12,26 @@ final jetsRouteDelegate = JetsRouterDelegate();
 final jetsRouteInformationParser = JetsRouteInformationParser();
 
 void main() {
-  // final url = html.window.location.href;
-  final protocol = html.window.location.protocol;
-  final port = foundation.kDebugMode ? 8080 : html.window.location.port;
-  final hostname = html.window.location.hostname; // you probably need this one
+  final uri = Uri.base;
+  final protocol = '${uri.scheme}:';
+  // Use a consistent String type for port to avoid type issues.
+  final String port =
+      foundation.kDebugMode ? '8080' : (uri.hasPort ? uri.port.toString() : '');
+  final hostname = uri.host; // you probably need this one
   // print("url: $url");
   // print("protocol: $protocol");
   // print("hostname: $hostname");
   // print("port: $port");
-  var serverOrigin = "$protocol//$hostname:$port";
+  // Build origin correctly when the port is empty (default HTTP/HTTPS).
+  final serverOrigin =
+      port.isEmpty ? "$protocol//$hostname" : "$protocol//$hostname:$port";
   HttpClientSingleton().serverAdd = Uri.parse(serverOrigin);
 
   // FlutterError.onError = (details) {
   //   print("#### GOT ERROR $details");
   // };
+  // Print env variables for verification
+  print('BUTTON_CFG_JSON: ${jsonEncode(AppConfig.buttonsConfig)}');
 
   runApp(JetsClient(serverOrigin: serverOrigin));
 }

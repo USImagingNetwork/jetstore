@@ -230,15 +230,17 @@ class JetsDataTableSource extends ChangeNotifier {
     // print("getRow Called with index $index which has key ${model![index][1]} ");
     return DataRow.byIndex(
       index: index,
-      color: MaterialStateProperty.resolveWith<Color?>(
-          (Set<MaterialState> states) {
+      color: WidgetStateProperty.resolveWith<Color?>((Set<WidgetState> states) {
         // All rows will have the same selected color.
-        if (states.contains(MaterialState.selected)) {
-          return Theme.of(state.context).colorScheme.primary.withOpacity(0.08);
+        if (states.contains(WidgetState.selected)) {
+          return Theme.of(state.context)
+              .colorScheme
+              .primary
+              .withValues(alpha: 0.08);
         }
         // Even rows will have a grey color.
         if (index.isEven) {
-          return Colors.grey.withOpacity(0.3);
+          return Colors.grey.withValues(alpha: 0.3);
         }
         return null; // Use default value for other states and odd rows.
       }),
@@ -546,6 +548,15 @@ class JetsDataTableSource extends ChangeNotifier {
         'column': 'client',
         'values': [JetsRouterDelegate().selectedClient!],
       });
+    } else if (hasClientColumn) {
+      if (config != null && config.key == DTKeys.inputRegistryTable) {
+        // Add filter to filter out client == 'Any'
+        whereClauses.add(<String, dynamic>{
+          'table': state.tableConfig.fromClauses[0].tableName,
+          'column': 'client',
+          'not_in_values': ['Any'],
+        });
+      }
     }
 
     if (whereClauses.isNotEmpty) {

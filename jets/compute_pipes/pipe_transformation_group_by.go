@@ -17,25 +17,25 @@ type GroupByTransformationPipe struct {
 	groupByCount  int
 	groupByPos    []int
 	spec          *TransformationSpec
-	env           map[string]interface{}
+	env           map[string]any
 	doneCh        chan struct{}
 }
 
-func (ctx *GroupByTransformationPipe) groupValueOf(input *[]interface{}) any {
+func (ctx *GroupByTransformationPipe) groupValueOf(input *[]any) any {
 	if len(ctx.groupByPos) == 1 {
 		return (*input)[ctx.groupByPos[0]]
 	}
 	var buf strings.Builder
 	for _, i := range ctx.groupByPos {
 		if (*input)[i] != nil {
-			buf.WriteString(fmt.Sprintf("%v", (*input)[i]))
+			fmt.Fprintf(&buf, "%v", (*input)[i])
 		}
 	}
 	return buf.String()
 }
 
 // Implementing interface PipeTransformationEvaluator
-func (ctx *GroupByTransformationPipe) Apply(input *[]interface{}) error {
+func (ctx *GroupByTransformationPipe) Apply(input *[]any) error {
 	if input == nil {
 		return fmt.Errorf("error: unexpected null input arg in GroupByTransformationPipe")
 	}
@@ -46,11 +46,17 @@ func (ctx *GroupByTransformationPipe) Apply(input *[]interface{}) error {
 			return nil
 		}
 		// Got value past end of bundle
-		ctx.sendBundle(input)
+		ctx.sendBundle()
+		// Prepare the next bundle
+		ctx.currentBundle = make([]any, 0, ctx.groupByCount)
+		ctx.currentBundle = append(ctx.currentBundle, *input)
 		return nil
 	}
 	// Group by value
 	groupByValue := ctx.groupValueOf(input)
+	if ctx.spec.GroupByConfig.IsDebug {
+		log.Printf("GroupByTransformationPipe input: groupByValue=%v, currentValue=%v", groupByValue, ctx.currentValue)
+	}
 	switch {
 	case ctx.currentValue == nil:
 		// First value of bundle
@@ -59,8 +65,14 @@ func (ctx *GroupByTransformationPipe) Apply(input *[]interface{}) error {
 
 	case ctx.currentValue != groupByValue:
 		// Got value past end of bundle
-		ctx.sendBundle(input)
+		if ctx.spec.GroupByConfig.IsDebug {
+			log.Printf("GroupByTransformationPipe output: sending bundle of size %d with currentValue=%v", len(ctx.currentBundle), ctx.currentValue)
+		}
+		ctx.sendBundle()
 		ctx.currentValue = groupByValue
+		// Prepare the next bundle
+		ctx.currentBundle = make([]any, 0, len(ctx.currentBundle))
+		ctx.currentBundle = append(ctx.currentBundle, *input)
 
 	default:
 		// Adding to the bundle
@@ -69,34 +81,26 @@ func (ctx *GroupByTransformationPipe) Apply(input *[]interface{}) error {
 	return nil
 }
 
-func (ctx *GroupByTransformationPipe) sendBundle(input *[]interface{}) {
-	// Send the bundle out
-	select {
-	case ctx.outputCh.channel <- ctx.currentBundle:
-	case <-ctx.doneCh:
-		log.Println("GroupByTransform interrupted")
-	}
-	// Prepare the next bundle
-	ctx.currentBundle = make([]any, 0)
-	ctx.currentBundle = append(ctx.currentBundle, *input)
-}
-
 func (ctx *GroupByTransformationPipe) Done() error {
 	// Send the last bundle
-	if len(ctx.currentBundle) > 0 {
-		// Send the bundle out the last bundle
-		select {
-		case ctx.outputCh.channel <- ctx.currentBundle:
-		case <-ctx.doneCh:
-			log.Println("GroupByTransform interrupted")
-		}
-	}
-	// log.Println("**!@@ ** Send ANALYZE Result to", ctx.outputCh.name, "DONE")
+	ctx.sendBundle()
 	return nil
 }
 
 func (ctx *GroupByTransformationPipe) Finally() {}
 
+func (ctx *GroupByTransformationPipe) sendBundle() {
+	// Send the bundle out
+	if len(ctx.currentBundle) > 0 {
+		select {
+		case ctx.outputCh.Channel <- ctx.currentBundle:
+		case <-ctx.doneCh:
+			log.Println("GroupByTransform interrupted")
+		}
+	}
+}
+
+// Builder function for GroupByTransformationPipe
 func (ctx *BuilderContext) NewGroupByTransformationPipe(source *InputChannel, outputCh *OutputChannel, spec *TransformationSpec) (*GroupByTransformationPipe, error) {
 	if spec == nil || spec.GroupByConfig == nil {
 		return nil, fmt.Errorf("error: GroupBy Pipe Transformation spec is missing regex, lookup, and/or keywords definition")
@@ -109,7 +113,7 @@ func (ctx *BuilderContext) NewGroupByTransformationPipe(source *InputChannel, ou
 
 	// Check if group by domain_key
 	if len(config.DomainKey) > 0 {
-		dk := source.domainKeySpec
+		dk := source.DomainKeySpec
 		if dk == nil {
 			return nil, fmt.Errorf("error: group_by operator is configured with domain key but no domain key spec available")
 		}
@@ -117,22 +121,29 @@ func (ctx *BuilderContext) NewGroupByTransformationPipe(source *InputChannel, ou
 		if ok {
 			// use config.GroupByName to hold the source of the domain key
 			config.GroupByName = info.KeyExpr
+			if config.IsDebug {
+				log.Printf("GroupByTransformationPipe using domain key '%s' with key expr: %v", config.DomainKey, info.KeyExpr)
+			}
 		} else {
 			return nil, fmt.Errorf("error: group_by operator is configured with domain key, but no domain key defined for %s", config.DomainKey)
 		}
 	}
-	
+
 	if groupByCount == 0 {
 		groupByPos = config.GroupByPos
-		if len(config.GroupByName) > 0 {
-			groupByPos = make([]int, 0)
+		l := len(config.GroupByName)
+		if l > 0 {
+			groupByPos = make([]int, 0, l)
 			for _, name := range config.GroupByName {
-				groupByPos = append(groupByPos, (*source.columns)[name])
+				groupByPos = append(groupByPos, (*source.Columns)[name])
 			}
 		}
 	}
 	if groupByCount == 0 && len(groupByPos) == 0 {
-		return nil, fmt.Errorf("error: group_by operator must specify one of: group_by_name, group_by_pos, group_by_count")
+		return nil, fmt.Errorf("error: group_by operator must specify one of: domain_key, group_by_name, group_by_pos, group_by_count")
+	}
+	if config.IsDebug {
+		log.Printf("GroupByTransformationPipe config: group_by_count=%d, group_by_pos=%v (name=%v)", groupByCount, groupByPos, config.GroupByName)
 	}
 
 	return &GroupByTransformationPipe{

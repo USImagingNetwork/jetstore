@@ -29,14 +29,26 @@ func (jsComp *JetStoreStackComponents) BuildUiService(scope constructs.Construct
 			OperatingSystemFamily: awsecs.OperatingSystemFamily_LINUX(),
 			CpuArchitecture:       awsecs.CpuArchitecture_X86_64(),
 		},
+		Volumes: &[]*awsecs.Volume{
+			{
+				Name: jsii.String("tmp-volume"),
+				// Host is nil because Fargate does not allow host-based volumes
+			},
+		},
+		EphemeralStorageGiB: jsii.Number(40),
 	})
 
+	// Define the log group
+	uiContainerLogGroup := awslogs.NewLogGroup(stack, jsii.String("UiContainerLogGroup"), &awslogs.LogGroupProps{
+		Retention: awslogs.RetentionDays_THREE_MONTHS,
+	})
+	// Define the container
 	jsComp.UiTaskContainer = jsComp.UiTaskDefinition.AddContainer(jsii.String("uiContainer"), &awsecs.ContainerDefinitionOptions{
 		// Use JetStore Image in ecr
 		Image:         jsComp.JetStoreImage,
 		ContainerName: jsii.String("uiContainer"),
 		Essential:     jsii.Bool(true),
-		EntryPoint:    jsii.Strings("apiserver"),
+		EntryPoint:    jsii.Strings("cbooter", "apiserver"),
 		PortMappings: &[]*awsecs.PortMapping{
 			{
 				Name:          jsii.String("ui-port-mapping"),
@@ -47,6 +59,8 @@ func (jsComp *JetStoreStackComponents) BuildUiService(scope constructs.Construct
 		},
 		Environment: &map[string]*string{
 			"JETS_BUCKET":                   jsComp.SourceBucket.BucketName(),
+			"JETS_TEMP_DATA":                jsii.String(jsComp.JetsTempData()),
+			"TMPDIR":                        jsii.String(jsComp.TempDir()),
 			"JETS_DSN_SECRET":               jsComp.RdsSecret.SecretName(),
 			"AWS_API_SECRET":                jsComp.ApiSecret.SecretName(),
 			"AWS_JETS_ADMIN_PWD_SECRET":     jsComp.AdminPwdSecret.SecretName(),
@@ -66,6 +80,7 @@ func (jsComp *JetStoreStackComponents) BuildUiService(scope constructs.Construct
 			"JETS_S3_KMS_KEY_ARN":           jsii.String(os.Getenv("JETS_S3_KMS_KEY_ARN")),
 			"JETS_SENTINEL_FILE_NAME":       jsii.String(os.Getenv("JETS_SENTINEL_FILE_NAME")),
 			"JETS_DOMAIN_KEY_SEPARATOR":     jsii.String(os.Getenv("JETS_DOMAIN_KEY_SEPARATOR")),
+			"WORKSPACES_HOME":               jsii.String("/jetsdata/workspaces"),
 			"WORKSPACE":                     jsii.String(os.Getenv("WORKSPACE")),
 			"WORKSPACE_BRANCH":              jsii.String(os.Getenv("WORKSPACE_BRANCH")),
 			"WORKSPACE_FILE_KEY_LABEL_RE":   jsii.String(os.Getenv("WORKSPACE_FILE_KEY_LABEL_RE")),
@@ -78,6 +93,7 @@ func (jsComp *JetStoreStackComponents) BuildUiService(scope constructs.Construct
 			"JETS_SERVER_SM_ARNv2":          jsii.String(jsComp.ServerSmArnv2),
 			"NBR_SHARDS":                    jsii.String(props.NbrShards),
 			"JETS_CPIPES_SM_ARN":            jsii.String(jsComp.CpipesSmArn),
+			"JETS_CPIPES_NATIVE_SM_ARN":     jsii.String(jsComp.CpipesNativeSmArn),
 			"JETS_REPORTS_SM_ARN":           jsii.String(jsComp.ReportsSmArn),
 			"JETS_ADMIN_EMAIL":              jsii.String(os.Getenv("JETS_ADMIN_EMAIL")),
 		},
@@ -88,8 +104,14 @@ func (jsComp *JetStoreStackComponents) BuildUiService(scope constructs.Construct
 		// },
 		Logging: awsecs.LogDriver_AwsLogs(&awsecs.AwsLogDriverProps{
 			StreamPrefix: jsii.String("task"),
-			LogRetention: awslogs.RetentionDays_THREE_MONTHS,
+			LogGroup:     uiContainerLogGroup,
 		}),
+		ReadonlyRootFilesystem: jsii.Bool(true),
+	})
+	jsComp.UiTaskContainer.AddMountPoints(&awsecs.MountPoint{
+		SourceVolume:  jsii.String("tmp-volume"),
+		ContainerPath: jsii.String("/jetsdata"),
+		ReadOnly:      jsii.Bool(false),
 	})
 
 	jsComp.EcsUiService = awsecs.NewFargateService(stack, jsii.String("jetstore-ui"), &awsecs.FargateServiceProps{
@@ -100,7 +122,11 @@ func (jsComp *JetStoreStackComponents) BuildUiService(scope constructs.Construct
 		AssignPublicIp: jsii.Bool(false),
 		DesiredCount:   jsii.Number(1),
 		SecurityGroups: &[]awsec2.ISecurityGroup{
-			jsComp.PrivateSecurityGroup,
+			jsComp.VpcEndpointsSg,
+			jsComp.RdsAccessSg,
+			// jsComp.ElbInboundSg,
+			// Add git access security group to allow outbound access to git providers
+			// for pulling workspace definitions
 			NewGitAccessSecurityGroup(stack, jsComp.Vpc)},
 	})
 	if phiTagName != nil {

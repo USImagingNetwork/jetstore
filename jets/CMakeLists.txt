@@ -55,14 +55,10 @@ add_library(${C_LIBRARY_NAME}_static STATIC $<TARGET_OBJECTS:objlib>)
 
 # Linking
 target_link_libraries(${C_LIBRARY_NAME}
-  # jemalloc
-  # boost_filesystem
-  # boost_system
   gflags
   glog
   absl_hash
   absl_city
-  absl_low_level_hash
   absl_raw_hash_set
   boost_date_time
   pthread
@@ -83,7 +79,9 @@ add_executable(jets_test
   rete/node_vertex_test.cc
   rete/rete_meta_store_test.cc
   rete/rete_session_test.cc
-  # # rete/rete_meta_store_factory_test.cc
+  rete/rete_meta_store_factory_test0.cc
+  rete/rete_meta_store_factory_test1.cc
+  rete/rete_meta_store_factory_test2.cc
   rete/expr_op_test.cc
   rete/expr_op_specialty_test.cc
 )
@@ -93,7 +91,6 @@ target_link_libraries(jets_test
   glog
   absl_hash
   absl_city
-  absl_low_level_hash
   absl_raw_hash_set
   boost_date_time
   gtest

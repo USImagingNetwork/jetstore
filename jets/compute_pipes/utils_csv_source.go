@@ -5,12 +5,10 @@ import (
 	"io"
 	"log"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/artisoft-io/jetstore/jets/csv"
-	"github.com/artisoft-io/jetstore/jets/jetrules/rdf"
-	"github.com/artisoft-io/jetstore/jets/jetrules/rete"
+	"github.com/artisoft-io/jetstore/jets/utils"
 	"github.com/golang/snappy"
 	"github.com/google/uuid"
 )
@@ -32,22 +30,22 @@ func NewCsvSourceS3(spec *CsvSourceSpec, env map[string]any) (*CsvSourceS3, erro
 		if len(spec.ReadStepId) == 0 {
 			return nil, fmt.Errorf("error: s3_csv_lookup of type cpipes must have read_step_id provided in cpipes spec")
 		} else {
-			spec.ReadStepId = replaceEnvVars(spec.ReadStepId, env)
+			spec.ReadStepId = utils.ReplaceEnvVars(spec.ReadStepId, env)
 		}
 		if len(spec.ProcessName) == 0 {
 			spec.ProcessName = env["$PROCESS_NAME"].(string)
 		} else {
-			spec.ProcessName = replaceEnvVars(spec.ProcessName, env)
+			spec.ProcessName = utils.ReplaceEnvVars(spec.ProcessName, env)
 		}
 		if len(spec.SessionId) == 0 {
 			spec.SessionId = env["$SESSIONID"].(string)
 		} else {
-			spec.SessionId = replaceEnvVars(spec.SessionId, env)
+			spec.SessionId = utils.ReplaceEnvVars(spec.SessionId, env)
 		}
 		if len(spec.JetsPartitionLabel) == 0 {
 			spec.JetsPartitionLabel = env["$JETS_PARTITION_LABEL"].(string)
 		} else {
-			spec.JetsPartitionLabel = replaceEnvVars(spec.JetsPartitionLabel, env)
+			spec.JetsPartitionLabel = utils.ReplaceEnvVars(spec.JetsPartitionLabel, env)
 		}
 		if len(spec.Format) == 0 {
 			spec.Format = "headerless_csv"
@@ -55,11 +53,12 @@ func NewCsvSourceS3(spec *CsvSourceSpec, env map[string]any) (*CsvSourceS3, erro
 		if len(spec.Compression) == 0 {
 			spec.Compression = "snappy"
 		}
-		fileKeys, err := GetS3FileKeys(spec.ProcessName, spec.SessionId,
-			spec.ReadStepId, spec.JetsPartitionLabel)
+		allFileKeys, err := GetS3FileKeys(spec.ProcessName, spec.SessionId,
+			spec.ReadStepId, spec.JetsPartitionLabel, &InputChannelConfig{}, nil)
 		if err != nil {
 			return nil, fmt.Errorf("failed to file keys for CsvSourceS3 of type cpipes: %v", err)
 		}
+		fileKeys := allFileKeys[0]
 		if len(fileKeys) == 0 {
 			if spec.MakeEmptyWhenNoFile {
 				return &CsvSourceS3{
@@ -85,7 +84,8 @@ func NewCsvSourceS3(spec *CsvSourceSpec, env map[string]any) (*CsvSourceS3, erro
 }
 
 // *TODO Refactor this ReadFileToMetaGraph func
-func (ctx *CsvSourceS3) ReadFileToMetaGraph(reteMetaStore *rete.ReteMetaStoreFactory, config *JetrulesSpec) error {
+func (ctx *CsvSourceS3) ReadFileToMetaGraph(re JetRuleEngine, config *JetrulesSpec) error {
+	rm := re.GetMetaResourceManager()
 
 	// Create a local temp directory to hold the file
 	inFolderPath, err := os.MkdirTemp("", "jetstore")
@@ -112,7 +112,7 @@ do_retry:
 	var csvReader *csv.Reader
 	var inputRowCount int64
 	var inRow []string
-	var predicates []*rdf.Node
+	var predicates []RdfNode
 	var rdfTypes []string
 
 	fileHd, err = os.Open(localFileName)
@@ -151,10 +151,10 @@ do_retry:
 			return fmt.Errorf("error get data properties from local workspace")
 		}
 		// Make the property resource (the predicate of the triple)
-		predicates = make([]*rdf.Node, 0, len(headers))
+		predicates = make([]RdfNode, 0, len(headers))
 		var dataType string
 		for _, h := range headers {
-			predicates = append(predicates, reteMetaStore.ResourceMgr.NewResource(h))
+			predicates = append(predicates, rm.NewResource(h))
 			nd := dataPropertyMap[h]
 			dataType = "text"
 			if nd != nil {
@@ -174,15 +174,15 @@ do_retry:
 	if err != nil {
 		return fmt.Errorf("error while reading first input records in readCsvLookup: %v", err)
 	}
-	jr := reteMetaStore.ResourceMgr.JetsResources
+	jr := re.JetResources()
 	if jr == nil {
 		return fmt.Errorf("error: bug nil JetsResources")
 	}
 
-	var object *rdf.Node
-	var rdfClass *rdf.Node
+	var object RdfNode
+	var rdfClass RdfNode
 	if len(ctx.spec.ClassName) > 0 {
-		rdfClass = reteMetaStore.ResourceMgr.NewResource(ctx.spec.ClassName)
+		rdfClass = rm.NewResource(ctx.spec.ClassName)
 	}
 
 	for {
@@ -191,28 +191,27 @@ do_retry:
 		inRow, err = csvReader.Read()
 		if err == nil {
 			subjectTxt := uuid.New().String()
-			subject := reteMetaStore.ResourceMgr.NewResource(subjectTxt)
+			subject := rm.NewResource(subjectTxt)
 			if rdfClass != nil {
-				_, err = reteMetaStore.MetaGraph.Insert(subject, jr.Rdf__type, rdfClass)
+				err = re.Insert(subject, jr.Rdf__type, rdfClass)
 				if err != nil {
 					return err
 				}
 			}
 			for i, value := range inRow {
 				// Parse the value to the rdfType
-				object, err = ParseObject(reteMetaStore.ResourceMgr, value, rdfTypes[i])
+				object, err = ParseRdfNodeValue(rm, value, rdfTypes[i])
 				if err != nil {
 					log.Printf("WARNING: Cannot parse value to rdf type %s\n", rdfTypes[i])
-					object = rdf.Null()
+					object = rm.RdfNull()
 				}
 				// Assert the triple
-				_, err = reteMetaStore.MetaGraph.Insert(subject, predicates[i], object)
+				err = re.Insert(subject, predicates[i], object)
 				if err != nil {
 					return err
 				}
 			}
-			_, err = reteMetaStore.MetaGraph.Insert(subject, jr.Jets__key,
-				reteMetaStore.ResourceMgr.NewTextLiteral(subjectTxt))
+			err = re.Insert(subject, jr.Jets__key, rm.NewTextLiteral(subjectTxt))
 			if err != nil {
 				return err
 			}
@@ -231,19 +230,4 @@ do_retry:
 			inputRowCount += 1
 		}
 	}
-}
-
-// Utility function
-func replaceEnvVars(value string, env map[string]any) string {
-	lc := 0
-	for strings.Contains(value, "$") && lc < 3 {
-		lc += 1
-		for k, v := range env {
-			v, ok := v.(string)
-			if ok {
-				value = strings.ReplaceAll(value, k, v)
-			}
-		}
-	}
-	return value
 }
