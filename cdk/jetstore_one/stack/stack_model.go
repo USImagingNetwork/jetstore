@@ -31,7 +31,6 @@ type JetstoreOneStackProps struct {
 	DbMaxCapacity                *float64
 	CpuUtilizationAlarmThreshold *float64
 	SnsAlarmTopicArn             *string
-	NbrShards                    string
 	MaxConcurrency               float64
 }
 
@@ -58,9 +57,6 @@ type ApiGatewayProxyPolicyStatement struct {
 
 // Struct to hold the stack components
 type JetStoreStackComponents struct {
-	LoaderSmArn       string
-	ServerSmArn       string
-	ServerSmArnv2     string
 	CpipesSmArn       string
 	CpipesNativeSmArn string
 	ReportsSmArn      string
@@ -71,7 +67,7 @@ type JetStoreStackComponents struct {
 
 	SourceBucket    awss3.IBucket
 	ExternalBuckets []awss3.IBucket
-	ExternalKmsKey  awskms.IKey
+	ExternalKmsKeys []awskms.IKey
 
 	Vpc                     awsec2.IVpc
 	PublicSubnetSelection   *awsec2.SubnetSelection
@@ -81,7 +77,6 @@ type JetStoreStackComponents struct {
 	VpcEndpointsSg   awsec2.ISecurityGroup
 	RdsAccessSg      awsec2.ISecurityGroup
 	InternetAccessSg awsec2.ISecurityGroup
-	// ElbInboundSg     awsec2.ISecurityGroup
 
 	RdsSecret            awsrds.DatabaseSecret
 	RdsCluster           awsrds.DatabaseCluster
@@ -91,24 +86,15 @@ type JetStoreStackComponents struct {
 	JetStoreImage        awsecs.EcrImage
 	CpipesImage          awsecs.EcrImage
 
-	RunreportTaskDefinition    awsecs.FargateTaskDefinition
-	RunreportsContainerDef     awsecs.ContainerDefinition
+	RunreportTaskDefinition awsecs.FargateTaskDefinition
+	RunreportsContainerDef  awsecs.ContainerDefinition
 
-	LoaderTaskDefinition       awsecs.FargateTaskDefinition
-	LoaderContainerDef         awsecs.ContainerDefinition
-	
-	ServerTaskDefinition       awsecs.FargateTaskDefinition
-	ServerContainerDef         awsecs.ContainerDefinition
-	
-	Serverv2TaskDefinition     awsecs.FargateTaskDefinition
-	Serverv2ContainerDef       awsecs.ContainerDefinition
-	
-	CpipesTaskDefinition       awsecs.FargateTaskDefinition
-	CpipesContainerDef         awsecs.ContainerDefinition
-	
-	UiTaskDefinition           awsecs.FargateTaskDefinition
-	UiTaskContainer            awsecs.ContainerDefinition
-	EcsUiService               awsecs.FargateService
+	CpipesTaskDefinition awsecs.FargateTaskDefinition
+	CpipesContainerDef   awsecs.ContainerDefinition
+
+	UiTaskDefinition awsecs.FargateTaskDefinition
+	UiTaskContainer  awsecs.ContainerDefinition
+	EcsUiService     awsecs.FargateService
 
 	UiLoadBalancer    awselb.ApplicationLoadBalancer
 	WebAcl            awswafv2.CfnWebACL
@@ -123,14 +109,13 @@ type JetStoreStackComponents struct {
 	// Lambdas Execution Role
 	// applicable to: RunReportsLambda, CpipesRunReportsLambda, CpipesNodeLambda, CpipesNativeNodeLambda,
 	// CpipesStartShardingLambda, CpipesStartReducingLambda, SqsRegisterKeyLambda, ApiGatewayLambda
-	LambdaExecutionRole       awsiam.Role
+	LambdaExecutionRole awsiam.Role
 
 	StatusUpdateLambda        awslambdago.GoFunction
 	SecretRotationLambda      awslambdago.GoFunction
 	RunReportsLambda          awslambdago.GoFunction
 	CpipesRunReportsLambda    awslambdago.GoFunction
 	PurgeDataLambda           awslambdago.GoFunction
-	serverv2NodeLambda        awslambdago.GoFunction
 	CpipesNodeLambda          awslambdago.GoFunction
 	CpipesNativeNodeLambda    awslambdago.GoFunction
 	CpipesStartShardingLambda awslambdago.GoFunction
@@ -140,10 +125,7 @@ type JetStoreStackComponents struct {
 	ApiGatewayLambda          awslambdago.GoFunction
 	ApiGatewayTestLambda      awslambdago.GoFunction
 
-	LoaderSM       sfn.StateMachine
 	ReportsSM      sfn.StateMachine
-	ServerSM       sfn.StateMachine
-	Serverv2SM     sfn.StateMachine
 	CpipesSM       sfn.StateMachine
 	CpipesNativeSM sfn.StateMachine
 	BastionHost    awsec2.BastionHostLinux
@@ -184,7 +166,7 @@ func (jsComp *JetStoreStackComponents) JetsTempData() string {
 func (jsComp *JetStoreStackComponents) TempDir() string {
 	var tmpDir string
 	tmpDir = os.Getenv("TMPDIR")
-		if tmpDir == "" {
+	if tmpDir == "" {
 		tmpDir = path.Join(jsComp.JetsTempData(), "tmp")
 	}
 	return tmpDir
@@ -212,7 +194,26 @@ func (jsComp *JetStoreStackComponents) ResolveExternalKmsKey(stack awscdk.Stack)
 	kmsArn := os.Getenv("JETS_S3_KMS_KEY_ARN")
 	if len(kmsArn) > 0 {
 		// Provide the ability to use the kms key
-		jsComp.ExternalKmsKey = awskms.Key_FromKeyArn(stack, jsii.String("existingKmsKey"), jsii.String(kmsArn))
+		jsComp.ExternalKmsKeys = append(jsComp.ExternalKmsKeys,
+			awskms.Key_FromKeyArn(stack, jsii.String("existingKmsKey"), jsii.String(kmsArn)))
+		log.Printf("Resolved main external KMS key '%s'\n", kmsArn)
+	}
+	keysArn := os.Getenv("EXTERNAL_S3_KMS_KEY_ARN")
+	if keysArn == "" {
+		return
+	}
+	for key := range strings.SplitSeq(keysArn, ",") {
+		if key != "" {
+			jsComp.ExternalKmsKeys = append(jsComp.ExternalKmsKeys,
+				awskms.Key_FromKeyArn(stack, jsii.String(fmt.Sprintf("ExternalKmsKey%d", len(jsComp.ExternalKmsKeys))), jsii.String(key)))
+			log.Printf("Resolved external KMS key '%s'\n", key)
+		}
+	}
+}
+
+func (jsComp *JetStoreStackComponents) GrantEncryptDecryptExternalKmsKey(grantee awsiam.IGrantable) {
+	for _, key := range jsComp.ExternalKmsKeys {
+		key.GrantEncryptDecrypt(grantee)
 	}
 }
 
