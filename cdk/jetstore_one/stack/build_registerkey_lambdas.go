@@ -39,8 +39,6 @@ func (jsComp *JetStoreStackComponents) BuildRegisterKeyLambdas(scope constructs.
 			"JETS_ADMIN_EMAIL":                         jsii.String(os.Getenv("JETS_ADMIN_EMAIL")),
 			"JETS_INPUT_ROW_JETS_KEY_ALGO":             jsii.String(os.Getenv("JETS_INPUT_ROW_JETS_KEY_ALGO")),
 			"JETS_INVALID_CODE":                        jsii.String(os.Getenv("JETS_INVALID_CODE")),
-			"JETS_LOADER_CHUNCK_SIZE":                  jsii.String(os.Getenv("JETS_LOADER_CHUNCK_SIZE")),
-			"JETS_LOADER_SM_ARN":                       jsii.String(jsComp.LoaderSmArn),
 			"CPIPES_DB_POOL_SIZE":                      jsii.String(os.Getenv("CPIPES_DB_POOL_SIZE")),
 			"JETS_REGION":                              jsii.String(os.Getenv("AWS_REGION")),
 			"JETS_PIVOT_YEAR_TIME_PARSING":             jsii.String(os.Getenv("JETS_PIVOT_YEAR_TIME_PARSING")),
@@ -52,8 +50,6 @@ func (jsComp *JetStoreStackComponents) BuildRegisterKeyLambdas(scope constructs.
 			"JETS_SENTINEL_FILE_NAME":                  jsii.String(os.Getenv("JETS_SENTINEL_FILE_NAME")),
 			"JETS_PIPELINE_THROTTLING_JSON":            jsii.String(os.Getenv("JETS_PIPELINE_THROTTLING_JSON")),
 			"JETS_CPIPES_SM_TIMEOUT_MIN":               jsii.String(os.Getenv("JETS_CPIPES_SM_TIMEOUT_MIN")),
-			"JETS_SERVER_SM_ARN":                       jsii.String(jsComp.ServerSmArn),
-			"JETS_SERVER_SM_ARNv2":                     jsii.String(jsComp.ServerSmArnv2),
 			"JETS_CPIPES_SM_ARN":                       jsii.String(jsComp.CpipesSmArn),
 			"JETS_CPIPES_NATIVE_SM_ARN":                jsii.String(jsComp.CpipesNativeSmArn),
 			"JETS_REPORTS_SM_ARN":                      jsii.String(jsComp.ReportsSmArn),
@@ -64,7 +60,6 @@ func (jsComp *JetStoreStackComponents) BuildRegisterKeyLambdas(scope constructs.
 			"CPIPES_COMPLETED_NOTIFICATION_JSON":       jsii.String(os.Getenv("CPIPES_COMPLETED_NOTIFICATION_JSON")),
 			"CPIPES_FAILED_NOTIFICATION_JSON":          jsii.String(os.Getenv("CPIPES_FAILED_NOTIFICATION_JSON")),
 			"TASK_MAX_CONCURRENCY":                     jsii.String(os.Getenv("TASK_MAX_CONCURRENCY")),
-			"NBR_SHARDS":                               jsii.String(props.NbrShards),
 			"ENVIRONMENT":                              jsii.String(os.Getenv("ENVIRONMENT")),
 			"WORKSPACES_HOME":                          jsii.String("/tmp/workspaces"),
 			"WORKSPACE":                                jsii.String(os.Getenv("WORKSPACE")),
@@ -104,9 +99,8 @@ func (jsComp *JetStoreStackComponents) BuildRegisterKeyLambdas(scope constructs.
 	jsComp.SourceBucket.AddEventNotification(awss3.EventType_OBJECT_CREATED, awss3n.NewLambdaDestination(jsComp.RegisterKeyV2Lambda), &awss3.NotificationKeyFilter{
 		Prefix: jsii.String(GetS3SchemaTriggersPrefix()),
 	})
-	if jsComp.ExternalKmsKey != nil {
-		jsComp.ExternalKmsKey.GrantEncryptDecrypt(jsComp.RegisterKeyV2Lambda)
-	}
+
+	jsComp.GrantEncryptDecryptExternalKmsKey(jsComp.RegisterKeyV2Lambda)
 	// END Create a Lambda function to register File Keys with JetStore DB
 
 	// Lambda Function for installation-specific integration for Register Key from SQS Event or other
@@ -161,8 +155,6 @@ func (jsComp *JetStoreStackComponents) BuildRegisterKeyLambdas(scope constructs.
 				"JETS_ADMIN_EMAIL":                         jsii.String(os.Getenv("JETS_ADMIN_EMAIL")),
 				"JETS_INPUT_ROW_JETS_KEY_ALGO":             jsii.String(os.Getenv("JETS_INPUT_ROW_JETS_KEY_ALGO")),
 				"JETS_INVALID_CODE":                        jsii.String(os.Getenv("JETS_INVALID_CODE")),
-				"JETS_LOADER_CHUNCK_SIZE":                  jsii.String(os.Getenv("JETS_LOADER_CHUNCK_SIZE")),
-				"JETS_LOADER_SM_ARN":                       jsii.String(jsComp.LoaderSmArn),
 				"CPIPES_DB_POOL_SIZE":                      jsii.String(os.Getenv("CPIPES_DB_POOL_SIZE")),
 				"JETS_REGION":                              jsii.String(os.Getenv("AWS_REGION")),
 				"JETS_PIVOT_YEAR_TIME_PARSING":             jsii.String(os.Getenv("JETS_PIVOT_YEAR_TIME_PARSING")),
@@ -174,8 +166,6 @@ func (jsComp *JetStoreStackComponents) BuildRegisterKeyLambdas(scope constructs.
 				"JETS_SENTINEL_FILE_NAME":                  jsii.String(os.Getenv("JETS_SENTINEL_FILE_NAME")),
 				"JETS_PIPELINE_THROTTLING_JSON":            jsii.String(os.Getenv("JETS_PIPELINE_THROTTLING_JSON")),
 				"JETS_CPIPES_SM_TIMEOUT_MIN":               jsii.String(os.Getenv("JETS_CPIPES_SM_TIMEOUT_MIN")),
-				"JETS_SERVER_SM_ARN":                       jsii.String(jsComp.ServerSmArn),
-				"JETS_SERVER_SM_ARNv2":                     jsii.String(jsComp.ServerSmArnv2),
 				"JETS_CPIPES_SM_ARN":                       jsii.String(jsComp.CpipesSmArn),
 				"JETS_CPIPES_NATIVE_SM_ARN":                jsii.String(jsComp.CpipesNativeSmArn),
 				"JETS_REPORTS_SM_ARN":                      jsii.String(jsComp.ReportsSmArn),
@@ -186,7 +176,6 @@ func (jsComp *JetStoreStackComponents) BuildRegisterKeyLambdas(scope constructs.
 				"CPIPES_COMPLETED_NOTIFICATION_JSON":       jsii.String(os.Getenv("CPIPES_COMPLETED_NOTIFICATION_JSON")),
 				"CPIPES_FAILED_NOTIFICATION_JSON":          jsii.String(os.Getenv("CPIPES_FAILED_NOTIFICATION_JSON")),
 				"TASK_MAX_CONCURRENCY":                     jsii.String(os.Getenv("TASK_MAX_CONCURRENCY")),
-				"NBR_SHARDS":                               jsii.String(props.NbrShards),
 				"ENVIRONMENT":                              jsii.String(os.Getenv("ENVIRONMENT")),
 				"WORKSPACES_HOME":                          jsii.String("/tmp/workspaces"),
 				"WORKSPACE":                                jsii.String(os.Getenv("WORKSPACE")),
@@ -225,8 +214,7 @@ func (jsComp *JetStoreStackComponents) BuildRegisterKeyLambdas(scope constructs.
 				Target:         jsComp.SqsRegisterKeyLambda,
 			})
 		}
-		if jsComp.ExternalKmsKey != nil {
-			jsComp.ExternalKmsKey.GrantEncryptDecrypt(jsComp.SqsRegisterKeyLambda)
-		}
+		//* This may not be needed since LambdaExecutionRole should already have permissions to access kms key
+		jsComp.GrantEncryptDecryptExternalKmsKey(jsComp.SqsRegisterKeyLambda)
 	}
 }
