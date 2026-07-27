@@ -25,12 +25,13 @@ type ShardFileKeyResult struct {
 	clusterShardingInfo *ClusterShardingInfo
 	nbrShardingNodes    int
 	firstKey            string
+	firstKeyFileSize		int64
 	clusterSpec         *ClusterShardingSpec
 }
 
 // ShardFileKeys: assign file keys to nodes for sharding mode according to inputChannelConfig and clusterConfig.
 func ShardFileKeys(exeCtx context.Context, dbpool *pgxpool.Pool, baseFileKey string, sessionId string,
-	inputChannelConfig InputChannelConfig, clusterConfig *ClusterSpec,
+	inputChannelConfig InputChannelConfig, clusterConfig *ClusterSpec, isMergeFileOnly bool,
 	schemaProviderConfig *SchemaProviderSpec) (result ShardFileKeyResult, cpErr error) {
 
 	var err error
@@ -60,7 +61,7 @@ func ShardFileKeys(exeCtx context.Context, dbpool *pgxpool.Pool, baseFileKey str
 		fileKey := fmt.Sprintf("%s/%s", awsi.JetStoreStagePrefix(), inputChannelConfig.FileKey)
 		lback := inputChannelConfig.LookbackPeriods
 		if len(lback) > 0 {
-			s3Objects, err = GetS3Objects4LookbackPeriod(schemaProviderConfig.Bucket, fileKey,
+			s3Objects, err = GetS3Objects4LookbackPeriod("", fileKey,
 				inputChannelConfig.LookbackPeriods, envSettings)
 			if err != nil {
 				cpErr = fmt.Errorf("failed to download list of files from s3 for lookback periods: %v", err)
@@ -69,7 +70,7 @@ func ShardFileKeys(exeCtx context.Context, dbpool *pgxpool.Pool, baseFileKey str
 		} else {
 			fileKeyPrefix := utils.ReplaceEnvVars(fileKey, envSettings)
 			log.Printf("Downloading file keys from s3 stage folder: %s", fileKeyPrefix)
-			s3Objects, err = awsi.ListS3Objects(schemaProviderConfig.Bucket, &fileKeyPrefix)
+			s3Objects, err = awsi.ListS3Objects("", &fileKeyPrefix)
 			if err != nil {
 				cpErr = fmt.Errorf("failed to download list of files from s3: %v", err)
 				return
@@ -79,6 +80,94 @@ func ShardFileKeys(exeCtx context.Context, dbpool *pgxpool.Pool, baseFileKey str
 	case "generator":
 		cpErr = fmt.Errorf("error: input channel type 'generator' is not supported for sharding mode in ShardFileKeys")
 		return
+	}
+
+	if len(s3Objects) == 0 {
+		cpErr = fmt.Errorf("error: input folder contains no data files")
+		return
+	}
+
+	// Select cluster config based on main input files (s3Objects)
+	// Get the total file size
+	for _, obj := range s3Objects {
+		result.clusterShardingInfo.TotalFileSize += obj.Size
+	}
+	if result.clusterShardingInfo.TotalFileSize == 0 {
+		cpErr = fmt.Errorf("error: input folder contains no data files")
+		return
+	}
+	totalSizeMb = int(result.clusterShardingInfo.TotalFileSize / 1024 / 1024)
+
+	if isMergeFileOnly {
+		// If it's merge file only, we want to put all files in one shard
+		result.clusterSpec = &ClusterShardingSpec{
+			MaxNbrPartitions: 1,
+			ShardSizeMb:      0,
+			ShardSizeBy:      float64(result.clusterShardingInfo.TotalFileSize + 1024), // add 1KB buffer to avoid shard size limit error
+			ShardMaxSizeMb:   0,
+			ShardMaxSizeBy:   float64(result.clusterShardingInfo.TotalFileSize + 1024*1024), // add 1MB buffer to avoid shard size limit error
+			MaxConcurrency:   clusterConfig.DefaultMaxConcurrency,
+		}
+		log.Printf("Merge file only, put all files in one shard with size %d MB", totalSizeMb)
+	} else {
+		// Determine the tier of sharding
+		result.clusterSpec = selectClusterShardingTier(totalSizeMb, schemaProviderConfig.Format, clusterConfig)
+	}
+
+	if result.clusterSpec.ShardSizeBy > 0 {
+		shardSize = int64(result.clusterSpec.ShardSizeBy)
+	} else {
+		shardSize = int64(result.clusterSpec.ShardSizeMb * 1024 * 1024)
+	}
+	if result.clusterSpec.ShardMaxSizeBy > 0 {
+		maxShardSize = int64(result.clusterSpec.ShardMaxSizeBy)
+	} else {
+		maxShardSize = int64(result.clusterSpec.ShardMaxSizeMb * 1024 * 1024)
+	}
+	// Validate ClusterShardingSpec
+	if shardSize == 0 {
+		cpErr = fmt.Errorf(
+			"error: invalid cluster config, need to specify shard_size_mb/shard_max_size_mb or their default values")
+		return
+	}
+	if maxShardSize < shardSize {
+		maxShardSize = shardSize
+	}
+
+	// Allocate file keys to nodes
+	doSplitFiles = false
+	isParquet := false
+	offset = int64(clusterConfig.ShardOffset)
+	if offset > 0 {
+		// Determine if we can split large files
+		switch schemaProviderConfig.Format {
+		case "csv", "headerless_csv", "fixed_width":
+			doSplitFiles = true
+		case "parquet", "parquet_select":
+			doSplitFiles = true
+			isParquet = true
+		}
+	}
+
+	// shardRegistryRow row of jetsapi.compute_pipes_shard_registry
+	var shardRegistryRows [][]any
+	switch {
+	case isMergeFileOnly:
+		shardRegistryRows, result.nbrShardingNodes = assignShardInfo(s3Objects, shardSize, maxShardSize,
+			0, false, sessionId, 0)
+		if result.nbrShardingNodes > 1 {
+			cpErr = fmt.Errorf("unexpected error: got %d shards for merge file only, expected 1 shard.",
+				result.nbrShardingNodes)
+			return
+		}
+
+	case isParquet:
+		shardRegistryRows, result.nbrShardingNodes = assignShardInfoParquet(s3Objects, shardSize, maxShardSize,
+			doSplitFiles, sessionId, 0)
+
+	default:
+		shardRegistryRows, result.nbrShardingNodes = assignShardInfo(s3Objects, shardSize, maxShardSize,
+			offset, doSplitFiles, sessionId, 0)
 	}
 
 	// Need to get the merge channels files as well
@@ -94,72 +183,6 @@ func ShardFileKeys(exeCtx context.Context, dbpool *pgxpool.Pool, baseFileKey str
 			return
 		}
 		mergeS3Objects[i] = append(mergeS3Objects[i], mergeObjects...)
-	}
-
-	if len(s3Objects) == 0 {
-		cpErr = fmt.Errorf("error: input folder contains no data files")
-		return
-	}
-	// Select cluster config based on main input files (s3Objects)
-	// Get the total file size
-	for _, obj := range s3Objects {
-		result.clusterShardingInfo.TotalFileSize += obj.Size
-	}
-	if result.clusterShardingInfo.TotalFileSize == 0 {
-		cpErr = fmt.Errorf("error: input folder contains no data files")
-		return
-	}
-	totalSizeMb = int(result.clusterShardingInfo.TotalFileSize / 1024 / 1024)
-
-	// Determine the tier of sharding
-	result.clusterSpec = selectClusterShardingTier(totalSizeMb, schemaProviderConfig.Format, clusterConfig)
-
-	if result.clusterSpec.ShardSizeBy > 0 {
-		shardSize = int64(result.clusterSpec.ShardSizeBy)
-	} else {
-		shardSize = int64(result.clusterSpec.ShardSizeMb * 1024 * 1024)
-	}
-
-	if result.clusterSpec.ShardMaxSizeBy > 0 {
-		maxShardSize = int64(result.clusterSpec.ShardMaxSizeBy)
-	} else {
-		maxShardSize = int64(result.clusterSpec.ShardMaxSizeMb * 1024 * 1024)
-	}
-
-	offset = int64(clusterConfig.ShardOffset)
-
-	// Allocate file keys to nodes
-	doSplitFiles = false
-	isParquet := false
-	if offset > 0 {
-		// Determine if we can split large files
-		switch schemaProviderConfig.Format {
-		case "csv", "headerless_csv", "fixed_width":
-			doSplitFiles = true
-		case "parquet", "parquet_select":
-			doSplitFiles = true
-			isParquet = true
-		}
-	}
-
-	// Validate ClusterShardingSpec
-	if shardSize == 0 {
-		cpErr = fmt.Errorf(
-			"error: invalid cluster config, need to specify shard_size_mb/shard_max_size_mb or their default values")
-		return
-	}
-	if maxShardSize < shardSize {
-		maxShardSize = shardSize
-	}
-
-	// shardRegistryRow row of jetsapi.compute_pipes_shard_registry
-	var shardRegistryRows [][]any
-	if isParquet {
-		shardRegistryRows, result.nbrShardingNodes = assignShardInfoParquet(s3Objects, shardSize, maxShardSize,
-			doSplitFiles, sessionId, 0)
-	} else {
-		shardRegistryRows, result.nbrShardingNodes = assignShardInfo(s3Objects, shardSize, maxShardSize,
-			offset, doSplitFiles, sessionId, 0)
 	}
 
 	// Add merge channel files to shardRegistryRows
@@ -185,6 +208,7 @@ func ShardFileKeys(exeCtx context.Context, dbpool *pgxpool.Pool, baseFileKey str
 	}
 
 	result.firstKey = shardRegistryRows[0][1].(string)
+	result.firstKeyFileSize = shardRegistryRows[0][2].(int64)
 
 	if result.clusterSpec.S3WorkerPoolSize == 0 {
 		result.clusterSpec.S3WorkerPoolSize = clusterConfig.S3WorkerPoolSize
@@ -321,8 +345,8 @@ func assignShardInfo(s3Objects []*awsi.S3Object, shardSize, maxShardSize, offset
 			var end int64
 			reminder := obj.Size
 			for reminder > 0 {
-				if start+shardSize-currentShardSize >= obj.Size {
-					end = obj.Size
+				if start+shardSize-currentShardSize >= obj.Size - 1 {
+					end = obj.Size -1
 					nextStart = 0
 					reminder = 0
 				} else {

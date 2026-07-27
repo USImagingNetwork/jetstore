@@ -2,7 +2,6 @@ package stack
 
 import (
 	"encoding/json"
-	"fmt"
 	"log"
 	"os"
 	"strconv"
@@ -79,7 +78,7 @@ func LookupVpcEndpointsSecurityGroup(stack awscdk.Stack, sgId string) awsec2.ISe
 		log.Fatal("Failed to lookup security group, please check JETS_VPC_ENDPOINTS_SG_ID")
 	}
 	log.Printf("Resolved VPC Endpoints Security Group '%s'\n", *sg.SecurityGroupId())
-	log.Printf("Egress rules are %T, %v '%s'\n", sg.ToEgressRuleConfig(), sg.ToEgressRuleConfig(), sg.ToEgressRuleConfig())
+	// log.Printf("Egress rules are %T, %v\n", sg.ToEgressRuleConfig(), sg.ToEgressRuleConfig())
 	return sg
 }
 
@@ -183,8 +182,8 @@ func CreateJetStoreVPC(stack awscdk.Stack) awsec2.Vpc {
 		var tags map[string]string
 		err := json.Unmarshal([]byte(os.Getenv("JETS_STACK_TAGS_JSON")), &tags)
 		if err != nil {
-			fmt.Println("** Invalid JSON in JETS_STACK_TAGS_JSON:", err)
-			os.Exit(1)
+			log.Println("** Invalid JSON in JETS_STACK_TAGS_JSON:", err)
+			log.Panic("Terminated due to invalid JSON in JETS_STACK_TAGS_JSON")
 		}
 		for k, v := range tags {
 			awscdk.Tags_Of(s3Endpoint).Add(jsii.String(k), jsii.String(v), nil)
@@ -219,8 +218,8 @@ func init() {
 	if os.Getenv("JETS_STACK_TAGS_JSON") != "" {
 		err := json.Unmarshal([]byte(os.Getenv("JETS_STACK_TAGS_JSON")), &tags)
 		if err != nil {
-			fmt.Println("** Invalid JSON in JETS_STACK_TAGS_JSON:", err)
-			os.Exit(1)
+			log.Println("** Invalid JSON in JETS_STACK_TAGS_JSON:", err)
+			log.Panic("Terminated due to invalid JSON in JETS_STACK_TAGS_JSON")
 		}
 	}
 }

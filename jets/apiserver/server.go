@@ -69,8 +69,11 @@ func corsh(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// DEV
 		// log.Println("* cors for",r.URL.Path,", Origin Header:", r.Header.Get("Origin"))
-		//* check that origin is what we expect
-		w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
+		// Check that origin is what we expect
+		origin := sanitizeOrigin(r.Header.Get("Origin"))
+		if origin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+		}
 		next(w, r)
 	}
 }
@@ -85,14 +88,16 @@ type OptionConfig struct {
 func (optionConfig OptionConfig) options(w http.ResponseWriter, r *http.Request) {
 	// // for devel
 	// log.Println("* Options for", r.URL, "method:",r.Method)
-
-	// write cors headers
-	//* TODO check that origin is what we expect
-	//
 	// for key, value := range r.Header {
 	// 	log.Println("OptionConfig: ",key,value)
 	// }
-	w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
+	
+	// write cors headers
+	// Check that origin is what we expect
+	origin := sanitizeOrigin(r.Header.Get("Origin"))
+	if origin != "" {
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+	}
 	if len(optionConfig.AllowedMethods) > 0 {
 		w.Header().Set("Access-Control-Allow-Methods", optionConfig.AllowedMethods)
 	}
@@ -587,8 +592,18 @@ func listenAndServe() error {
 	}
 
 	log.Println("Listening to address ", serverAddr)
+	// Configure the HTTP server with explicit timeouts to mitigate slow-client
+	// (Slowloris) denial-of-service attacks (CWE-676 / OWASP Security Misconfiguration).
+	httpServer := &http.Server{
+		Addr:              serverAddr,
+		Handler:           server.Router,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      120 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 	if *usingSshTunnel {
-		return http.ListenAndServe(serverAddr, server.Router)
+		return httpServer.ListenAndServe()
 	} else {
 		err = GenerateCert()
 		if err != nil {
@@ -596,7 +611,7 @@ func listenAndServe() error {
 			log.Println(err)
 			return err
 		}
-		return http.ListenAndServeTLS(serverAddr, "cert.pem", "key.pem", server.Router)
+		return httpServer.ListenAndServeTLS("cert.pem", "key.pem")
 	}
 }
 

@@ -333,7 +333,6 @@ func (ctx *CleansingFunctionContext) ApplyCleasingFunction(functionName string, 
 			var buf strings.Builder
 			buf.WriteString(inputValue)
 			for i := range arg.ColumnPositions {
-				// fmt.Println("=== concat value @pos:",arg.ColumnPositions[i])
 				if (*inputRow)[arg.ColumnPositions[i]] != nil {
 					if arg.Delimit != "" {
 						buf.WriteString(arg.Delimit)
@@ -372,6 +371,16 @@ func (ctx *CleansingFunctionContext) ApplyCleasingFunction(functionName string, 
 			} else {
 				obj = vv
 			}
+		}
+
+	case "scrub_characters":
+		// Cleansing function that remove characters from the input column
+		// The argument is a string of characters to be removed from the input column
+		if argument != "" {
+			obj = ScrubCharacters(inputValue, argument)
+		} else {
+			// configuration error, bailing out
+			log.Panicf("ERROR missing argument for function scrub_characters for input column pos %d", inputPos)
 		}
 
 	case "substring":
@@ -514,6 +523,19 @@ func SplitOn(inputValue, argument string) any {
 		return nil
 	}
 	return strings.Split(inputValue, argument)
+}
+
+func ScrubCharacters(inputValue, argument string) any {
+	if inputValue == "" || argument == "" {
+		return nil
+	}
+	result := []rune{}
+	for _, r := range inputValue {
+		if !strings.ContainsRune(argument, r) {
+			result = append(result, r)
+		}
+	}
+	return string(result)
 }
 
 func UniqueSplitOn(inputValue, argument string) any {

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 
@@ -72,7 +73,7 @@ func NewAnalyzer(basePath, mainRuleFileName, runOptions, dependencyPropertyName 
 func (a *Analyzer) Analyze() (err error) {
 	model := a.compiler.JetRuleModel()
 	if a.compiler.Trace() {
-		fmt.Printf("** Starting analysis of model with %d classes and %d rules\n", len(model.Classes), len(model.Jetrules))
+		log.Printf("** Starting analysis of model with %d classes and %d rules\n", len(model.Classes), len(model.Jetrules))
 	}
 	// Perform analysis logic here, such as validating the model, checking for consistency, etc.
 	for _, option := range a.runOptions {
@@ -93,7 +94,7 @@ func (a *Analyzer) Analyze() (err error) {
 				return fmt.Errorf("error analyzing property dependencies: %w", err)
 			}
 		default:
-			fmt.Printf("** Unknown analysis option: %s\n", option)
+			log.Printf("** Unknown analysis option: %s\n", option)
 		}
 	}
 
@@ -108,7 +109,13 @@ func (a *Analyzer) Analyze() (err error) {
 }
 
 func (c *Analyzer) SaveModel() error {
-	outPath := c.OutJsonFileName()
+	// OutJsonFileName validate the output path to remain inside the
+	// base path to prevent path traversal (CWE-73).
+	outPath, err := c.OutJsonFileName()
+	if err != nil {
+		log.Println("** ERROR invalid output path:", err.Error())
+		return err
+	}
 	log.Println("Saving json to", outPath)
 	data, err := c.ToJson()
 	if err != nil {
@@ -179,7 +186,7 @@ func (a *Analyzer) analyzePredicates(model *rete.JetruleModel) error {
 			predicate := resourceMap[antecedent.PredicateKey]
 			if predicate != nil && predicate.Type == "resource" &&
 				predicate.Id != "rdf:type" && predicate.Id != "jets:key" {
-					
+
 				className := dataPropertyToClass[predicate.Id]
 				if className != "" {
 					// Consider only predicates having a class
@@ -220,24 +227,30 @@ func appendIfMissing(slice []string, value string) []string {
 // Analyze rule dependencies based on the DependencyPropertyName
 // Populate a.analyzerModel.AntecedentRules and ConsequentRules
 
-func (a *Analyzer) analyzeRuleDependencies(model *rete.JetruleModel) error {
+func (a *Analyzer) analyzeRuleDependencies(_ *rete.JetruleModel) error {
 	// Analyze rule dependencies based on the DependencyPropertyName
 	// Populate a.analyzerModel.AntecedentRules and ConsequentRules
 	return nil
 }
 
-func (a *Analyzer) analyzePropertyDependencies(model *rete.JetruleModel) error {
+func (a *Analyzer) analyzePropertyDependencies(_ *rete.JetruleModel) error {
 	// Analyze property dependencies based on the DependencyPropertyName
 	// Populate a.analyzerModel.AntecedentProperties and ConsequentProperties
 	return nil
 }
 
-func (a *Analyzer) Root() *AnalyzeModel {
-	return a.analyzerModel
-}
-
-func (a *Analyzer) OutJsonFileName() string {
-	return fmt.Sprintf("%s/%s", a.basePath, MakeAOutputFileName(a.analyzerModel.MainRuleFileName))
+// OutJsonFileName resolves the analysis output file path within the analyzer
+// base path. The output file name is derived from the (externally controlled)
+// main rule file name, so the resolved path is validated to remain inside the
+// base path to prevent path traversal (CWE-73).
+func (a *Analyzer) OutJsonFileName() (string, error) {
+	cleanBase := filepath.Clean(a.basePath)
+	outPath := filepath.Clean(filepath.Join(cleanBase, MakeAOutputFileName(a.analyzerModel.MainRuleFileName)))
+	if outPath != cleanBase && !strings.HasPrefix(outPath, cleanBase+string(os.PathSeparator)) {
+		return "", fmt.Errorf("invalid output file name %q: resolved path %q is outside of base path %q",
+			a.analyzerModel.MainRuleFileName, outPath, cleanBase)
+	}
+	return outPath, nil
 }
 
 func MakeAOutputFileName(mainSourceFileName string) string {

@@ -41,7 +41,7 @@ func getWorkspaceUri(dataTableAction *DataTableAction, irow int) string {
 // Main insert row function with pre processing hooks for validating/authorizing the request
 // Main insert row function with post processing hooks to perform work async
 // Inserting rows using pre-defined sql statements, keyed by table name provided in dataTableAction
-func (ctx *DataTableContext) WorkspaceInsertRows(dataTableAction *DataTableAction, token string) (results *map[string]interface{}, httpStatus int, err error) {
+func (ctx *DataTableContext) WorkspaceInsertRows(dataTableAction *DataTableAction, token string) (results *map[string]any, httpStatus int, err error) {
 	httpStatus = http.StatusOK
 	returnedKey := make([]int, len(dataTableAction.Data))
 	sqlStmt, ok := sqlInsertStmts[dataTableAction.FromClauses[0].Table]
@@ -57,7 +57,7 @@ func (ctx *DataTableContext) WorkspaceInsertRows(dataTableAction *DataTableActio
 	var gitProfile user.GitProfile
 	gitProfile, gitProfileErr := user.GetGitProfile(ctx.Dbpool, userProfile.Email)
 
-	row := make([]interface{}, len(sqlStmt.ColumnKeys))
+	row := make([]any, len(sqlStmt.ColumnKeys))
 	for irow := range dataTableAction.Data {
 		// Pre-Processing hook
 		// -----------------------------------------------------------------------
@@ -138,8 +138,7 @@ func (ctx *DataTableContext) WorkspaceInsertRows(dataTableAction *DataTableActio
 			wsCM := dataTableAction.Data[irow]["git.commit.message"]
 			var wsCommitMessage string
 			if wsCM != nil {
-				// escape singe ' with ''
-				wsCommitMessage = strings.ReplaceAll(wsCM.(string), "'", "''")
+				wsCommitMessage = wsCM.(string)
 			}
 			workspaceGit := git.InitWorkspaceGit(&git.WorkspaceGit{
 				WorkspaceName:   dataTableAction.WorkspaceName,
@@ -267,7 +266,7 @@ func (ctx *DataTableContext) WorkspaceInsertRows(dataTableAction *DataTableActio
 				// Check if compile_workspace is requested, if not check if load client config is requested
 				otherActions := dataTableAction.Data[irow]["otherWorkspaceActionOptions"]
 				if otherActions != nil {
-					l := otherActions.([]interface{})
+					l := otherActions.([]any)
 					compileWorkspaceStarted := false
 					for i := range l {
 						if l[i] != nil && l[i] == "wpCompileWorkspaceOption" {
@@ -300,12 +299,6 @@ func (ctx *DataTableContext) WorkspaceInsertRows(dataTableAction *DataTableActio
 			}
 			dataTableAction.Data[irow]["status"] = ""
 
-		case strings.HasPrefix(dataTableAction.FromClauses[0].Table, "unit_test"):
-			if dataTableAction.WorkspaceName == "" {
-				return nil, http.StatusBadRequest, fmt.Errorf("invaid request for unit_test, missing workspace_name")
-			}
-			dataTableAction.Data[irow]["status"] = "Unit Test in progress"
-
 		case dataTableAction.FromClauses[0].Table == "delete_workspace":
 			if dataTableAction.WorkspaceName == "" {
 				return nil, http.StatusBadRequest, fmt.Errorf("invaid request for delete/workspace_registry, missing workspace_name")
@@ -332,8 +325,8 @@ func (ctx *DataTableContext) WorkspaceInsertRows(dataTableAction *DataTableActio
 			row[jcol] = dataTableAction.Data[irow][colKey]
 		}
 
-		// fmt.Printf("Insert Row with stmt %s\n", sqlStmt.Stmt)
-		// fmt.Printf("Insert Row on table %s: %v\n", dataTableAction.FromClauses[0].Table, row)
+		// log.Printf("Insert Row with stmt %s\n", sqlStmt.Stmt)
+		// log.Printf("Insert Row on table %s: %v\n", dataTableAction.FromClauses[0].Table, row)
 		// Executing the InserRow Stmt
 		var dbErr error
 		if strings.Contains(sqlStmt.Stmt, "RETURNING key") {
@@ -367,23 +360,20 @@ func (ctx *DataTableContext) WorkspaceInsertRows(dataTableAction *DataTableActio
 		//	- Compile workspace (workspace.db, lookup.db, and reports.tgz)
 		go compileWorkspaceAction(ctx, dataTableAction)
 
-	case strings.HasPrefix(dataTableAction.FromClauses[0].Table, "unit_test"):
-		go UnitTestWorkspaceAction(ctx, dataTableAction, token)
-
 	case dataTableAction.FromClauses[0].Table == "load_workspace_config":
 		// Load workspace config
 		loadWorkspaceConfigAction(ctx, dataTableAction)
 
 	}
 returnResults:
-	results = &map[string]interface{}{
+	results = &map[string]any{
 		"returned_keys": &returnedKey,
 	}
 	return
 }
 
 // DoWorkspaceReadAction ------------------------------------------------------
-func (ctx *DataTableContext) DoWorkspaceReadAction(dataTableAction *DataTableAction, token string) (*map[string]interface{}, int, error) {
+func (ctx *DataTableContext) DoWorkspaceReadAction(dataTableAction *DataTableAction, token string) (*map[string]any, int, error) {
 
 	// Replace table schema with value $SCHEMA with the workspace_name
 	//* NOTE: Reading directly from sqlite, no schema needed (set $SCHEMA to empty)
@@ -398,7 +388,7 @@ func (ctx *DataTableContext) DoWorkspaceReadAction(dataTableAction *DataTableAct
 	}
 
 	// to package up the result
-	results := make(map[string]interface{})
+	results := make(map[string]any)
 	var err error
 
 	if len(dataTableAction.Columns) == 0 {
@@ -420,7 +410,7 @@ func (ctx *DataTableContext) DoWorkspaceReadAction(dataTableAction *DataTableAct
 	query, nbrRowsQuery := dataTableAction.buildQuery()
 
 	// Perform the query
-	var resultRows *[][]interface{}
+	var resultRows *[][]any
 	var totalRowCount int
 	if dataTableAction.FromClauses[0].Schema == "jetsapi" {
 		resultRows, _, err = execQuery(ctx.Dbpool, dataTableAction, &query)
@@ -471,7 +461,7 @@ func (ctx *DataTableContext) DoWorkspaceReadAction(dataTableAction *DataTableAct
 			}
 		done:
 			if missingColumns {
-				fmt.Println("Oops expecting workspace_name, workspace_uri, workspace_branch, feature_branch and status columns")
+				log.Println("Oops expecting workspace_name, workspace_uri, workspace_branch, feature_branch and status columns")
 			} else {
 				// Get the status from git command
 				for irow := range *resultRows {
@@ -615,7 +605,7 @@ func (ctx *DataTableContext) WorkspaceQueryStructure(dataTableAction *DataTableA
 	switch requestType {
 	case "workspace_file_structure":
 		// Data Model (.jr)
-		// fmt.Println("** Visiting data_model:")
+		// log.Println("** Visiting data_model:")
 		workspaceNode, err = wsfile.VisitDirWrapper(root, "data_model", "Data Model", &[]string{".jr", ".csv"}, workspaceName)
 		if err != nil {
 			log.Println("while walking workspace structure:", err)
@@ -626,7 +616,7 @@ func (ctx *DataTableContext) WorkspaceQueryStructure(dataTableAction *DataTableA
 		resultData = append(resultData, workspaceNode)
 
 		// Jets Rules (.jr, .jr.sql)
-		// fmt.Println("** Visiting jet_rules:")
+		// log.Println("** Visiting jet_rules:")
 		workspaceNode, err = wsfile.VisitDirWrapper(root, "jet_rules", "Jets Rules", &[]string{".jr", ".jr.sql"}, workspaceName)
 		if err != nil {
 			log.Println("while walking workspace structure:", err)
@@ -637,7 +627,7 @@ func (ctx *DataTableContext) WorkspaceQueryStructure(dataTableAction *DataTableA
 		resultData = append(resultData, workspaceNode)
 
 		// Lookups (.jr)
-		// fmt.Println("** Visiting lookups:")
+		// log.Println("** Visiting lookups:")
 		workspaceNode, err = wsfile.VisitDirWrapper(root, "lookups", "Lookups", &[]string{".jr", ".csv"}, workspaceName)
 		if err != nil {
 			log.Println("while walking workspace structure:", err)
@@ -648,7 +638,7 @@ func (ctx *DataTableContext) WorkspaceQueryStructure(dataTableAction *DataTableA
 		resultData = append(resultData, workspaceNode)
 
 		// cpipes config (.pc.json)
-		fmt.Println("** Visiting pipes_config:")
+		log.Println("** Visiting pipes_config:")
 		workspaceNode, err = wsfile.VisitDirWrapper(root, "pipes_config", "Pipes Config", &[]string{".pc.json"}, workspaceName)
 		if err != nil {
 			log.Println("while walking workspace structure:", err)
@@ -659,7 +649,7 @@ func (ctx *DataTableContext) WorkspaceQueryStructure(dataTableAction *DataTableA
 		resultData = append(resultData, workspaceNode)
 
 		// Process Configurations (workspace_init_db.sql)
-		// fmt.Println("** Visiting process_config:")
+		// log.Println("** Visiting process_config:")
 		workspaceNode, err = wsfile.VisitDirWrapper(root, "process_config", "Process Configuration", &[]string{"workspace_init_db.sql"}, workspaceName)
 		if err != nil {
 			log.Println("while walking workspace structure:", err)
@@ -670,7 +660,7 @@ func (ctx *DataTableContext) WorkspaceQueryStructure(dataTableAction *DataTableA
 		resultData = append(resultData, workspaceNode)
 
 		// Process Sequences (.jr)
-		// fmt.Println("** Visiting process_sequence:")
+		// log.Println("** Visiting process_sequence:")
 		workspaceNode, err = wsfile.VisitDirWrapper(root, "process_sequence", "Process Sequences", &[]string{".jr"}, workspaceName)
 		if err != nil {
 			log.Println("while walking workspace structure:", err)
@@ -681,7 +671,7 @@ func (ctx *DataTableContext) WorkspaceQueryStructure(dataTableAction *DataTableA
 		resultData = append(resultData, workspaceNode)
 
 		// Reports (.sql, .json)
-		// fmt.Println("** Visiting reports:")
+		// log.Println("** Visiting reports:")
 		workspaceNode, err = wsfile.VisitDirWrapper(root, "reports", "Reports", &[]string{".sql", ".json"}, workspaceName)
 		if err != nil {
 			log.Println("while walking workspace structure:", err)
@@ -736,9 +726,9 @@ func (ctx *DataTableContext) WorkspaceQueryStructure(dataTableAction *DataTableA
 	// 	ResultData: &resultData,
 	// },"", "  ")
 	// //*
-	// fmt.Println("*** Workspace Structure ***")
-	// fmt.Println(string(v))
-	// fmt.Println("*** Workspace Structure ***")
+	// log.Println("*** Workspace Structure ***")
+	// log.Println(string(v))
+	// log.Println("*** Workspace Structure ***")
 	results = &v
 	return
 }
@@ -749,7 +739,7 @@ func (ctx *DataTableContext) addWorkspaceFile(dataTableAction *DataTableAction, 
 	workspaceName := dataTableAction.WorkspaceName
 	if workspaceName == "" {
 		err = fmt.Errorf("GetWorkspaceFileContent: missing workspace_name")
-		fmt.Println(err)
+		log.Println(err)
 		return
 	}
 	for ipos := range dataTableAction.Data {
@@ -757,14 +747,20 @@ func (ctx *DataTableContext) addWorkspaceFile(dataTableAction *DataTableAction, 
 		wsFileName := request["source_file_name"]
 		if wsFileName == nil {
 			err = fmt.Errorf("GetWorkspaceFileContent: missing file_name")
-			fmt.Println(err)
+			log.Println(err)
 			return
 		}
 		var fileName string
 		fileName, err = url.QueryUnescape(wsFileName.(string))
-		fullFileName := fmt.Sprintf("%s/%s/%s", os.Getenv("WORKSPACES_HOME"), workspaceName, fileName)
 		if err != nil {
-			fmt.Println(err)
+			log.Println(err)
+			return
+		}
+		// Confine the file path within the workspace directory (CWE-73)
+		var fullFileName string
+		fullFileName, err = wsfile.ResolveWorkspacePath(workspaceName, fileName)
+		if err != nil {
+			log.Println(err)
 			return
 		}
 
@@ -773,14 +769,14 @@ func (ctx *DataTableContext) addWorkspaceFile(dataTableAction *DataTableAction, 
 		fileDir := filepath.Dir(fullFileName)
 		if err = os.MkdirAll(fileDir, 0770); err != nil {
 			err = fmt.Errorf("while creating file directory structure: %v", err)
-			fmt.Println(err)
+			log.Println(err)
 			return
 		}
 
 		myfile, err = os.Create(fullFileName)
 		if err != nil {
 			err = fmt.Errorf("while creating workspace file: %v", err)
-			fmt.Println(err)
+			log.Println(err)
 			return
 		}
 		myfile.Close()
@@ -819,7 +815,7 @@ func (ctx *DataTableContext) DeleteWorkspaceFile(dataTableAction *DataTableActio
 	workspaceName := dataTableAction.WorkspaceName
 	if workspaceName == "" {
 		err = fmt.Errorf("GetWorkspaceFileContent: missing workspace_name")
-		fmt.Println(err)
+		log.Println(err)
 		httpStatus = http.StatusBadRequest
 		return
 	}
@@ -828,20 +824,26 @@ func (ctx *DataTableContext) DeleteWorkspaceFile(dataTableAction *DataTableActio
 		wsFileName := request["source_file_name"]
 		if wsFileName == nil {
 			err = fmt.Errorf("GetWorkspaceFileContent: missing file_name")
-			fmt.Println(err)
+			log.Println(err)
 			httpStatus = http.StatusBadRequest
 			return
 		}
 		var fileName string
 		if fileName, err = url.QueryUnescape(wsFileName.(string)); err != nil {
-			fmt.Println(err)
+			log.Println(err)
 			httpStatus = http.StatusBadRequest
 			return
 		}
-		fullFileName := fmt.Sprintf("%s/%s/%s", os.Getenv("WORKSPACES_HOME"), workspaceName, fileName)
+		// Confine the file path within the workspace directory (CWE-73)
+		var fullFileName string
+		if fullFileName, err = wsfile.ResolveWorkspacePath(workspaceName, fileName); err != nil {
+			log.Println(err)
+			httpStatus = http.StatusBadRequest
+			return
+		}
 		// Write empty file to local workspace & db
 		if err = wsfile.SaveContent(ctx.Dbpool, workspaceName, fileName, ""); err != nil {
-			fmt.Println(err)
+			log.Println(err)
 			httpStatus = http.StatusBadRequest
 			return
 		}
@@ -850,7 +852,7 @@ func (ctx *DataTableContext) DeleteWorkspaceFile(dataTableAction *DataTableActio
 		err = os.Remove(fullFileName)
 		if err != nil {
 			err = fmt.Errorf("while removing workspace file: %v", err)
-			fmt.Println(err)
+			log.Println(err)
 			httpStatus = http.StatusBadRequest
 			return
 		}
@@ -863,7 +865,7 @@ func (ctx *DataTableContext) DeleteWorkspaceFile(dataTableAction *DataTableActio
 // GetWorkspaceFileContent --------------------------------------------------------------------------
 // Function to get the workspace file content based on relative file name
 // Read the file from the workspace on file system since it's already in sync with database
-func (ctx *DataTableContext) GetWorkspaceFileContent(dataTableAction *DataTableAction, token string) (results *map[string]interface{}, httpStatus int, err error) {
+func (ctx *DataTableContext) GetWorkspaceFileContent(dataTableAction *DataTableAction, token string) (results *map[string]any, httpStatus int, err error) {
 	_, err2 := ctx.VerifyUserPermission(&SqlInsertDefinition{Capability: "workspace_ide"}, token)
 	if err2 != nil {
 		return nil, http.StatusUnauthorized, errors.New("error: unauthorized, cannot get user info or does not have permission")
@@ -874,20 +876,20 @@ func (ctx *DataTableContext) GetWorkspaceFileContent(dataTableAction *DataTableA
 	wsFileName := request["file_name"]
 	if workspaceName == "" || wsFileName == nil {
 		err = fmt.Errorf("GetWorkspaceFileContent: missing workspace_name or file_name")
-		fmt.Println(err)
+		log.Println(err)
 		httpStatus = http.StatusBadRequest
 		return
 	}
 	fileName, err := url.QueryUnescape(wsFileName.(string))
 	if err != nil {
-		fmt.Println(err)
+		log.Println(err)
 		httpStatus = http.StatusBadRequest
 		return
 	}
 
 	// Read file from local workspace
 	content, err := wsfile.GetContent(workspaceName, fileName)
-	results = &map[string]interface{}{
+	results = &map[string]any{
 		"file_name":    wsFileName,
 		"file_content": content,
 	}
@@ -896,7 +898,7 @@ func (ctx *DataTableContext) GetWorkspaceFileContent(dataTableAction *DataTableA
 
 // SaveWorkspaceFileContent --------------------------------------------------------------------------
 // Function to save the workspace file content in local workspace file system and in database
-func (ctx *DataTableContext) SaveWorkspaceFileContent(dataTableAction *DataTableAction, token string) (results *map[string]interface{}, httpStatus int, err error) {
+func (ctx *DataTableContext) SaveWorkspaceFileContent(dataTableAction *DataTableAction, token string) (results *map[string]any, httpStatus int, err error) {
 	_, err2 := ctx.VerifyUserPermission(&SqlInsertDefinition{Capability: "workspace_ide"}, token)
 	if err2 != nil {
 		return nil, http.StatusUnauthorized, errors.New("error: unauthorized, cannot get user info or does not have permission")
@@ -908,13 +910,13 @@ func (ctx *DataTableContext) SaveWorkspaceFileContent(dataTableAction *DataTable
 	wsFileContent := request["file_content"]
 	if workspaceName == "" || wsFileName == nil || wsFileContent == nil {
 		err = fmt.Errorf("SaveWorkspaceFileContent: missing workspace_name, file_content, or file_name")
-		fmt.Println(err)
+		log.Println(err)
 		httpStatus = http.StatusBadRequest
 		return
 	}
 	fileName, err := url.QueryUnescape(wsFileName.(string))
 	if err != nil {
-		fmt.Println(err)
+		log.Println(err)
 		httpStatus = http.StatusBadRequest
 		return
 	}
@@ -925,14 +927,14 @@ func (ctx *DataTableContext) SaveWorkspaceFileContent(dataTableAction *DataTable
 		err = json.Unmarshal([]byte(wsFileContent.(string)), &m)
 		if err != nil {
 			err = fmt.Errorf("the file is not a valid json file: %v", err)
-			fmt.Println(err)
+			log.Println(err)
 			httpStatus = http.StatusBadRequest
 			return
 		}
 	}
 	// Write file to local workspace
 	err = wsfile.SaveContent(ctx.Dbpool, workspaceName, fileName, wsFileContent.(string))
-	results = &map[string]interface{}{
+	results = &map[string]any{
 		"file_name": wsFileName,
 	}
 	return
@@ -940,7 +942,7 @@ func (ctx *DataTableContext) SaveWorkspaceFileContent(dataTableAction *DataTable
 
 // SaveWorkspaceClientConfig --------------------------------------------------------------------------
 // Function to save the workspace file content in local workspace file system and in database
-func (ctx *DataTableContext) SaveWorkspaceClientConfig(dataTableAction *DataTableAction, token string) (results *map[string]interface{}, httpStatus int, err error) {
+func (ctx *DataTableContext) SaveWorkspaceClientConfig(dataTableAction *DataTableAction, token string) (results *map[string]any, httpStatus int, err error) {
 	_, err2 := ctx.VerifyUserPermission(&SqlInsertDefinition{Capability: "workspace_ide"}, token)
 	if err2 != nil {
 		return nil, http.StatusUnauthorized, errors.New("error: unauthorized, cannot get user info or does not have permission")
@@ -951,14 +953,14 @@ func (ctx *DataTableContext) SaveWorkspaceClientConfig(dataTableAction *DataTabl
 	clientName := request["client"]
 	if workspaceName == "" || clientName == nil {
 		err = fmt.Errorf("SaveWorkspaceClientConfig: missing workspace_name, or client")
-		fmt.Println(err)
+		log.Println(err)
 		httpStatus = http.StatusBadRequest
 		return
 	}
 
 	// Save client config to local workspace
 	err = wsfile.SaveClientConfig(ctx.Dbpool, workspaceName, clientName.(string))
-	results = &map[string]interface{}{}
+	results = &map[string]any{}
 	return
 }
 
@@ -966,7 +968,7 @@ func (ctx *DataTableContext) SaveWorkspaceClientConfig(dataTableAction *DataTabl
 // Function to delete workspace file changes based on rows in workspace_changes
 // Delete the workspace_changes row and the associated large object
 // Restaure files from stash, except for .db and .tgz files
-func (ctx *DataTableContext) DeleteWorkspaceChanges(dataTableAction *DataTableAction, token string) (results *map[string]interface{}, httpStatus int, err error) {
+func (ctx *DataTableContext) DeleteWorkspaceChanges(dataTableAction *DataTableAction, token string) (results *map[string]any, httpStatus int, err error) {
 	_, err2 := ctx.VerifyUserPermission(&SqlInsertDefinition{Capability: "workspace_ide"}, token)
 	if err2 != nil {
 		return nil, http.StatusUnauthorized, errors.New("error: unauthorized, cannot get user info or does not have permission")
@@ -978,7 +980,7 @@ func (ctx *DataTableContext) DeleteWorkspaceChanges(dataTableAction *DataTableAc
 		wsFileName := request["file_name"]
 		if workspaceName == "" || wsFileName == nil {
 			err = fmt.Errorf("DeleteWorkspaceChanges: missing workspace_name, oid, key, or file_name")
-			fmt.Println(err)
+			log.Println(err)
 			httpStatus = http.StatusBadRequest
 			return
 		}
@@ -989,14 +991,14 @@ func (ctx *DataTableContext) DeleteWorkspaceChanges(dataTableAction *DataTableAc
 		}
 	}
 
-	results = &map[string]interface{}{}
+	results = &map[string]any{}
 	return
 }
 
 // DeleteAllWorkspaceChanges --------------------------------------------------------------------------
 // Function to delete workspace file changes based on rows in workspace_changes
 // Delete the workspace_changes row and the associated large object
-func (ctx *DataTableContext) DeleteAllWorkspaceChanges(dataTableAction *DataTableAction, token string) (results *map[string]interface{}, httpStatus int, err error) {
+func (ctx *DataTableContext) DeleteAllWorkspaceChanges(dataTableAction *DataTableAction, token string) (results *map[string]any, httpStatus int, err error) {
 	_, err2 := ctx.VerifyUserPermission(&SqlInsertDefinition{Capability: "workspace_ide"}, token)
 	if err2 != nil {
 		return nil, http.StatusUnauthorized, errors.New("error: unauthorized, cannot get user info or does not have permission")
@@ -1005,7 +1007,7 @@ func (ctx *DataTableContext) DeleteAllWorkspaceChanges(dataTableAction *DataTabl
 	workspaceName := dataTableAction.WorkspaceName
 	if workspaceName == "" {
 		err = fmt.Errorf("DeleteAllWorkspaceChanges: missing workspace_name")
-		fmt.Println(err)
+		log.Println(err)
 		httpStatus = http.StatusBadRequest
 		return
 	}
@@ -1016,6 +1018,6 @@ func (ctx *DataTableContext) DeleteAllWorkspaceChanges(dataTableAction *DataTabl
 		return
 	}
 
-	results = &map[string]interface{}{}
+	results = &map[string]any{}
 	return
 }

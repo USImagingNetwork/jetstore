@@ -1,6 +1,7 @@
 package compute_pipes
 
 import (
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strings"
@@ -40,8 +41,9 @@ func (cp *ComputePipesConfig) NbrComputePipes() int {
 	return len(cp.ConditionalPipesConfig)
 }
 
-// This function is called once per compute pipes step (sharding or redicung)
+// This function is called once per compute pipes step (sharding or reducing)
 // so we construct the ExprNodeEvaluator as needed.
+// Returns the PipeSpec (pipeline config) for the step, the stepId to execute, and error if any.
 func (cp *ComputePipesConfig) GetComputePipes(stepId int, env map[string]any) ([]PipeSpec, int, error) {
 	switch {
 	case len(cp.ReducingPipesConfig) > stepId:
@@ -227,9 +229,13 @@ type CsvSourceSpec struct {
 // the domain class.
 // When direct_properties_only is true, only take the data properties
 // of the class, not including the properties of the parent classes.
+// ClassName is used to get the columns from the local workspace, and get domain key from registry, and is optional.
+// Env variables (from mainInputSchemaProvider.Env) can be used in the class_name, e.g., hc:${ENTITY}.
 // DomainKeys provide the ability to configure the domain keys in the cpipes config document.
 // DomainKeysSpec is parsed version of DomainKeys or the spec from the domain_keys_registry table.
 // DomainKeysSpec is derived from DomainKeys when provided.
+// EntityEncoding is used to specify the entity encoding: json, toon, row (default).
+// RemoveModelPrefixes is used to remove the model prefixes from the columns, e.g., jets: or rdf: on the output (currently used only for json and toon).
 // columnsMap is added in StartComputePipes
 type ChannelSpec struct {
 	Name                 string          `json:"name"`
@@ -240,6 +246,9 @@ type ChannelSpec struct {
 	SameColumnsAsInput   bool            `json:"same_columns_as_input,omitzero"`
 	DomainKeys           map[string]any  `json:"domain_keys,omitempty"`
 	DomainKeysInfo       *DomainKeysSpec `json:"domain_keys_spec,omitzero"`
+	EntityEncoding       string          `json:"entity_encoding,omitempty"`
+	RemoveModelPrefixes  bool            `json:"remove_model_prefixes,omitzero"`
+	ExcludeProperties    []string        `json:"exclude_properties,omitempty"`
 	columnsMap           *map[string]int
 }
 
@@ -302,7 +311,8 @@ type BlankFieldMarkersSpec struct {
 }
 
 type SchemaProviderSpec struct {
-	// Type range: default
+	// Type range: default, pipeline_coordinator_map
+	// Most properties applies to type default:
 	// Key is schema provider key for reference by compute pipes steps
 	// Format: csv, headerless_csv, fixed_width, parquet, parquet_select,
 	//              xlsx, headerless_xlsx
@@ -341,34 +351,57 @@ type SchemaProviderSpec struct {
 	// RequestID is used for logging and tracking purpose.
 	// Contains properties to register FileKey with input_registry table:
 	// Client, Vendor, ObjectType, FileDate (does not apply to Jets_Loader).
+	// NotifyApiGatewayOverride: values: no_notifications, failure_only, start_only, completion_and_failure_only, default (same as empty).
 	// NotificationTemplatesOverrides have the following keys to override the templates defined
 	// in the deployment environment var: CPIPES_START_NOTIFICATION_JSON,
 	// CPIPES_COMPLETED_NOTIFICATION_JSON, and CPIPES_FAILED_NOTIFICATION_JSON.
+	// Properties for type pipeline_coordinator_map:
+	// Type: pipeline_coordinator_map.
+	// RequestId: request_id for the pipeline coordinator map.
+	// CoordinatedPipesMap: list of schema_event_json.
+	// PostMapEvent: schema event for post map pipeline.
 	//*TODO domain_keys_json
 	//*TODO code_values_mapping_json
 	FileConfig
-	Key                              string             `json:"key"`
-	Type                             string             `json:"type"`
-	FileSize                         int64              `json:"file_size,omitzero"`
-	KmsKey                           string             `json:"kms_key_arn,omitempty"`
-	Client                           string             `json:"client,omitempty"`
-	Vendor                           string             `json:"vendor,omitempty"`
-	ObjectType                       string             `json:"object_type,omitempty"`
-	RequestID                        string             `json:"request_id,omitempty"`
-	UseOriginSourceConfig            bool               `json:"use_origin_source_config,omitempty"`
-	FileDate                         string             `json:"file_date,omitempty"`
-	SourceType                       string             `json:"source_type,omitempty"`
-	SchemaName                       string             `json:"schema_name,omitempty"`
-	Columns                          []SchemaColumnSpec `json:"columns,omitempty"`
-	Headers                          []string           `json:"headers,omitempty"`
-	CapDobYears                      int                `json:"cap_dob_years,omitzero"`
-	SetDobToJan1                     bool               `json:"set_dob_to_jan1,omitzero"`
-	SetDodToJan1                     bool               `json:"set_dod_to_jan1,omitzero"`
-	SetAllDatesToJan1                bool               `json:"set_all_dates_to_jan1,omitzero"`
-	Env                              map[string]any     `json:"env,omitempty"`
-	ReportCmds                       []ReportCmdSpec    `json:"report_cmds,omitempty"`
-	NotificationTemplatesOverrides   map[string]string  `json:"notification_templates_overrides,omitempty"`
-	NotificationRoutingOverridesJson string             `json:"notification_routing_overrides_json,omitempty"`
+	Key                              string                `json:"key"`
+	Type                             string                `json:"type"`
+	FileSize                         int64                 `json:"file_size,omitzero"`
+	KmsKey                           string                `json:"kms_key_arn,omitempty"`
+	Client                           string                `json:"client,omitempty"`
+	Vendor                           string                `json:"vendor,omitempty"`
+	ObjectType                       string                `json:"object_type,omitempty"`
+	RequestID                        string                `json:"request_id,omitempty"`
+	UseOriginSourceConfig            bool                  `json:"use_origin_source_config,omitempty"`
+	FileDate                         string                `json:"file_date,omitempty"`
+	SourceType                       string                `json:"source_type,omitempty"`
+	SchemaName                       string                `json:"schema_name,omitempty"`
+	Columns                          []SchemaColumnSpec    `json:"columns,omitempty"`
+	Headers                          []string              `json:"headers,omitempty"`
+	CapDobYears                      int                   `json:"cap_dob_years,omitzero"`
+	SetDobToJan1                     bool                  `json:"set_dob_to_jan1,omitzero"`
+	SetDodToJan1                     bool                  `json:"set_dod_to_jan1,omitzero"`
+	SetAllDatesToJan1                bool                  `json:"set_all_dates_to_jan1,omitzero"`
+	Env                              map[string]any        `json:"env,omitempty"`
+	ReportCmds                       []ReportCmdSpec       `json:"report_cmds,omitempty"`
+	NotificationTemplatesOverrides   map[string]string     `json:"notification_templates_overrides,omitempty"`
+	NotificationRoutingOverridesJson string                `json:"notification_routing_overrides_json,omitempty"`
+	NotifyApiGatewayOverride         string                `json:"notify_api_gateway_override,omitempty"`
+	CoordinatedPipesMap              []*SchemaProviderSpec `json:"coordinated_pipes_map,omitempty"`
+	PostMapEvent                     *SchemaProviderSpec   `json:"post_map_event,omitzero"`
+}
+
+// Utility function to convert to a map[string]any for use in input_registry table
+func (sp *SchemaProviderSpec) ToMap() (map[string]any, error) {
+	b, err := json.Marshal(sp)
+	if err != nil {
+		return nil, err
+	}
+	m := make(map[string]any)
+	err = json.Unmarshal(b, &m)
+	if err != nil {
+		return nil, err
+	}
+	return m, nil
 }
 
 // Commands for the run_report step
@@ -398,6 +431,9 @@ type SchemaColumnSpec struct {
 	Precision *int   `json:"precision,omitzero"` // for fixed_width
 }
 
+// TableSpec specifies the output table configuration
+// Key is the table key for reference by compute pipes steps
+// Name is the table name for reference by compute pipes steps, env var replacement used for table name (e.g., ${CLIENT}_${OBJECT_TYPE})
 // ChannelSpecName specify the channel spec.
 // Column provides metadata info
 type TableSpec struct {
@@ -683,6 +719,7 @@ type OutputChannelConfig struct {
 	// Other available env substitution:
 	// $FILE_KEY main input file key.
 	// $SESSIONID current session id.
+	// ${REQUEST_ID} current request id.
 	// $PROCESS_NAME current process name.
 	// $PATH_FILE_KEY file key path portion.
 	// $NAME_FILE_KEY file key file name portion (empty when in part files mode).

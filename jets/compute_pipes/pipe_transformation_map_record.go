@@ -13,15 +13,17 @@ import (
 // map_record: each input record is mapped to the output
 
 type MapRecordTransformationPipe struct {
-	source           *InputChannel
-	outputCh         *OutputChannel
-	columnEvaluators []TransformationColumnEvaluator
-	failOnError      bool
-	errorCount       int
-	errorOutputCh    *OutputChannel
-	spec             *TransformationSpec
-	doneCh           chan struct{}
-	builderContext   *BuilderContext
+	source              *InputChannel
+	outputCh            *OutputChannel
+	columnEvaluators    []TransformationColumnEvaluator
+	failOnError         bool
+	errorCount          int
+	errorOutputCh       *OutputChannel
+	spec                *TransformationSpec
+	currentSourcePeriod int
+	sourcePeriodType    string
+	doneCh              chan struct{}
+	builderContext      *BuilderContext
 }
 
 // Implementing interface PipeTransformationEvaluator
@@ -31,6 +33,8 @@ func (ctx *MapRecordTransformationPipe) Apply(input *[]any) error {
 	}
 	var currentValues *[]any
 	var inBytes []byte
+	var rowHash string
+	var hasClassName bool
 	// Debug logging of input record
 	if ctx.spec.MapRecordConfig != nil && ctx.spec.MapRecordConfig.IsDebug {
 		data, err := utils.ZipSlices(ctx.source.Config.Columns, *input)
@@ -41,6 +45,13 @@ func (ctx *MapRecordTransformationPipe) Apply(input *[]any) error {
 		log.Println()
 		log.Printf("MapRecordTransformationPipe input (zipped): %s", string(inBytes))
 		log.Println()
+	}
+
+	// Compute the row hash for the input record if the output channel has a class name
+	// so we can use the hash as jets:key
+	if ctx.outputCh.Config.ClassName != "" {
+		rowHash = ComputeRowHash((*input), ctx.currentSourcePeriod)
+		hasClassName = true
 	}
 
 	if ctx.spec.NewRecord {
@@ -76,11 +87,16 @@ func (ctx *MapRecordTransformationPipe) Apply(input *[]any) error {
 			*currentValues = (*currentValues)[:len(ctx.outputCh.Config.Columns)]
 		}
 	}
-	if ctx.outputCh.Config.ClassName != "" {
+	if hasClassName {
 		// Set rdf:type to output channel class name if it's not set by the mapping
 		typeIdx, ok := (*ctx.outputCh.Columns)["rdf:type"]
 		if ok && (*currentValues)[typeIdx] == nil {
 			(*currentValues)[typeIdx] = fmt.Sprintf(`{"%s"}`, ctx.outputCh.Config.ClassName)
+		}
+		// Set jets:key to output channel class name if it's not set by the mapping
+		keyIdx, ok := (*ctx.outputCh.Columns)["jets:key"]
+		if ok && (*currentValues)[keyIdx] == nil {
+			(*currentValues)[keyIdx] = rowHash
 		}
 	}
 
@@ -157,7 +173,7 @@ func (ctx *BuilderContext) NewMapRecordTransformationPipe(source *InputChannel, 
 				// Check if this is a "local variable for rules", ie if it's added to the input class
 				_, ok := (*outputCh.Columns)[mappingExp.DataProperty]
 				if ok {
-					node = &rete.DataPropertyNode{Type: "text"}
+					node = &rete.PropertyNode{Type: "text"}
 					log.Printf("Note: mapping expression data property '%s' is not found in workspace metastore but found in input channel columns, treating it as text type", mappingExp.DataProperty)
 				} else {
 					return nil, fmt.Errorf("error: property name not found in workspace metastore or input channel: %v",
@@ -217,14 +233,17 @@ func (ctx *BuilderContext) NewMapRecordTransformationPipe(source *InputChannel, 
 	if config != nil {
 		failOnError = config.FailOnError
 	}
+	currentSourcePeriod, sourcePeriodType := GetCurrentSourcePeriod(ctx.env)
 	return &MapRecordTransformationPipe{
-		source:           source,
-		outputCh:         outputCh,
-		columnEvaluators: columnEvaluators,
-		spec:             spec,
-		failOnError:      failOnError,
-		doneCh:           ctx.done,
-		errorOutputCh:    errorOutputCh,
-		builderContext:   ctx,
+		source:              source,
+		outputCh:            outputCh,
+		columnEvaluators:    columnEvaluators,
+		spec:                spec,
+		currentSourcePeriod: currentSourcePeriod,
+		sourcePeriodType:    sourcePeriodType,
+		failOnError:         failOnError,
+		doneCh:              ctx.done,
+		errorOutputCh:       errorOutputCh,
+		builderContext:      ctx,
 	}, nil
 }

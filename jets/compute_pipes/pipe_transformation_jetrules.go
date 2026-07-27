@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/artisoft-io/jetstore/jets/datatable/jcsv"
 	"github.com/artisoft-io/jetstore/jets/utils"
+	"github.com/artisoft-io/jetstore/jets/utils/jcsv"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -26,6 +26,7 @@ type JetrulesTransformationPipe struct {
 	doneCh         chan struct{}
 }
 
+// Encoding: json, toon, row (default)
 type JetrulesOutputChan struct {
 	ClassName        string
 	ColumnEvaluators []TransformationColumnEvaluator

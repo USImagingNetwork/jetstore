@@ -5,9 +5,11 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/artisoft-io/jetstore/jets/dbutils"
+	"github.com/artisoft-io/jetstore/jets/utils"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -16,24 +18,31 @@ import (
 // Run command in workspace
 func RunCommand(buf *strings.Builder, command string, args *[]string, workspaceName string) error {
 	var cmd *exec.Cmd
+	var err error
 	if args != nil {
+		// Sanitize the arguments to prevent injection of options/flags
+		*args = utils.SanitizeArgs(*args)
 		cmd = exec.Command(command, (*args)...)
 	} else {
 		cmd = exec.Command(command)
 	}
 	if workspaceName != "" {
-		path := fmt.Sprintf("%s/%s", os.Getenv("WORKSPACES_HOME"), workspaceName)
-		buf.WriteString(fmt.Sprintf("Executing command %s in %s\n", command, path))
+		workspaceName, err = utils.ValidateWorkspaceName(workspaceName)
+		if err != nil {
+			return err
+		}
+		path := filepath.Join(os.Getenv("WORKSPACES_HOME"), workspaceName)
+		fmt.Fprintf(buf, "Executing command %s in %s\n", command, path)
 		cmd.Dir = path
 		cmd.Env = append(os.Environ(),
 			fmt.Sprintf("WORKSPACE=%s", workspaceName),
 		)
 	} else {
-		buf.WriteString(fmt.Sprintf("Executing command %s (not workspace specific or path specified)\n", command))
+		fmt.Fprintf(buf, "Executing command %s (not workspace specific or path specified)\n", command)
 	}
 	cmd.Stdout = buf
 	cmd.Stderr = buf
-	err := cmd.Run()
+	err = cmd.Run()
 	if err != nil {
 		msg := fmt.Sprintf("while executing command '%v': %v\n", command, err)
 		log.Print(msg)
@@ -48,10 +57,12 @@ func RunCommand(buf *strings.Builder, command string, args *[]string, workspaceN
 // Read the file from the workspace on file system since it's already in sync with database
 func GetContent(workspaceName, fileName string) (string, error) {
 
-	// Read file from local workspace
-	var content []byte
-	var err error
-	content, err = os.ReadFile(fmt.Sprintf("%s/%s/%s", os.Getenv("WORKSPACES_HOME"), workspaceName, fileName))
+	// Read file from local workspace, confining the path to the workspace dir (CWE-73)
+	_, path, err := resolveWorkspacePath(workspaceName, fileName)
+	if err != nil {
+		return "", err
+	}
+	content, err := os.ReadFile(path)
 	if err != nil {
 		return "", fmt.Errorf("failed to read local workspace file %s: %v", fileName, err)
 	}
@@ -62,10 +73,13 @@ func GetContent(workspaceName, fileName string) (string, error) {
 // Function to save the workspace file content in local workspace file system and in database
 func SaveContent(dbpool *pgxpool.Pool, workspaceName, fileName, fileContent string) error {
 
-	// Write file to local workspace
+	// Write file to local workspace, confining the path to the workspace dir (CWE-73)
+	workspaceName, path, err := resolveWorkspacePath(workspaceName, fileName)
+	if err != nil {
+		return err
+	}
 	data := []byte(fileContent)
-	path := fmt.Sprintf("%s/%s/%s", os.Getenv("WORKSPACES_HOME"), workspaceName, fileName)
-	err := os.WriteFile(path, data, 0644)
+	err = os.WriteFile(path, data, 0644)
 	if err != nil {
 		return fmt.Errorf("failed to write local workspace file %s: %v", fileName, err)
 	}
@@ -90,6 +104,6 @@ func SaveContent(dbpool *pgxpool.Pool, workspaceName, fileName, fileContent stri
 	if err != nil {
 		return fmt.Errorf("failed to save local workspace file %s in database: %v", fileName, err)
 	}
-	fmt.Println("uploaded", fo.FileName, "size", n, "bytes to database")
+	log.Println("uploaded", fo.FileName, "size", n, "bytes to database")
 	return nil
 }

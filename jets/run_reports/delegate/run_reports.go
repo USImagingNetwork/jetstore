@@ -9,12 +9,14 @@ import (
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/artisoft-io/jetstore/jets/awsi"
+	"github.com/artisoft-io/jetstore/jets/utils"
 	"github.com/artisoft-io/jetstore/jets/workspace"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -333,14 +335,33 @@ func (ca *CommandArguments) RunReports(dbpool *pgxpool.Pool) (returnedErr error)
 	return nil
 }
 
+// confineReportPath verifies that reportScriptPath, after resolving to an
+// absolute path, stays within the workspace reports directory, mitigating
+// external control of file name or path (CWE-73). The report script names come
+// from the report directives config, which is externally controlled.
+func confineReportPath(reportScriptPath string) (string, error) {	
+	baseDir := filepath.Join(workspaceHome, wprefix, "reports")
+	filePath, err := utils.ConfineFilePath(baseDir, reportScriptPath)
+	if err != nil {
+		return "", err
+	}
+	return filePath, nil
+}
+
 // Support Functions
 func (ca *CommandArguments) runSqlScriptDelegate(dbpool *pgxpool.Pool, reportScriptPath string) error {
 
+	// Confine the report script path within the workspace reports directory (CWE-73)
+	safePath, err := confineReportPath(reportScriptPath)
+	if err != nil {
+		return err
+	}
+
 	// Read the sql script
-	file, err := os.ReadFile(reportScriptPath)
+	file, err := os.ReadFile(safePath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			fmt.Println("Error sql Script not found:", reportScriptPath)
+			log.Println("Error sql Script not found:", reportScriptPath)
 		}
 		return err
 	}
@@ -374,8 +395,14 @@ func (ca *CommandArguments) runSqlScriptDelegate(dbpool *pgxpool.Pool, reportScr
 
 func (ca *CommandArguments) runReportsDelegate(dbpool *pgxpool.Pool, tempDir string, reportScriptPath string, updatedKeys *[]string) error {
 
+	// Confine the report script path within the workspace reports directory (CWE-73)
+	safePath, err := confineReportPath(reportScriptPath)
+	if err != nil {
+		return err
+	}
+
 	// Get the report definitions
-	file, err := os.Open(reportScriptPath)
+	file, err := os.Open(safePath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			log.Printf("Report definitions file %s does not exist, skipping", reportScriptPath)
@@ -544,20 +571,18 @@ func (ca *CommandArguments) DoReport(dbpool *pgxpool.Pool, tempDir string, outpu
 			escapedStmt := strings.ReplaceAll(stmt, "'", "''")
 			s3Stmt := fmt.Sprintf("SELECT * from aws_s3.query_export_to_s3('%s', '%s', '%s','%s',options:='%s')",
 				escapedStmt, ca.BucketName, s3FileName, ca.RegionName, options)
-			// fmt.Println("S3 QUERY:", s3Stmt)
+			// log.Println("S3 QUERY:", s3Stmt)
 			var rowsUploaded, filesUploaded, bytesUploaded sql.NullInt64
 			err := dbpool.QueryRow(context.Background(), s3Stmt).Scan(&rowsUploaded, &filesUploaded, &bytesUploaded)
 			if err != nil {
 				return "", fmt.Errorf("while executing s3 query %s: %v", escapedStmt, err)
 			}
-			fmt.Println("Report:", name, "rowsUploaded", rowsUploaded.Int64, "filesUploaded", filesUploaded.Int64, "bytesUploaded", bytesUploaded.Int64)
+			log.Println("Report:", name, "rowsUploaded", rowsUploaded.Int64, "filesUploaded", filesUploaded.Int64, "bytesUploaded", bytesUploaded.Int64)
 		}
 	default:
 		// Report not saved to s3, probably as as table (see below)
 		log.Printf("Report %s not saved to s3", *outputFileName)
 	}
-
-	fmt.Println("------")
 
 	return s3FileName, nil
 }

@@ -6,6 +6,7 @@ import (
 
 	"github.com/antlr4-go/antlr/v4"
 	"github.com/artisoft-io/jetstore/jets/compilerv2/parser"
+	"github.com/artisoft-io/jetstore/jets/utils"
 )
 
 // antlr v4 JetRuleListener interface implementation
@@ -20,7 +21,11 @@ func (j *JetRuleListener) LogParse(msg string) {
 	j.parseLog.WriteString("\n")
 }
 
-func readRuleFile(filePath string) (string, error) {
+func readRuleFile(basePath, fileName string) (string, error) {
+	filePath, err := utils.ConfineFilePath(basePath, fileName)
+	if err != nil {
+		return "", err
+	}
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		return "", err
