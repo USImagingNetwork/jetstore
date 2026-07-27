@@ -13,6 +13,7 @@ import (
 
 	"github.com/artisoft-io/jetstore/jets/awsi"
 	"github.com/artisoft-io/jetstore/jets/schema"
+	"github.com/artisoft-io/jetstore/jets/utils"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -94,12 +95,11 @@ var jetsS3SchemaTriggers string = os.Getenv("JETS_s3_SCHEMA_TRIGGERS")
 // Submit Schema Event to S3 (which will call RegisterFileKEys as side effect)
 func (ctx *DataTableContext) PutSchemaEventToS3(action *RegisterFileKeyAction, token string) (*map[string]any, int, error) {
 	for irow := range action.Data {
-		var schemaProviderJson string
 		e := action.Data[irow]["event"]
 		key := action.Data[irow]["file_key"]
 		if e != nil && key != nil {
-			schemaProviderJson = e.(string)
-			if len(schemaProviderJson) > 0 {
+			schemaProviderJson, ok := e.(string)
+			if ok && len(schemaProviderJson) > 0 {
 				err := awsi.UploadBufToS3("", fmt.Sprintf("%s/%v", jetsS3SchemaTriggers, key), []byte(schemaProviderJson))
 				if err != nil {
 					return nil, http.StatusInternalServerError, fmt.Errorf("while calling UploadBufToS3: %v", err)
@@ -338,53 +338,6 @@ do_retry:
 	return sessionId, nil
 }
 
-func splitFileKey(keyMap map[string]any, fileKey *string) map[string]any {
-	if fileKey != nil {
-		for _, component := range strings.Split(*fileKey, "/") {
-			elms := strings.Split(component, "=")
-			if len(elms) == 2 {
-				keyMap[elms[0]] = elms[1]
-				if elms[0] == "vendor" {
-					keyMap["org"] = elms[1]
-				}
-			}
-		}
-	}
-	return keyMap
-}
-
-func SplitFileKeyIntoComponents(keyMap map[string]any, fileKey *string) map[string]any {
-	var err error
-	fileKeyObject := splitFileKey(keyMap, fileKey)
-	fileKeyObject["file_key"] = *fileKey
-	year := 1970
-	if fileKeyObject["year"] != nil {
-		year, err = strconv.Atoi(fileKeyObject["year"].(string))
-		if err != nil {
-			log.Printf("File Key with invalid year: %s, setting to 1970", fileKeyObject["year"])
-		}
-	}
-	month := 1
-	if fileKeyObject["month"] != nil {
-		month, err = strconv.Atoi(fileKeyObject["month"].(string))
-		if err != nil {
-			log.Printf("File Key with invalid month: %s, setting to 1", fileKeyObject["month"])
-		}
-	}
-	day := 1
-	if fileKeyObject["day"] != nil {
-		day, err = strconv.Atoi(fileKeyObject["day"].(string))
-		if err != nil {
-			log.Printf("File Key with invalid day: %s, setting to 1", fileKeyObject["day"])
-		}
-	}
-	// Updating object attribute with correct type
-	fileKeyObject["year"] = year
-	fileKeyObject["month"] = month
-	fileKeyObject["day"] = day
-	return fileKeyObject
-}
-
 // SyncFileKeys ------------------------------------------------------
 // 12/17/2023: Replacing all keys in file_key_staging to be able to reset keys from source_config that are Part File sources
 func (ctx *DataTableContext) SyncFileKeys(registerFileKeyAction *RegisterFileKeyAction, token string) (*map[string]any, int, error) {
@@ -439,7 +392,7 @@ func (ctx *DataTableContext) SyncFileKeys(registerFileKeyAction *RegisterFileKey
 			"size":  s3Obj.Size,
 		}
 		// Split fileKey into components and then in it's elements
-		fileKeyObject = SplitFileKeyIntoComponents(fileKeyObject, &s3Key)
+		fileKeyObject = utils.SplitFileKeyIntoComponents(fileKeyObject, &s3Key)
 		fileKeyObject["file_key"] = s3Key
 		// Updating object attribute with correct type
 		fileKeyObject["year"] = fileKeyObject["year"].(int)

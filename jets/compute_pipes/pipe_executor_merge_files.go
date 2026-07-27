@@ -73,6 +73,7 @@ func (cpCtx *ComputePipesContext) StartMergeFiles(dbpool *pgxpool.Pool) (cpErr e
 	var fileFolder, fileName, outputS3FileKey string
 	inputFileKeys := cpCtx.InputFileKeys[0]
 	nbrFiles := len(inputFileKeys)
+	outputFileConfig.SetOutputLocation(utils.ReplaceEnvVars(outputFileConfig.OutputLocation(), cpCtx.EnvSettings))
 	switch outputFileConfig.OutputLocation() {
 	case "jetstore_s3_input", "jetstore_s3_output", "jetstore_s3_stage", "jetstore_s3_schema_events":
 		if len(outputFileConfig.Name()) > 0 {
@@ -88,11 +89,11 @@ func (cpCtx *ComputePipesContext) StartMergeFiles(dbpool *pgxpool.Pool) (cpErr e
 		case "jetstore_s3_stage":
 			// put in jetstore s3 stage path
 			keyPrefix := utils.ReplaceEnvVars(outputFileConfig.KeyPrefix, cpCtx.EnvSettings)
-			fileFolder = fmt.Sprintf("%s/%s/%s", awsi.JetStoreStagePrefix(), keyPrefix, fileName)
+			fileFolder = fmt.Sprintf("%s/%s", awsi.JetStoreStagePrefix(), keyPrefix)
 		case "jetstore_s3_schema_events":
 			// put in jetstore s3 schema events path
 			keyPrefix := utils.ReplaceEnvVars(outputFileConfig.KeyPrefix, cpCtx.EnvSettings)
-			fileFolder = fmt.Sprintf("%s/%s/%s", awsi.JetStoreSchemaEventsPrefix(), keyPrefix, fileName)
+			fileFolder = fmt.Sprintf("%s/%s", awsi.JetStoreSchemaEventsPrefix(), keyPrefix)
 		default:
 			if len(outputFileConfig.KeyPrefix) > 0 {
 				fileFolder = doSubstitution(outputFileConfig.KeyPrefix, "", outputFileConfig.OutputLocation(),
@@ -101,11 +102,11 @@ func (cpCtx *ComputePipesContext) StartMergeFiles(dbpool *pgxpool.Pool) (cpErr e
 				fileFolder = doSubstitution("$PATH_FILE_KEY", "", outputFileConfig.OutputLocation(),
 					cpCtx.EnvSettings)
 			}
-			outputS3FileKey = fmt.Sprintf("%s/%s", fileFolder, fileName)
 		}
+		outputS3FileKey = fmt.Sprintf("%s/%s", fileFolder, fileName)
 
 	default:
-		outputS3FileKey = utils.ReplaceEnvVars(outputFileConfig.OutputLocation(), cpCtx.EnvSettings)
+		outputS3FileKey = outputFileConfig.OutputLocation()
 	}
 
 	// Create a reader if stream the data to s3
@@ -138,15 +139,52 @@ func (cpCtx *ComputePipesContext) StartMergeFiles(dbpool *pgxpool.Pool) (cpErr e
 	case inputChannel.Format != "":
 		format = inputChannel.Format
 	}
-	writeHeaders := true
-	if format != "csv" || (inputChannel.Format == "csv" && nbrFiles == 1) {
+
+	log.Printf("%s node %d merging %d files to '%s' in bucket '%s' with format %s and compression %s",
+		cpCtx.SessionId, cpCtx.NodeId, nbrFiles, outputS3FileKey, externalBucket, format, compression)
+
+	var writeHeaders bool
+	var skipInputHeaders bool
+	switch {
+	case format != "csv" && inputChannel.Format == "csv":
 		writeHeaders = false
-	}
-	if pipeSpec.MergeFileConfig != nil && pipeSpec.MergeFileConfig.FirstPartitionHasHeaders {
+		skipInputHeaders = true
+		log.Printf("%s node %d input channel is csv but output format is %s, will not write headers in merged file",
+			cpCtx.SessionId, cpCtx.NodeId, format)
+	case format != "csv" && inputChannel.Format != "csv":
 		writeHeaders = false
+		skipInputHeaders = false
+		log.Printf("%s node %d input channel format is %s but output format is %s, will not write headers in merged file",
+			cpCtx.SessionId, cpCtx.NodeId, inputChannel.Format, format)
+	case format == "csv" && inputChannel.Format == "csv" && nbrFiles == 1:
+		writeHeaders = false
+		skipInputHeaders = false
+		log.Printf("%s node %d only one input file and format is csv, will copy input file with it's headers in merged file",
+			cpCtx.SessionId, cpCtx.NodeId)
+	case format == "csv" && inputChannel.Format == "csv" && pipeSpec.MergeFileConfig != nil && pipeSpec.MergeFileConfig.FirstPartitionHasHeaders:
+		writeHeaders = false
+		skipInputHeaders = false
+		log.Printf("%s node %d multiple input files and format is csv but first file has headers, will copy files as is, headeers will come from first file.",
+			cpCtx.SessionId, cpCtx.NodeId)
+	case format == "csv" && inputChannel.Format == "csv" && nbrFiles > 1:
+		writeHeaders = true
+		skipInputHeaders = true
+		log.Printf("%s node %d multiple input files and format is csv, will write headers in merged file but skip headers in input files",
+			cpCtx.SessionId, cpCtx.NodeId)
+	case format == "csv" && inputChannel.Format != "csv":
+		writeHeaders = true
+		skipInputHeaders = false
+		log.Printf("%s node %d input channel format is %s but output format is csv, will write headers in merged file",
+			cpCtx.SessionId, cpCtx.NodeId, inputChannel.Format)
+	default:
+		err := fmt.Errorf("error: unexpected case when determining whether to write headers in merged file, input format: %s, output format: %s, number of input files: %d",
+			inputChannel.Format, format, nbrFiles)
+		log.Println(err)
+		return err
 	}
 
 	// Determine the headers to write
+	getHeadersFromInputFile := false
 	if len(outputFileConfig.Headers) == 0 && writeHeaders {
 		if inputSp != nil {
 			// This is always the original headers, not the uniquefied ones
@@ -156,7 +194,7 @@ func (cpCtx *ComputePipesContext) StartMergeFiles(dbpool *pgxpool.Pool) (cpErr e
 		if len(outputFileConfig.Headers) == 0 {
 			// Get the headers from the main input source (as a fallback)
 			// This is for the case where the headers are in the input file
-			inputChannelName := cpCtx.CpConfig.PipesConfig[0].InputChannel.Name
+			inputChannelName := inputChannel.Name
 			if inputChannelName == "input_row" {
 				// Check if we need to use the original headers or the uniquefied ones
 				inputChannelColumns := cpCtx.CpConfig.CommonRuntimeArgs.SourcesConfig.MainInput.InputColumns
@@ -165,6 +203,9 @@ func (cpCtx *ComputePipesContext) StartMergeFiles(dbpool *pgxpool.Pool) (cpErr e
 					outputFileConfig.Headers = originalHeaders
 				} else {
 					outputFileConfig.Headers = inputChannelColumns
+				}
+				if len(outputFileConfig.Headers) == 0 && inputChannel.Format == "csv" {
+					getHeadersFromInputFile = true
 				}
 			} else {
 				for i := range cpCtx.CpConfig.Channels {
@@ -175,9 +216,9 @@ func (cpCtx *ComputePipesContext) StartMergeFiles(dbpool *pgxpool.Pool) (cpErr e
 				}
 			}
 		}
-		if len(outputFileConfig.Headers) == 0 {
+		if len(outputFileConfig.Headers) == 0 && !getHeadersFromInputFile {
 			cpErr = fmt.Errorf(
-				"error: merge_files operator using output_file %s, no headers avaliable",
+				"error: merge_files operator using output_file %s, no headers available",
 				outputFileConfig.Key)
 			log.Println(cpErr)
 			return
@@ -211,7 +252,7 @@ func (cpCtx *ComputePipesContext) StartMergeFiles(dbpool *pgxpool.Pool) (cpErr e
 	switch {
 	case inputFormat == "parquet" && nbrFiles > 1:
 		// merge parquet files into a single file
-		// Pipe the writer to a reader to content goes directly to s3
+		// Pipe the writer to a reader so content goes directly to s3
 		// log.Printf("*** MERGE %d files to single parquet file\n", nbrFiles)
 		pin, pout := io.Pipe()
 		gotError := func(err error) {
@@ -231,7 +272,8 @@ func (cpCtx *ComputePipesContext) StartMergeFiles(dbpool *pgxpool.Pool) (cpErr e
 		// Not usual, do copy the old way
 		log.Printf("*** MERGE %d files using text format (%s) with compression %s\n",
 			nbrFiles, inputFormat, compression)
-		fileReader, err = cpCtx.NewMergeFileReader(0, inputFormat, delimiter, outputSp, outputFileConfig.Headers, writeHeaders, compression)
+		fileReader, err = cpCtx.NewMergeFileReader(0, inputFormat, delimiter, outputSp, outputFileConfig.Headers,
+			writeHeaders, getHeadersFromInputFile, skipInputHeaders, compression)
 		if err != nil {
 			cpErr = err
 			return
@@ -247,8 +289,16 @@ func (cpCtx *ComputePipesContext) StartMergeFiles(dbpool *pgxpool.Pool) (cpErr e
 		}
 
 		poolSize := cpCtx.CpConfig.ClusterConfig.S3WorkerPoolSize
-		sourceKey := fmt.Sprintf("%s/process_name=%s/session_id=%s/step_id=%s",
-			awsi.JetStoreStagePrefix(), cpCtx.ProcessName, cpCtx.SessionId, inputChannel.ReadStepId)
+		var sourceKey string
+		// Main input source, always reading from "stage", therefore bucket is 'jetstore_bucket', hence the sourceBucket is ""
+		if len(inputChannel.FileKey) == 0 {
+			sourceKey = fmt.Sprintf("%s/process_name=%s/session_id=%s/step_id=%s",
+				awsi.JetStoreStagePrefix(), cpCtx.ProcessName, cpCtx.SessionId, inputChannel.ReadStepId)
+		} else {
+			fileK := utils.ReplaceEnvVars(inputChannel.FileKey, cpCtx.EnvSettings)
+			sourceKey = fmt.Sprintf("%s/%s", awsi.JetStoreStagePrefix(), fileK)
+		}
+		// Note sourceBucket is empty since we are always reading from the jetstore_bucket stage folder
 		err = awsi.MultiPartCopy(context.TODO(), s3Client, poolSize, "", sourceKey, externalBucket, outputS3FileKey,
 			cpCtx.CpConfig.ClusterConfig.IsDebugMode)
 		if err != nil {
@@ -333,57 +383,46 @@ func (cpCtx *ComputePipesContext) startDownloadFiles() bool {
 // that reads content from partfiles and makes it available to the s3 manager
 // via the Read interface
 type MergeFileReader struct {
-	currentFile    FileName
-	currentFileHd  *os.File
-	reader         *bufio.Reader
-	headers        []byte
-	mergePos       int
-	compression    string
-	skipHeaderLine bool
-	skipHeaderFlag bool
-	cpCtx          *ComputePipesContext
+	currentFile             FileName
+	currentFileHd           *os.File
+	reader                  *bufio.Reader
+	headers                 []byte
+	outputSp                SchemaProvider
+	getHeadersFromInputFile bool
+	delimiter               rune
+	mergePos                int
+	compression             string
+	skipHeaderLine          bool
+	skipHeaderFlag          bool
+	cpCtx                   *ComputePipesContext
 }
 
 // outputSp is needed to determine if we quote all or non fields. It also provided the writeHeaders value.
-func (cpCtx *ComputePipesContext) NewMergeFileReader(mergePos int, inputFormat string, delimiter rune, outputSp SchemaProvider, headers []string,
-	writeHeaders bool, compression string) (io.Reader, error) {
+func (cpCtx *ComputePipesContext) NewMergeFileReader(mergePos int, inputFormat string, delimiter rune,
+	outputSp SchemaProvider, headers []string,
+	writeHeaders, getHeadersFromInputFile, skipInputHeaders bool, compression string) (io.Reader, error) {
 
 	var h []byte
+	var err error
 	if len(headers) > 0 && writeHeaders {
-		// Write the header into a byte slice. Using a csv.Writer to make sure
-		// the delimiter is escaped correctly
-		var buf bytes.Buffer
-		w := csv.NewWriter(&buf)
-		if outputSp != nil {
-			d := outputSp.Delimiter()
-			if d > 0 {
-				delimiter = d
-			}
-			if outputSp.QuoteAllRecords() {
-				w.QuoteAll = true
-			}
-			if outputSp.NoQuotes() {
-				w.NoQuotes = true
-			}
-		}
-		w.Comma = delimiter
-		err := w.Write(headers)
+		h, err = packageHeaders(outputSp, headers, delimiter)
 		if err != nil {
-			return nil, fmt.Errorf("while writing headers in merge_files op: %v", err)
+			return nil, err
 		}
-		w.Flush()
-		h = buf.Bytes()
 	}
 	if strings.HasPrefix(inputFormat, "parquet") {
 		// compression does not applies to parquet file
 		compression = ""
 	}
 	return &MergeFileReader{
-		cpCtx:          cpCtx,
-		headers:        h,
-		mergePos:       mergePos,
-		compression:    compression,
-		skipHeaderLine: inputFormat == "csv" && writeHeaders,
+		cpCtx:                   cpCtx,
+		headers:                 h,
+		mergePos:                mergePos,
+		compression:             compression,
+		skipHeaderLine:          skipInputHeaders,
+		getHeadersFromInputFile: getHeadersFromInputFile,
+		outputSp:                outputSp,
+		delimiter:               delimiter,
 	}, nil
 }
 
@@ -430,9 +469,22 @@ func (r *MergeFileReader) Read(buf []byte) (int, error) {
 	default:
 		// Delegate to the reader
 		if r.skipHeaderFlag {
-			_, err = r.reader.ReadString('\n')
+			var headers string
+			headers, err = r.reader.ReadString('\n')
 			if err != nil && err != io.EOF {
 				return 0, err
+			}
+			if r.getHeadersFromInputFile {
+				// Get the headers from the first input file and package them
+				var err3 error
+				r.headers, err3 = packageHeaders(r.outputSp, strings.Split(strings.TrimSpace(headers), string(r.delimiter)), r.delimiter)
+				if err3 != nil {
+					return 0, fmt.Errorf("while packaging headers from first input file: %v", err3)
+				}
+				r.getHeadersFromInputFile = false
+				r.skipHeaderFlag = false
+				// delegate to itself to write the headers before reading the file content
+				return r.Read(buf)
 			}
 			r.skipHeaderFlag = false
 		}
@@ -457,4 +509,30 @@ func (r *MergeFileReader) Read(buf []byte) (int, error) {
 		return n, nil
 	}
 
+}
+
+func packageHeaders(outputSp SchemaProvider, headers []string, delimiter rune) ([]byte, error) {
+	// Write the header into a byte slice. Using a csv.Writer to make sure
+	// the delimiter is escaped correctly
+	var buf bytes.Buffer
+	w := csv.NewWriter(&buf)
+	if outputSp != nil {
+		d := outputSp.Delimiter()
+		if d > 0 {
+			delimiter = d
+		}
+		if outputSp.QuoteAllRecords() {
+			w.QuoteAll = true
+		}
+		if outputSp.NoQuotes() {
+			w.NoQuotes = true
+		}
+	}
+	w.Comma = delimiter
+	err := w.Write(headers)
+	if err != nil {
+		return nil, fmt.Errorf("while writing headers in merge_files op: %v", err)
+	}
+	w.Flush()
+	return buf.Bytes(), nil
 }

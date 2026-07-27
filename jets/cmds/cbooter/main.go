@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"syscall"
 	"time"
+
+	"github.com/artisoft-io/jetstore/jets/utils"
 )
 
 // Docker image booter to run commands as non-root user inside container
@@ -48,14 +50,36 @@ var rootSysProcAttr *syscall.SysProcAttr = &syscall.SysProcAttr{
 	},
 }
 
+// allowedCommands is the set of commands cbooter is permitted to run.
+// The user-supplied command must match one of these exactly to prevent
+// arbitrary command / argument injection via os.Args.
+var allowedCommands = map[string]bool{
+	"apiserver":            true,
+	"run_reports":          true,
+	"cpipes_server":        true,
+	"cpipes_native_server": true,
+}
+
 func main() {
+	utils.UseJetStoreLogger()
 	log.Printf("cbooter starting with arguments %v...", os.Args[1:])
+
+	// A command name is required as the first argument.
+	if len(os.Args) < 2 {
+		log.Fatalf("a command name must be provided as the first argument; allowed commands: apiserver, run_reports, cpipes_server, cpipes_native_server")
+	}
 
 	// Separate cbooter args from command args
 	// cbooter args are -ui, -reports, -loader, -server, -serverv2, -cpipes
 	// Everything else is considered a cmd arg
 	cmd := os.Args[1]
 	cmdArgs := os.Args[2:]
+
+	// Validate the command against the allowlist to prevent command injection.
+	// Only known, trusted command names may be executed.
+	if !allowedCommands[cmd] {
+		log.Fatalf("invalid command %q; allowed commands: apiserver, run_reports, cpipes_server, cpipes_native_server", cmd)
+	}
 
 	// Validate that JETS_TEMP_DATA, WORKSPACES_REPO, and WORKSPACES_HOME are set
 	if os.Getenv("JETS_TEMP_DATA") == "" || os.Getenv("WORKSPACES_REPO") == "" || os.Getenv("WORKSPACES_HOME") == "" {
@@ -134,6 +158,8 @@ func makeJetsdataWritable() error {
 }
 
 func runCommandAsRoot(command string, args []string) error {
+	// Sanitize the command and arguments to prevent injection of options/flags
+	args = utils.SanitizeArgs(args)
 	cmd := exec.Command(command, args...)
 	cmd.SysProcAttr = rootSysProcAttr
 	// Run the command and capture output
@@ -145,6 +171,8 @@ func runCommandAsRoot(command string, args []string) error {
 // runCommandAsJsuser runs a command with specified user
 // It returns an error if the command fails to start
 func runCommandAsJsuser(command string, args []string) error {
+	// Sanitize the command and arguments to prevent injection of options/flags
+	args = utils.SanitizeArgs(args)
 	cmd := exec.Command(command, args...)
 	cmd.SysProcAttr = jsuserSysProcAttr
 

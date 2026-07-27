@@ -196,7 +196,7 @@ func (ctx *PartitionWriterTransformationPipe) applyInternal(input *[]any) error 
 						close(ctx.doneCh)
 					}
 				}
-				// fmt.Println("**@= Defer called done writing, calling ClientsWg.Done()")
+				// log.Println("**@= Defer called done writing, calling ClientsWg.Done()")
 				ctx.s3DeviceManager.ClientsWg.Done()
 			}()
 
@@ -297,7 +297,7 @@ func (ctx *PartitionWriterTransformationPipe) Finally() {
 
 	// Indicate to S3DeviceManager that we're done using it
 	if ctx.s3DeviceManager.ClientsWg != nil {
-		// fmt.Println("**@= Finally called, calling ClientsWg.Done()")
+		// log.Println("**@= Finally called, calling ClientsWg.Done()")
 		ctx.s3DeviceManager.ClientsWg.Done()
 	} else {
 		log.Panicln("ERROR expecting ctx.s3DeviceManager.ClientsWg not nil")
@@ -442,7 +442,7 @@ func (ctx *BuilderContext) NewPartitionWriterTransformationPipe(source *InputCha
 		}
 		// log.Printf("NewPartitionWriterTransformationPipe: Writing to baseOutputPath %s", baseOutputPath)
 	case "output":
-		outLoc := spec.OutputChannel.OutputLocation()
+		outLoc := utils.ReplaceEnvVars(spec.OutputChannel.OutputLocation(), ctx.env)
 		keyPrefix := spec.OutputChannel.KeyPrefix
 		switch outLoc {
 		case "jetstore_s3_schema_events":
@@ -451,9 +451,7 @@ func (ctx *BuilderContext) NewPartitionWriterTransformationPipe(source *InputCha
 			log.Printf("NewPartitionWriterTransformationPipe: Writing to schema events location with baseOutputPath: %s", baseOutputPath)
 
 		default:
-			if len(outLoc) > 0 &&
-				outLoc != "jetstore_s3_input" &&
-				outLoc != "jetstore_s3_output" {
+			if len(outLoc) > 0 && !strings.HasPrefix(outLoc, "jetstore_s3_") {
 				outputLocation := utils.ReplaceEnvVars(outLoc, ctx.env)
 				if !strings.HasSuffix(outputLocation, "/") {
 					pos := strings.LastIndex(outputLocation, "/")

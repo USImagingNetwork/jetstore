@@ -1,6 +1,8 @@
 # =======================================================================================
 # Jets Data Model 
 # ---------------------------------------------------------------------------------------
+# Define the jets data model version
+@JetCompilerDirective JWS_VERSION = "0.1.0";
 
 class jets:Entity {
   $base_classes = [owl:Thing],
@@ -13,6 +15,15 @@ class jets:Entity {
     rdf:type                    as array of resource
   ],
   $as_table = false
+};
+
+# Class to use when encoding as toon or json
+class json:Data {
+  $base_classes = [jets:Entity],
+  $data_properties = [
+    json:data                   as text
+  ],
+  $as_table = true
 };
 
 # Marker class to indicate the entity is a mapped entity

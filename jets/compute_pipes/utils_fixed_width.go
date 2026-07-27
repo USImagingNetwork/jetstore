@@ -4,17 +4,18 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"log"
 	"strconv"
 	"strings"
 
 	"github.com/artisoft-io/jetstore/jets/csv"
-	"github.com/artisoft-io/jetstore/jets/datatable/jcsv"
+	"github.com/artisoft-io/jetstore/jets/utils/jcsv"
 )
 
 // Utilities for Fixed Width Files
 
-// Struct to hold column names and positions for fixed-width file encoding. 
-// ColumnsMap key is record type or empty string if single record type (RecordTypeColumn = nil in that case). 
+// Struct to hold column names and positions for fixed-width file encoding.
+// ColumnsMap key is record type or empty string if single record type (RecordTypeColumn = nil in that case).
 // In ColumnsMap elements, ColumnName is <record type>.<record column name> to make it unique across record types.
 // However RecordTypeColumn.ColumnName is <record column name> without prefix.
 // Note that all record type MUST have RecordTypeColumn.ColumnName with same start and end position.
@@ -162,7 +163,7 @@ func (sp *DefaultSchemaProvider) initializeFixedWidthInfo() error {
 		}
 	}
 	if sp.isDebugMode {
-		fmt.Println(sp.fwColumnInfo.String())
+		log.Println(sp.fwColumnInfo.String())
 	}
 	return nil
 }
