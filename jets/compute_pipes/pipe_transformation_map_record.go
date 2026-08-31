@@ -126,7 +126,10 @@ func (ctx *MapRecordTransformationPipe) Done() error {
 	return nil
 }
 
-func (ctx *MapRecordTransformationPipe) Finally() {}
+func (ctx *MapRecordTransformationPipe) Finally() {
+	// Note - closing the error channel is moved with closing all the output channels in 
+	// the pipe_executor_fan_out.go and pipe_executor_fsplitter.go
+}
 
 func (ctx *BuilderContext) NewMapRecordTransformationPipe(source *InputChannel, outputCh *OutputChannel,
 	spec *TransformationSpec) (*MapRecordTransformationPipe, error) {

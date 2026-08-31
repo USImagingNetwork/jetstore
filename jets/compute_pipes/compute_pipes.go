@@ -51,7 +51,7 @@ func (cpCtx *ComputePipesContext) StartComputePipes(dbpool *pgxpool.Pool,
 	var cpErr, err error
 	var channelRegistry *ChannelRegistry
 	var outChannel *Channel
-	var wt WriteTableSource
+	var wt *WriteTableSource
 	var table chan ComputePipesResult
 	var ctx *BuilderContext
 	var inputChannel InputChannelConfig
@@ -203,17 +203,18 @@ func (cpCtx *ComputePipesContext) StartComputePipes(dbpool *pgxpool.Pool,
 	outputChannels = make([]*OutputChannelConfig, 0)
 	for i := range cpCtx.CpConfig.PipesConfig {
 		for j := range cpCtx.CpConfig.PipesConfig[i].Apply {
-			switch cpCtx.CpConfig.PipesConfig[i].Apply[j].Type {
+			transformationConfig := &cpCtx.CpConfig.PipesConfig[i].Apply[j]
+			switch transformationConfig.Type {
 			case "anonymize":
-				outputChannel := &cpCtx.CpConfig.PipesConfig[i].Apply[j].OutputChannel
+				outputChannel := &transformationConfig.OutputChannel
 				outputChannels = append(outputChannels, outputChannel)
-				outputChannel = cpCtx.CpConfig.PipesConfig[i].Apply[j].AnonymizeConfig.KeysOutputChannel
+				outputChannel = transformationConfig.AnonymizeConfig.KeysOutputChannel
 				if outputChannel != nil {
 					outputChannels = append(outputChannels, outputChannel)
 				}
 			case "jetrules":
 				// Jetrules config overrides the outputChannel
-				jetruleConfig := cpCtx.CpConfig.PipesConfig[i].Apply[j].JetrulesConfig
+				jetruleConfig := transformationConfig.JetrulesConfig
 				if jetruleConfig == nil {
 					cpErr = fmt.Errorf("error: jetrules_config is required for transformation of type jetrules in PipesConfig")
 					goto gotError
@@ -226,18 +227,23 @@ func (cpCtx *ComputePipesContext) StartComputePipes(dbpool *pgxpool.Pool,
 					outputChannel := &jetruleConfig.OutputChannels[k]
 					outputChannels = append(outputChannels, outputChannel)
 				}
-				// Add the error output channel if specified
-				if jetruleConfig.ErrorChannel != nil {
-					outputChannels = append(outputChannels, jetruleConfig.ErrorChannel)
-				}
 			case "clustering":
-				outputChannel := &cpCtx.CpConfig.PipesConfig[i].Apply[j].OutputChannel
+				outputChannel := &transformationConfig.OutputChannel
 				outputChannels = append(outputChannels, outputChannel)
-				outputChannel = cpCtx.CpConfig.PipesConfig[i].Apply[j].ClusteringConfig.CorrelationOutputChannel
+				outputChannel = transformationConfig.ClusteringConfig.CorrelationOutputChannel
 				outputChannels = append(outputChannels, outputChannel)
 			default:
-				outputChannel := &cpCtx.CpConfig.PipesConfig[i].Apply[j].OutputChannel
+				// Note the ollama operator falls here: it augments the input record in
+				// place, so its output channel shares the input channel's spec.
+				outputChannel := &transformationConfig.OutputChannel
 				outputChannels = append(outputChannels, outputChannel)
+			}
+			// The operators that report row level errors write to an error channel, which
+			// must be registered here too or it is missing from the channel registry.
+			// See errorChannelConfig for the operators concerned.
+			errorChannel := errorChannelConfig(transformationConfig)
+			if errorChannel != nil && len(errorChannel.Name) > 0 {
+				outputChannels = append(outputChannels, errorChannel)
 			}
 		}
 	}
@@ -344,11 +350,8 @@ func (cpCtx *ComputePipesContext) StartComputePipes(dbpool *pgxpool.Pool,
 		if cpCtx.CpConfig.ClusterConfig.IsDebugMode {
 			log.Println("*** Channel for Output Table", tableIdentifier, "is:", outChannel.Name)
 		}
-		wt = WriteTableSource{
-			source:          outChannel.Channel,
-			tableIdentifier: tableIdentifier,
-			columns:         outChannel.Config.Columns,
-		}
+		wt = NewWriteTableSource(outChannel.Channel, tableIdentifier, outChannel.Config.Columns, 
+			cpCtx.Done, cpCtx.ErrCh)
 		table = make(chan ComputePipesResult, 1)
 		cpCtx.ChResults.Copy2DbResultCh <- table
 		go wt.WriteTable(dbpool, cpCtx.Done, table)
@@ -397,13 +400,14 @@ func (cpCtx *ComputePipesContext) StartComputePipes(dbpool *pgxpool.Pool,
 	// Wait until the lookup tables are ready
 	managersWg.Wait()
 
-	// log.Println("Calling ctx.BuildComputeGraph()")
 	err = ctx.BuildComputeGraph()
 	if err != nil {
 		cpErr = fmt.Errorf("while building the compute graph: %s", err)
 		goto gotError
 	}
-	// log.Println("Calling ctx.BuildComputeGraph() completed")
+	if cpCtx.CpConfig.ClusterConfig.IsDebugMode {
+		log.Println("*** Calling ctx.BuildComputeGraph() completed")
+	}
 
 	// All done!
 	close(cpCtx.ChResults.Copy2DbResultCh)
