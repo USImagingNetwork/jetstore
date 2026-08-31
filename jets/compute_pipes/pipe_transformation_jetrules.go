@@ -21,16 +21,21 @@ type JetrulesTransformationPipe struct {
 	jrPoolManager  *JrPoolManager
 	errorOutputCh  *OutputChannel
 	outputChannels []*JetrulesOutputChan
+	builderContext *BuilderContext
 	spec           *TransformationSpec
 	env            map[string]any
 	doneCh         chan struct{}
 }
 
-// Encoding: json, toon, row (default)
+type JrSpecialColumnEncoding struct {
+	Config            *ColumnEncodingSpec
+	ExcludeProperties map[string]bool
+}
 type JetrulesOutputChan struct {
-	ClassName        string
-	ColumnEvaluators []TransformationColumnEvaluator
-	OutputCh         *OutputChannel
+	ClassName         string
+	JrColumnEncodings map[string]*JrSpecialColumnEncoding
+	ColumnEvaluators  []TransformationColumnEvaluator
+	OutputCh          *OutputChannel
 }
 
 // Implementing interface PipeTransformationEvaluator
@@ -54,17 +59,17 @@ func (ctx *JetrulesTransformationPipe) Done() error {
 }
 
 func (ctx *JetrulesTransformationPipe) Finally() {
-	// log.Println("Entering JetrulesTransformationPipe.Finally")
-	close(ctx.jrPoolManager.WorkersTaskCh)
-	// Wait till the pool workers are done
-	// This is to avoid to close the output channel too early since the pool workers
-	// are writing to the output channel async
-	ctx.jrPoolManager.WaitForDone.Wait()
-	// log.Println("JetrulesTransformationPipe.Finally done")
-	// Close the error channel if exists
-	if ctx.errorOutputCh != nil {
-		close(ctx.errorOutputCh.Channel)
+	if ctx.jrPoolManager != nil {
+		close(ctx.jrPoolManager.WorkersTaskCh)
+		// Wait till the pool workers are done
+		// This is to avoid to close the output channel too early since the pool workers
+		// are writing to the output channel async
+		if ctx.jrPoolManager.WaitForDone != nil {
+			ctx.jrPoolManager.WaitForDone.Wait()
+		}
 	}
+	// Note - closing the error channel is moved with closing all the output channels in
+	// the pipe_executor_fan_out.go and pipe_executor_fsplitter.go
 }
 
 func (ctx *BuilderContext) NewJetrulesTransformationPipe(source *InputChannel, _ *OutputChannel, spec *TransformationSpec) (
@@ -130,6 +135,28 @@ func (ctx *BuilderContext) NewJetrulesTransformationPipe(source *InputChannel, _
 			return nil, fmt.Errorf("error: missing class name on jetrules output channel named %s",
 				config.OutputChannels[i].Name)
 		}
+
+		// The ChannelSpec associated with the output channel will give use the special encoding to use
+		//TODO: ColumnEncodingSpec will exist in Class metadata sidecar.
+		// The ColumnEncodingSpec on the ChannelSpec will override at the column level the one in the Class metadata sidecar.
+		// Make a lookup of column -> *JrSpecialColumnEncoding for the output channel
+		columnEncodings := make(map[string]*JrSpecialColumnEncoding)
+		for j := range outCh.Config.ColumnEncodings {
+			se := outCh.Config.ColumnEncodings[j]
+			if len(se.Column) == 0 {
+				return nil, fmt.Errorf("error: missing column name on jetrules output channel named %s column_encodings[%d]",
+					outCh.Config.Name, j)
+			}
+			excludeProperties := make(map[string]bool)
+			for _, p := range se.ExcludeProperties {
+				excludeProperties[p] = true
+			}
+			columnEncodings[se.Column] = &JrSpecialColumnEncoding{
+				Config:            se,
+				ExcludeProperties: excludeProperties,
+			}
+		}
+
 		// Make a set of TransformationColumnEvaluator for each of the output channel
 		columnEvaluators := make([]TransformationColumnEvaluator, len(spec.Columns))
 		for i := range spec.Columns {
@@ -142,9 +169,10 @@ func (ctx *BuilderContext) NewJetrulesTransformationPipe(source *InputChannel, _
 			}
 		}
 		jetrulesOutputChan = append(jetrulesOutputChan, &JetrulesOutputChan{
-			ClassName:        outCh.Config.ClassName,
-			ColumnEvaluators: columnEvaluators,
-			OutputCh:         outCh,
+			ClassName:         outCh.Config.ClassName,
+			ColumnEvaluators:  columnEvaluators,
+			OutputCh:          outCh,
+			JrColumnEncodings: columnEncodings,
 		})
 	}
 
@@ -228,11 +256,11 @@ func (ctx *BuilderContext) NewJetrulesTransformationPipe(source *InputChannel, _
 	var jrPoolManager *JrPoolManager
 	workerResultCh := make(chan JetrulesWorkerResult, 10)
 	ctx.chResults.JetrulesWorkerResultCh <- workerResultCh
-	jrPoolManager, err = ctx.NewJrPoolManager(config, source, rdfType2Columns, ruleEngine,
+	jrPoolManager = ctx.NewJrPoolManager(config, source, rdfType2Columns, ruleEngine,
 		errorOutputCh, jetrulesOutputChan, workerResultCh)
-	if err != nil {
-		return nil, err
-	}
+
+	// All good!
+	log.Printf("*** NewJetrulesTransformationPipe: exiting SUCCESS")
 	return &JetrulesTransformationPipe{
 		cpConfig:       ctx.cpConfig,
 		source:         source,
@@ -240,6 +268,7 @@ func (ctx *BuilderContext) NewJetrulesTransformationPipe(source *InputChannel, _
 		jrPoolManager:  jrPoolManager,
 		errorOutputCh:  errorOutputCh,
 		outputChannels: jetrulesOutputChan,
+		builderContext: ctx,
 		spec:           spec,
 		env:            ctx.env,
 		doneCh:         ctx.done,
