@@ -6,7 +6,7 @@ import (
 	"strings"
 
 	"github.com/artisoft-io/jetstore/jets/jetrules/rdf"
-	"github.com/jackc/pgx/v4/pgxpool"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // This file contains the definition of the interface for jetrules native and go versions integration.
@@ -88,6 +88,7 @@ type RdfNode interface {
 	Hdle() any
 	IsNil() bool
 	Value() any
+	Type() string
 	Equals(other RdfNode) bool
 	String() string
 }

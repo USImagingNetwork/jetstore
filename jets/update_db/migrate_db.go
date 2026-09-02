@@ -9,10 +9,12 @@ import (
 	"io/fs"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/artisoft-io/jetstore/jets/schema"
-	"github.com/jackc/pgx/v4/pgxpool"
+	"github.com/artisoft-io/jetstore/jets/utils"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func MigrateDb(dbpool *pgxpool.Pool) error {
@@ -34,7 +36,7 @@ func MigrateDb(dbpool *pgxpool.Pool) error {
 		return fmt.Errorf("error while decoding jstore schema: %v", err)
 	}
 	for i := range schemaDef {
-		fmt.Println("-- Got schema for", schemaDef[i].SchemaName, ".", schemaDef[i].TableName)
+		log.Println("Got schema for", schemaDef[i].SchemaName, ".", schemaDef[i].TableName)
 		// Drop specified tables
 		if schemaDef[i].Deleted {
 			err = schemaDef[i].DropTable(dbpool)
@@ -51,8 +53,12 @@ func MigrateDb(dbpool *pgxpool.Pool) error {
 	return nil
 }
 
-func loadConfig(dbpool *pgxpool.Pool, sqlFile string) error {
-	fmt.Println("\nInitializing jetsapi db using", sqlFile)
+func loadConfig(dbpool *pgxpool.Pool, baseDir, fileName string) error {
+	sqlFile, err := utils.ConfineFilePath(baseDir, fileName)
+	if err != nil {
+		return err
+	}
+	log.Println("Initializing jetsapi db using", sqlFile)
 	file, err := os.Open(sqlFile)
 	if err != nil {
 		return fmt.Errorf("error while opening jetsapi init db file: %v", err)
@@ -75,7 +81,7 @@ func loadConfig(dbpool *pgxpool.Pool, sqlFile string) error {
 			return fmt.Errorf("error while reading db init, stmt is empty")
 		}
 		stmt = strings.TrimSpace(stmt)
-		// fmt.Println(stmt)
+		// log.Println(stmt)
 		_, err = dbpool.Exec(context.Background(), stmt)
 		if err != nil {
 			return fmt.Errorf("error while executing: %v", err)
@@ -91,13 +97,12 @@ func InitializeBaseJetsapiDb(dbpool *pgxpool.Pool, jetsDbInitPath *string) error
 	// initialize jetsapi database -- base initialization only
 	// jetsDbInitPath using base__workspace_init_db.sql
 	if len(jetsDbInitScriptPath) > 0 {
-		err := loadConfig(dbpool, jetsDbInitScriptPath)
+		err := loadConfig(dbpool, filepath.Dir(jetsDbInitScriptPath), filepath.Base(jetsDbInitScriptPath))
 		if err != nil {
 			return err
 		}
 	}
-	sqlFile := fmt.Sprintf("%s/base__workspace_init_db.sql", *jetsDbInitPath)
-	return loadConfig(dbpool, sqlFile)
+	return loadConfig(dbpool, *jetsDbInitPath, "base__workspace_init_db.sql")
 }
 
 func InitializeJetsapiDb4Clients(dbpool *pgxpool.Pool, jetsDbInitPath *string, clients *string) error {
@@ -107,8 +112,8 @@ func InitializeJetsapiDb4Clients(dbpool *pgxpool.Pool, jetsDbInitPath *string, c
 	}
 	clientList := strings.Split(*clients, ",")
 	for i := range clientList {
-		sqlFile := fmt.Sprintf("%s/%s_workspace_init_db.sql", *jetsDbInitPath, strings.ToLower(clientList[i]))
-		err := loadConfig(dbpool, sqlFile)
+		fileName := fmt.Sprintf("%s_workspace_init_db.sql", strings.ToLower(clientList[i]))
+		err := loadConfig(dbpool, *jetsDbInitPath, fileName)
 		if err != nil {
 			return err
 		}
@@ -126,11 +131,11 @@ func InitializeJetsapiDb(dbpool *pgxpool.Pool, jetsDbInitPath *string) error {
 			return err
 		}
 		if info.IsDir() || path == "base__workspace_init_db.sql" {
-			// fmt.Printf("visiting directory: %+v \n", info.Name())
+			// log.Printf("visiting directory: %+v \n", info.Name())
 			return nil
 		}
 		sqlFile := fmt.Sprintf("%s/%s", *jetsDbInitPath, path)
-		fmt.Println("-- Initializing jetsapi db using", sqlFile)
+		log.Println("Initializing jetsapi db using", sqlFile)
 		file, err := os.Open(sqlFile)
 		if err != nil {
 			return fmt.Errorf("error while opening jetsapi init db file: %v", err)
@@ -152,7 +157,7 @@ func InitializeJetsapiDb(dbpool *pgxpool.Pool, jetsDbInitPath *string) error {
 				return fmt.Errorf("error while reading db init, stmt is empty")
 			}
 			stmt = strings.TrimSpace(stmt)
-			// fmt.Println(stmt)
+			// log.Println(stmt)
 			_, err = dbpool.Exec(context.Background(), stmt)
 			if err != nil {
 				return fmt.Errorf("error while executing: %v", err)

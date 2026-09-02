@@ -16,9 +16,11 @@ import (
 	"strings"
 
 	"github.com/artisoft-io/jetstore/jets/awsi"
+	"github.com/artisoft-io/jetstore/jets/compute_pipes"
 	"github.com/artisoft-io/jetstore/jets/jetrules/rdf"
-	"github.com/jackc/pgx/v4"
-	"github.com/jackc/pgx/v4/pgxpool"
+	"github.com/artisoft-io/jetstore/jets/utils"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // This file contains functions to update table pipeline_execution_status,
@@ -81,6 +83,41 @@ type PendingTask struct {
 	FileSize             sql.NullInt64
 }
 
+// validateCommandArg guards against option-style argument injection.
+// The task fields below are passed as arguments to external commands
+// (run_reports, local_test_driver) and to state machine inputs that
+// ultimately execute those commands. exec.Command does not invoke a shell,
+// so shell metacharacters are not a concern, but a value beginning with '-'
+// could be interpreted as a flag/option by the invoked program. Reject such
+// values (and empty values) to prevent argument injection.
+func validateCommandArg(name, value string) error {
+	if value == "" {
+		return fmt.Errorf("invalid %s: value must not be empty", name)
+	}
+	if strings.HasPrefix(value, "-") {
+		return fmt.Errorf("invalid %s: value must not start with '-'", name)
+	}
+	return nil
+}
+
+// validateForCommand validates the PendingTask fields that are used to build
+// command-line arguments, preventing option-style argument injection.
+func (task *PendingTask) validateForCommand() error {
+	if err := validateCommandArg("client", task.Client); err != nil {
+		return err
+	}
+	if err := validateCommandArg("process_name", task.ProcessName); err != nil {
+		return err
+	}
+	if err := validateCommandArg("session_id", task.SessionId); err != nil {
+		return err
+	}
+	if err := validateCommandArg("file_key", task.MainInputFileKey.String); err != nil {
+		return err
+	}
+	return nil
+}
+
 // Insert into pipeline_execution_status and in loader_execution_status
 func (ctx *DataTableContext) InsertPipelineExecutionStatus(dataTableAction *DataTableAction,
 	irow int, results *map[string]any, token string) (peKey int, httpStatus int, err error) {
@@ -111,20 +148,20 @@ func (ctx *DataTableContext) InsertPipelineExecutionStatus(dataTableAction *Data
 
 	switch {
 	case strings.HasSuffix(dataTableAction.FromClauses[0].Table, "pipeline_execution_status"):
-		if dataTableAction.Data[irow]["input_session_id"] == nil {
-			inSessionId := sessionId
-			inputRegistryKey := dataTableAction.Data[irow]["main_input_registry_key"]
-			if inputRegistryKey != nil {
-				stmt := "SELECT session_id FROM jetsapi.input_registry WHERE key = $1"
-				err = ctx.Dbpool.QueryRow(context.Background(), stmt, inputRegistryKey).Scan(&inSessionId)
-				if err != nil {
-					log.Printf("While getting session_id from input_registry table %s: %v", dataTableAction.FromClauses[0].Table, err)
-					httpStatus = http.StatusInternalServerError
-					err = errors.New("error while reading from a table")
-					return
-				}
+		inputRegistryKey := dataTableAction.Data[irow]["main_input_registry_key"]
+		if inputRegistryKey != nil {
+			var inSessionId string
+			var requestId sql.NullString
+			stmt := "SELECT session_id, request_id FROM jetsapi.input_registry WHERE key = $1"
+			err = ctx.Dbpool.QueryRow(context.Background(), stmt, inputRegistryKey).Scan(&inSessionId, &requestId)
+			if err != nil {
+				log.Printf("While getting session_id, request_id from input_registry for inserting in table %s: %v", dataTableAction.FromClauses[0].Table, err)
+				httpStatus = http.StatusInternalServerError
+				err = errors.New("error while reading from a table")
+				return
 			}
 			dataTableAction.Data[irow]["input_session_id"] = inSessionId
+			dataTableAction.Data[irow]["request_id"] = requestId.String
 		}
 		//=============
 		// Need to get:
@@ -205,7 +242,7 @@ func (ctx *DataTableContext) InsertPipelineExecutionStatus(dataTableAction *Data
 	case "input_loader_status":
 		httpStatus, err = ctx.startLoader(dataTableAction, irow, peKey, token)
 
-	case "pipeline_execution_status", "short/pipeline_execution_status":
+	case "pipeline_execution_status":
 		if status == "submitted" {
 			var mainInputRegistryKey int64
 			switch vv := dataTableAction.Data[irow]["main_input_registry_key"].(type) {
@@ -464,6 +501,13 @@ func (ctx *DataTableContext) startPipeline(devModeCode string, task *PendingTask
 func (ctx *DataTableContext) startStateMachine(task *PendingTask) error {
 	var err error
 	var name string
+
+	// Guard against option-style argument injection before building command args.
+	if err = task.validateForCommand(); err != nil {
+		log.Printf("while validating task for startStateMachine: %v", err)
+		return errors.New("error: invalid task argument")
+	}
+
 	peKey := strconv.Itoa(int(task.Key))
 
 	runReportsCommand := []string{
@@ -474,45 +518,12 @@ func (ctx *DataTableContext) startStateMachine(task *PendingTask) error {
 	}
 
 	// Invoke states to execute a pipeline
-	serverCommands := make([][]string, 0)
-
 	var processArn string
 	var smInput map[string]any
 	switch task.StateMachineName {
-	case "serverSM", "serverv2SM":
-		if task.StateMachineName == "serverv2SM" {
-			processArn = os.Getenv("JETS_SERVER_SM_ARNv2")
-		} else {
-			processArn = os.Getenv("JETS_SERVER_SM_ARN")
-		}
-		for shardId := range nbrShards {
-			serverArgs := []string{
-				"-peKey", peKey,
-				"-userEmail", task.UserEmail,
-				"-shardId", strconv.Itoa(shardId),
-			}
-			serverCommands = append(serverCommands, serverArgs)
-		}
-		smInput = map[string]any{
-			"serverCommands": serverCommands,
-			"reportsCommand": runReportsCommand,
-			"successUpdate": map[string]any{
-				"-peKey":         peKey,
-				"-status":        "completed",
-				"file_key":       task.MainInputFileKey.String,
-				"failureDetails": "",
-			},
-			"errorUpdate": map[string]any{
-				"-peKey":         peKey,
-				"-status":        "failed",
-				"file_key":       task.MainInputFileKey.String,
-				"failureDetails": "",
-			},
-		}
-
 	case "cpipesSM", "cpipesNativeSM":
 		// State Machine input for new cpipesSM all-in-one
-		// Set DoNotNotifyApiGateway to true, since we don't have the cpipesEnv when
+		// Set NotifyApiGatewayOverride to "no_notifications", since we don't have the cpipesEnv when
 		// calling start Sharding, api notification will be done in by sharding task
 		// as needed.
 		smInput = map[string]any{
@@ -522,12 +533,12 @@ func (ctx *DataTableContext) startStateMachine(task *PendingTask) error {
 				"session_id":             task.SessionId,
 			},
 			"errorUpdate": map[string]any{
-				"-peKey":                peKey, // string for this one! - legacy alert!
-				"-status":               "failed",
-				"file_key":              task.MainInputFileKey.String,
-				"cpipesMode":            true,
-				"doNotNotifyApiGateway": true,
-				"failureDetails":        "",
+				"-peKey":                      peKey, // string for this one! - legacy alert!
+				"-status":                     "failed",
+				"file_key":                    task.MainInputFileKey.String,
+				"cpipesMode":                  true,
+				"notify_api_gateway_override": "no_notifications",
+				"failureDetails":              "",
 			},
 		}
 		if task.StateMachineName == "cpipesNativeSM" {
@@ -568,13 +579,20 @@ func (ctx *DataTableContext) startStateMachine(task *PendingTask) error {
 		err = errors.New("error while calling StartExecution")
 		return err
 	}
-	fmt.Println("Server State Machine", name, "started")
+	log.Println("State Machine", name, "started")
 	return nil
 }
 
 func (ctx *DataTableContext) runPipelineLocally(devModeCode string, task *PendingTask, results *map[string]any) error {
 
 	var err error
+
+	// Guard against option-style argument injection before building command args.
+	if err = task.validateForCommand(); err != nil {
+		log.Printf("while validating task for runPipelineLocally: %v", err)
+		return errors.New("error: invalid task argument")
+	}
+
 	workspaceName := os.Getenv("WORKSPACE")
 	peKey := strconv.Itoa(int(task.Key))
 
@@ -599,43 +617,9 @@ func (ctx *DataTableContext) runPipelineLocally(devModeCode string, task *Pendin
 		devModeCode == "run_cpipes_only" || devModeCode == "run_cpipes_reports" {
 		// DevMode: Lock session id & register run on last shard (unless error)
 		// loop over every chard to exec in succession
-		var execName, lable string
+		var lable string
 		var cmd *exec.Cmd
 		switch devModeCode {
-		case "run_server_only", "run_server_reports":
-			switch task.StateMachineName {
-			case "serverSM":
-				execName = "/usr/local/bin/server"
-			case "serverv2SM":
-				execName = "/usr/local/bin/serverv2"
-			default:
-				log.Printf("error: unknown state machine name: %s", task.StateMachineName)
-				err = fmt.Errorf("error: unknown stateMachineName: %s", task.StateMachineName)
-				return err
-			}
-			for shardId := 0; shardId < nbrShards && err == nil; shardId++ {
-				serverArgs := []string{
-					"-peKey", peKey,
-					"-userEmail", task.UserEmail,
-					"-shardId", strconv.Itoa(shardId),
-				}
-				if ctx.UsingSshTunnel {
-					serverArgs = append(serverArgs, "-usingSshTunnel")
-				}
-
-				log.Printf("Run %s: %s", execName, serverArgs)
-				lable = "SERVER"
-				cmd = exec.Command(execName, serverArgs...)
-				cmd.Env = append(os.Environ(),
-					fmt.Sprintf("WORKSPACE=%s", workspaceName),
-					"JETSTORE_DEV_MODE=1", "USING_SSH_TUNNEL=1",
-				)
-				cmd.Stdout = &buf
-				cmd.Stderr = &buf
-				log.Printf("Executing %s with args '%v'", execName, serverArgs)
-				err = cmd.Run()
-				(*results)["log"] = buf.String()
-			}
 
 		case "run_cpipes_only", "run_cpipes_reports":
 			// State Machine input for new cpipesSM all-in-one
@@ -645,6 +629,8 @@ func (ctx *DataTableContext) runPipelineLocally(devModeCode string, task *Pendin
 				"-file_key", task.MainInputFileKey.String,
 				"-session_id", task.SessionId,
 			}
+			// Sanitize the arguments to prevent injection of options/flags
+			cpipesArgs = utils.SanitizeArgs(cpipesArgs)
 			log.Printf("Run local cpipes driver: %s", cpipesArgs)
 			lable = "CPIPES"
 			cmd = exec.Command("/usr/local/bin/local_test_driver", cpipesArgs...)
@@ -682,12 +668,13 @@ func (ctx *DataTableContext) runPipelineLocally(devModeCode string, task *Pendin
 		}
 	}
 
-	if devModeCode == "run_reports_only" || devModeCode == "run_server_reports" ||
-		devModeCode == "run_cpipes_reports" {
+	if devModeCode == "run_reports_only" || devModeCode == "run_cpipes_reports" {
 		// Call run_report synchronously
 		if ctx.UsingSshTunnel {
 			runReportsCommand = append(runReportsCommand, "-usingSshTunnel")
 		}
+		// Sanitize the arguments to prevent injection of options/flags
+		runReportsCommand = utils.SanitizeArgs(runReportsCommand)
 		cmd := exec.Command("/usr/local/bin/run_reports", runReportsCommand...)
 		cmd.Env = append(os.Environ(),
 			fmt.Sprintf("WORKSPACE=%s", workspaceName),
@@ -701,27 +688,27 @@ func (ctx *DataTableContext) runPipelineLocally(devModeCode string, task *Pendin
 		if err != nil {
 			log.Printf("while executing run_reports command '%v': %v", runReportsCommand, err)
 			log.Println("=*=*=*=*=*=*=*=*=*=*=*=*=*=*")
-			log.Println("SERVER & REPORTS CAPTURED OUTPUT BEGIN")
+			log.Println("CPIPES & REPORTS CAPTURED OUTPUT BEGIN")
 			log.Println("=*=*=*=*=*=*=*=*=*=*=*=*=*=*")
 			log.Println((*results)["log"])
 			log.Println("=*=*=*=*=*=*=*=*=*=*=*=*=*=*")
-			log.Println("SERVER & REPORTS CAPTURED OUTPUT END")
+			log.Println("CPIPES & REPORTS CAPTURED OUTPUT END")
 			log.Println("=*=*=*=*=*=*=*=*=*=*=*=*=*=*")
 			err = errors.New("error while running run_reports command")
 			ca.Status = "failed"
 			ca.FailureDetails = fmt.Sprintf("Error while running reports command in test mode: %s", (*results)["log"])
-			// Update server execution status table
+			// Update pipeline execution status table
 			ca.ValidateArguments()
 			ca.CoordinateWork()
 			return err
 		}
 	}
 	log.Println("============================")
-	log.Println("SERVER/CPIPES & REPORTS CAPTURED OUTPUT BEGIN")
+	log.Println("CPIPES & REPORTS CAPTURED OUTPUT BEGIN")
 	log.Println("============================")
 	log.Println((*results)["log"])
 	log.Println("============================")
-	log.Println("SERVER/CPIPES & REPORTS CAPTURED OUTPUT END")
+	log.Println("CPIPES & REPORTS CAPTURED OUTPUT END")
 	log.Println("============================")
 	// all good, update server execution status table
 	ca.ValidateArguments()
@@ -757,7 +744,7 @@ func (ctx *DataTableContext) startLoader(dataTableAction *DataTableAction, irow 
 	// Get the file info for the file to load from input_registry table
 	// originDomainKeys is needed to register the loaded file in input_registry table after the load
 	// is successful.
-	var inputRegistryKey sql.NullInt64
+	var sourcePeriodKey sql.NullInt64
 	var year, month, day int
 	var inputFormat string
 	var originDomainKeys []string
@@ -772,7 +759,7 @@ func (ctx *DataTableContext) startLoader(dataTableAction *DataTableAction, irow 
 			AND sp.key = ir.source_period_key
 			AND ir.table_name = sc.table_name`
 	err = ctx.Dbpool.QueryRow(context.Background(), stmt, fileKey, inputRegistrySessionId).Scan(
-		&inputRegistryKey, &year, &month, &day, &inputFormat, &originDomainKeys, &originSchemaProviderJson,
+		&sourcePeriodKey, &year, &month, &day, &inputFormat, &originDomainKeys, &originSchemaProviderJson,
 		&icJson, &icPosCsv, &inputFormatDataJson, &scSchemaProviderJson)
 	if err != nil {
 		log.Printf("While getting file info for file_key '%s' and session_id '%s': %v", fileKey, inputRegistrySessionId, err)
@@ -781,7 +768,7 @@ func (ctx *DataTableContext) startLoader(dataTableAction *DataTableAction, irow 
 		return
 	}
 
-	if !inputRegistryKey.Valid {
+	if !sourcePeriodKey.Valid {
 		log.Printf("error: got nil key from input_registry key for file_key '%s' and session_id '%s'", fileKey, inputRegistrySessionId)
 		httpStatus = http.StatusInternalServerError
 		err = errors.New("error while reading from input_registry table")
@@ -797,32 +784,34 @@ func (ctx *DataTableContext) startLoader(dataTableAction *DataTableAction, irow 
 		"${TABLE_NAME}":             tableName,
 		"$ORIGIN_SESSIONID":         originSessionId,
 		"$ORIGIN_DOMAIN_KEYS":       originDomainKeys,
-		"$ORIGIN_SOURCE_PERIOD_KEY": int(inputRegistryKey.Int64),
+		"$ORIGIN_SOURCE_PERIOD_KEY": int(sourcePeriodKey.Int64),
 		"$INPUT_LOADER_STATUS_KEY":  inputLoaderStatusKey,
 		"${STAGING_TABLE_NAME}":     tableName,
 	}
-	schemaInfo := map[string]any{
-		"key":                        "_main_input_",
-		"type":                       "default",
-		"source_type":                "main_input",
-		"client":                     "Any",
-		"object_type":                "Any",
-		"use_origin_source_config":   true,
-		"file_key":                   fileKey,
-		"format":                     inputFormat,
-		"detect_encoding":            true,
-		"detect_cr_as_eol":           true,
-		"compression":                "none",
-		"use_lazy_quotes":            false,
-		"use_lazy_quotes_special":    true,
-		"variable_fields_per_record": true,
-		"multi_columns_input":        true,
-		"enforce_row_max_length":     false,
-		"enforce_row_min_length":     false,
-		"trim_columns":               true,
-		"is_part_files":              false,
-		"file_date":                  fmt.Sprintf("%04d-%02d-%02d", year, month, day),
-		"env":                        cpipesEnv,
+	schemaInfo := &compute_pipes.SchemaProviderSpec{
+		Key:                   "_main_input_",
+		Type:                  "default",
+		SourceType:            "main_input",
+		Client:                "Any",
+		ObjectType:            "Any",
+		UseOriginSourceConfig: true,
+		FileConfig: compute_pipes.FileConfig{
+			FileKey:                 fileKey.(string),
+			Format:                  inputFormat,
+			DetectEncoding:          true,
+			DetectCrAsEol:           true,
+			Compression:             "none",
+			UseLazyQuotes:           false,
+			UseLazyQuotesSpecial:    true,
+			VariableFieldsPerRecord: true,
+			MultiColumnsInput:       true,
+			EnforceRowMaxLength:     false,
+			EnforceRowMinLength:     false,
+			TrimColumns:             true,
+			IsPartFiles:             false,
+		},
+		FileDate: fmt.Sprintf("%04d-%02d-%02d", year, month, day),
+		Env:      cpipesEnv,
 	}
 	if icJson.Valid {
 		// Convert the icJson string to []string
@@ -835,90 +824,41 @@ func (ctx *DataTableContext) startLoader(dataTableAction *DataTableAction, irow 
 			err = errors.New("error while preparing to start Jet_Loader pipeline")
 			return
 		}
-		schemaInfo["headers"] = ic
+		schemaInfo.Headers = ic
 	}
 	if icPosCsv.Valid {
-		schemaInfo["fixed_width_columns_csv"] = icPosCsv.String
+		schemaInfo.FixedWidthColumnsCsv = icPosCsv.String
 	}
 	if inputFormatDataJson.Valid {
-		schemaInfo["input_format_data_json"] = inputFormatDataJson.String
+		schemaInfo.InputFormatDataJson = inputFormatDataJson.String
 	}
 
-	// Get file infor from source_config.schema_provider_json if available, it will be overridden by the one in
+	// Get file info from source_config.schema_provider_json if available, it will be overridden by the one in
 	// input_registry.schema_provider_json if both are available, since input_registry is closer to the file
 	// source and more likely to be updated with correct info.
-	// Columns of interest
-	keyColumns := []string{
-		"bucket",
-		"compression",
-		"delimiter",
-		"detect_cr_as_eol",
-		"detect_encoding",
-		"domain_class",
-		"domain_keys",
-		"encoding",
-		"enforce_row_max_length",
-		"enforce_row_min_length",
-		"eol_byte",
-		"file_key",
-		"file_name",
-		"fixed_width_columns_csv",
-		"format",
-		"input_format_data_json",
-		"is_part_files",
-		"main_input_row_count",
-		"multi_columns_input",
-		"nbr_rows_in_record",
-		"no_quotes",
-		"quote_all_records",
-		"read_date_layout",
-		"trim_columns",
-		"use_lazy_quotes",
-		"use_lazy_quotes_special",
-		"variable_fields_per_record",
-	}
-	// Copy infor from scource_config schema provider
+	// Copy info from source_config schema provider
 	if scSchemaProviderJson.Valid && len(scSchemaProviderJson.String) > 0 {
 		// Unmarshal the schema_provider_json in source_config to get loading information
-		var scSchemaProvider map[string]any
-		err = json.Unmarshal([]byte(scSchemaProviderJson.String), &scSchemaProvider)
+		err = json.Unmarshal([]byte(scSchemaProviderJson.String), schemaInfo)
 		if err != nil {
 			log.Printf("While unmarshalling source_config schema_provider_json: %v", err)
 			httpStatus = http.StatusInternalServerError
 			err = errors.New("error while preparing to start Jet_Loader pipeline")
 			return
 		}
-		// Copy over information needed to loading the file, set defaults for the rest if not exist, will be overridden by input_registry.schema_provider_json if exist
-		var v any
-		var ok bool
-		for _, k := range keyColumns {
-			if v, ok = scSchemaProvider[k]; ok {
-				schemaInfo[k] = v
-			}
-		}
 	}
-	// Copy infor from input_registry schema provider
+	// Copy info from input_registry schema provider
 	if len(originSchemaProviderJson) > 0 {
 		// Put the origin schema_provider_json into the cpipesEnv since we need it to register the loaded file
-		//*TODO compress and encode base64 if too big?
 		cpipesEnv["$ORIGIN_SCHEMA_PROVIDER_JSON"] = originSchemaProviderJson
 
-		// Unmarshal the origin schema_provider_json to get loading information
-		var originSchemaProvider map[string]any
-		err = json.Unmarshal([]byte(originSchemaProviderJson), &originSchemaProvider)
+		// Unmarshal the origin schema_provider_json to get information for the loader pipeline
+		err = json.Unmarshal([]byte(originSchemaProviderJson), schemaInfo)
 		if err != nil {
 			log.Printf("While unmarshalling origin schema_provider_json: %v", err)
 			httpStatus = http.StatusInternalServerError
 			err = errors.New("error while preparing to start Jet_Loader pipeline")
 			return
-		}
-		// Copy over information needed to loading the file, overrides defaults set above
-		var v any
-		var ok bool
-		for _, k := range keyColumns {
-			if v, ok = originSchemaProvider[k]; ok {
-				schemaInfo[k] = v
-			}
 		}
 	}
 
@@ -940,11 +880,25 @@ func (ctx *DataTableContext) startLoader(dataTableAction *DataTableAction, irow 
 }
 
 // API version to register schema event. This is used by the Jets_Loader process to avoid writing the event to s3 first.
-func (ctx *DataTableContext) RegisterSchemaEvent(dbpool *pgxpool.Pool, schemaInfo map[string]any, token string) error {
-	log.Printf("Registering schema event with schema info: %v", schemaInfo)
-	schemaInfoJson, err := json.Marshal(schemaInfo)
+// This is also used by the register key v2 lambda once the event is downloaded from s3.
+func (ctx *DataTableContext) RegisterSchemaEvent(dbpool *pgxpool.Pool, schemaEvent *compute_pipes.SchemaProviderSpec, token string) error {
+
+	// Check if this is a pipeline_coordinator schema event
+	if schemaEvent.Type == "pipeline_coordinator_map" {
+		return ctx.ProcessCoordinatorMapRegisterSchemaEvent(dbpool, schemaEvent, token)
+	}
+
+	b, err := json.Marshal(schemaEvent)
 	if err != nil {
 		return fmt.Errorf("while marshalling schema info to json in RegisterSchemaEvent: %v", err)
+	}
+
+	schemaInfoJson := string(b)
+	log.Printf("Registering schema event with schema info: %v", schemaInfoJson)
+	var schemaInfo map[string]any
+	err = json.Unmarshal(b, &schemaInfo)
+	if err != nil {
+		return fmt.Errorf("while unmarshalling schema info in RegisterSchemaEvent: %v", err)
 	}
 
 	// Prepare the register key request
@@ -968,7 +922,17 @@ func (ctx *DataTableContext) RegisterSchemaEvent(dbpool *pgxpool.Pool, schemaInf
 	schemaInfo["year"] = year
 	schemaInfo["month"] = month
 	schemaInfo["day"] = day
-	schemaInfo["schema_provider_json"] = string(schemaInfoJson)
+	schemaInfo["schema_provider_json"] = schemaInfoJson
+
+	// Check if the schema event has no request_id but has one in the env var section,
+	// if so put it in the register key event so it gets put on the input_registry table for tracking the pipeline execution.
+	if _, ok := schemaInfo["request_id"]; !ok {
+		if env, ok := schemaInfo["env"].(map[string]any); ok {
+			if reqId, ok := env["${REQUEST_ID}"].(string); ok && len(reqId) > 0 {
+				schemaInfo["request_id"] = reqId
+			}
+		}
+	}
 
 	registerFileKeyAction := RegisterFileKeyAction{
 		Action:        "register_keys",
@@ -977,4 +941,74 @@ func (ctx *DataTableContext) RegisterSchemaEvent(dbpool *pgxpool.Pool, schemaInf
 	}
 	_, _, err = ctx.RegisterFileKeys(&registerFileKeyAction, token)
 	return err
+}
+
+// NewPipelineCoordinatorMapSchemaInfo creates the schema info for a pipeline coordinator map register schema event,
+// which contains the coordinated pipes map and the post map event.
+// coordinatedPipesMap is a list of schema_event_json
+// postMapEvent is the schema event for the post map event, which will be called after all steps in the coordinated pipes map are executed.
+// Returns the schema info for the pipeline coordinator map register schema event of type pipeline_coordinator_map, which can be passed to RegisterSchemaEvent.
+func NewPipelineCoordinatorMapSchemaInfo(requestId string, coordinatedPipesJsonMap []*compute_pipes.SchemaProviderSpec,
+	postMapEvent *compute_pipes.SchemaProviderSpec) (*compute_pipes.SchemaProviderSpec, error) {
+	schemaInfo := &compute_pipes.SchemaProviderSpec{
+		Type:                "pipeline_coordinator_map",
+		CoordinatedPipesMap: coordinatedPipesJsonMap,
+		PostMapEvent:        postMapEvent,
+		RequestID:           requestId,
+	}
+	log.Printf("NewPipelineCoordinatorMapSchemaInfo called with RequestId=%s\n", requestId)
+	return schemaInfo, nil
+}
+
+// ProcessCoordinatorMapRegisterSchemaEvent processes a pipeline coordinator map register schema event.
+// Input schemaInfo is of Type "pipeline_coordinator_map" and contains the coordinated pipes map and the post map event:
+//   - CoordinatedPipesMap: list of schema_event_json
+//   - PostMapEvent: serialized SchemaProviderSpec
+//   - RequestID: optional, if not exist, will be created and added to schemaInfo for tracking the pipeline execution
+//
+// This is called by RegisterSchemaEvent when the schema event is of type "pipeline_coordinator_map".
+// and RegisterSchemaEvent is called for each step in the coordinated pipes map.
+func (ctx *DataTableContext) ProcessCoordinatorMapRegisterSchemaEvent(dbpool *pgxpool.Pool,
+	schemaInfo *compute_pipes.SchemaProviderSpec, token string) error {
+
+	// Setup a Process Coordinator pipeline
+	log.Printf("Processing pipeline coordinator map register schema event with schema info: %v", schemaInfo)
+
+	coordinatedPipesMap := schemaInfo.CoordinatedPipesMap
+	if len(coordinatedPipesMap) == 0 {
+		return fmt.Errorf("coordinated_pipes_json_map is missing or not a list of schemaInfo")
+	}
+	var postMapEventJson string
+	if schemaInfo.PostMapEvent != nil {
+		postMapEventJsonBytes, err := json.Marshal(schemaInfo.PostMapEvent)
+		if err != nil {
+			return fmt.Errorf("while marshalling post map event schema: %v", err)
+		}
+		postMapEventJson = string(postMapEventJsonBytes)
+	}
+	// Insert into table jetsapi.pipeline_coordinator_map
+	// Check if schemaInfo already contains a "request_id", if not create one.
+	requestId := schemaInfo.RequestID
+	if requestId == "" {
+		//TODO set request_id in schema providers and env var accordingly
+		// Set to schema providers & env var of the map, and to env var (only) to post map event.
+		// requestId = uuid.New().String()
+		// schemaInfo["request_id"] = requestId
+		return fmt.Errorf("request_id is missing in schemaInfo, it must be provided for pipeline coordinator map register schema event")
+	}
+	stmt := `INSERT INTO jetsapi.pipeline_coordinator_map (request_id, status, nbr_tasks, schema_provider_json) VALUES ($1, 'in_progress', $2, $3)`
+	_, err := dbpool.Exec(context.Background(), stmt, requestId, len(coordinatedPipesMap), postMapEventJson)
+	if err != nil {
+		return fmt.Errorf("while inserting into pipeline_coordinator_map: %v", err)
+	}
+
+	// For each step in coordinatedPipesMap, unmarshal the schema_event_json and call RegisterSchemaEvent
+	for _, step := range coordinatedPipesMap {
+		err = ctx.RegisterSchemaEvent(dbpool, step, token)
+		if err != nil {
+			return fmt.Errorf("while registering schema event in ProcessCoordinatorMapRegisterSchemaEvent: %v", err)
+		}
+	}
+
+	return nil
 }

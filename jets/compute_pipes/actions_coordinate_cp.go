@@ -8,7 +8,7 @@ import (
 	"regexp"
 
 	"github.com/artisoft-io/jetstore/jets/workspace"
-	"github.com/jackc/pgx/v4/pgxpool"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // Compute Pipes Actions
@@ -77,7 +77,7 @@ func (args *ComputePipesNodeArgs) CoordinateComputePipes(ctx context.Context, db
 	}
 	if mainSchemaProviderConfig == nil {
 		// Did not find the main_input schema provider
-		cpErr = fmt.Errorf("error: bug in CoordinateComputePipes, could not find the main_input schema provider")
+		cpErr = fmt.Errorf("unexpected error in CoordinateComputePipes: could not find the main_input schema provider")
 		goto gotError
 	}
 	envSettings = mainSchemaProviderConfig.Env
@@ -149,7 +149,14 @@ func (args *ComputePipesNodeArgs) CoordinateComputePipes(ctx context.Context, db
 		goto gotError
 	}
 	if cpConfig.CommonRuntimeArgs.CpipesMode == "sharding" {
-		externalBucket = mainSchemaProviderConfig.Bucket
+		switch {
+		case len(inputChannelConfig.Bucket) > 0 && inputChannelConfig.Bucket != "jetstore_bucket":
+			externalBucket = inputChannelConfig.Bucket
+		case inputChannelConfig.Bucket == "jetstore_bucket":
+			externalBucket = ""
+		default:
+			externalBucket = mainSchemaProviderConfig.Bucket
+		}
 	}
 
 	cpContext = &ComputePipesContext{

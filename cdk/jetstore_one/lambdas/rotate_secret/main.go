@@ -11,8 +11,9 @@ import (
 
 	"github.com/artisoft-io/jetstore/jets/awsi"
 	"github.com/artisoft-io/jetstore/jets/user"
+	"github.com/artisoft-io/jetstore/jets/utils"
 	"github.com/aws/aws-lambda-go/lambda"
-	"github.com/jackc/pgx/v4/pgxpool"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // Env variable:
@@ -440,7 +441,7 @@ func OpenCurrentDbConn() (*pgxpool.Pool, error) {
 		log.Println(err)
 		return nil, err
 	}
-	dbpool, err := pgxpool.Connect(context.Background(), dsn)
+	dbpool, err := pgxpool.New(context.Background(), dsn)
 	if err != nil {
 		err = fmt.Errorf("error: failed to connect to database using current dsn: %v", err)
 		log.Println(err)
@@ -455,9 +456,10 @@ func OpenDbConn(dnsJson string) (*pgxpool.Pool, error) {
 	if err != nil {
 		return nil, fmt.Errorf("while getting dns from json: %v", err)
 	}
-	return pgxpool.Connect(context.Background(), dns)
+	return pgxpool.New(context.Background(), dns)
 }
 
 func main() {
+	utils.UseJetStoreLogger()
 	lambda.Start(handler)
 }

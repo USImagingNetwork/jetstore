@@ -5,15 +5,19 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/artisoft-io/jetstore/jets/jetrules/rete"
+	"github.com/artisoft-io/jetstore/jets/utils"
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v4/pgxpool"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // Utility functions for jetrules transformation pipes operator
@@ -22,10 +26,10 @@ var workspaceControl *rete.WorkspaceControl
 var workspaceControlMx sync.Mutex
 
 // ruleEngineCache is a map mainRuleName -> *ReteMetaStoreFactory
-var ruleEngineCache *sync.Map = new(sync.Map)
+// var ruleEngineCache *sync.Map = new(sync.Map) // not used
 var inputMappingCache *sync.Map = new(sync.Map)
 
-var dataPropertyInfoMap map[string]*rete.DataPropertyNode
+var dataPropertyInfoMap map[string]*rete.PropertyNode
 var dataPropertyInfoMx sync.Mutex
 
 var domainTablesMap map[string]*rete.TableNode
@@ -48,7 +52,7 @@ func init() {
 // Note: This must be called before starting goroutines as it is not thread safe.
 func ClearJetrulesCaches() {
 	workspaceControl = nil
-	ruleEngineCache = new(sync.Map)
+	// ruleEngineCache = new(sync.Map)
 	inputMappingCache = new(sync.Map)
 	dataPropertyInfoMap = nil
 	domainTablesMap = nil
@@ -112,26 +116,8 @@ func AssertSourcePeriodInfo(re JetRuleEngine, config *JetrulesSpec, env map[stri
 	rm := re.GetMetaResourceManager()
 	jr := re.JetResources()
 	// ${PERIOD_ID_TYPE}
-	var pt string
 	if config.CurrentSourcePeriod == 0 || config.CurrentSourcePeriodType == "" {
-		pt, _ = env["${PERIOD_ID_TYPE}"].(string)
-		switch pt {
-		case "${MONTH_PERIOD}", "month_period":
-			config.CurrentSourcePeriodType = "month_period"
-		case "${DAY_PERIOD}", "day_period":
-			config.CurrentSourcePeriodType = "day_period"
-		case "${HOUR_PERIOD}", "hour_period":
-			config.CurrentSourcePeriodType = "hour_period"
-		}
-
-		switch vv := env[pt].(type) {
-		case int:
-			config.CurrentSourcePeriod = vv
-		case float64:
-			config.CurrentSourcePeriod = int(vv)
-		case string:
-			config.CurrentSourcePeriod, _ = strconv.Atoi(vv)
-		}
+		config.CurrentSourcePeriod, config.CurrentSourcePeriodType = GetCurrentSourcePeriod(env)
 	}
 	err = re.Insert(jr.Jets__istate, jr.Jets__currentSourcePeriod, rm.NewIntLiteral(config.CurrentSourcePeriod))
 	if err != nil {
@@ -220,7 +206,7 @@ func ExtractRdfNodeInfoJson(e any) (value, rdfType string, err error) {
 		rdfType = "text"
 		return
 	case map[string]any:
-		// fmt.Println("*** Domain Key is a struct of composite keys", value)
+		// log.Println("*** Domain Key is a struct of composite keys", value)
 		for k, v := range obj {
 			switch vv := v.(type) {
 			case string:
@@ -245,39 +231,80 @@ func ExtractRdfNodeInfoJson(e any) (value, rdfType string, err error) {
 	}
 }
 
-// Function to get the JetRuleEngine for a rule process
-func GetJetRuleEngine(reFactory JetRulesFactory, dbpool *pgxpool.Pool, processName string, isDebug bool) (
-	ruleEngine JetRuleEngine, err error) {
-
-	// Get the Rete MetaStore for the mainRules
-	reHdle, _ := ruleEngineCache.Load(processName)
-	if reHdle == nil {
-		// Get the jetrule process info -- the mainRule name or ruleSequence name
-		var mainRules string
-		stmt := `SELECT	pc.main_rules FROM jetsapi.process_config pc WHERE pc.process_name = $1`
-		err := dbpool.QueryRow(context.Background(), stmt, processName).Scan(&mainRules)
-		if err != nil {
-			return nil,
-				fmt.Errorf("quering main rule file name for process %s from jetsapi.process_config failed: %v",
-					processName, err)
+func ComputeRowHash(row []any, sourcePeriod int) string {
+	// Compute a hash for the row, to be used as jets:key when it's not provided in the input data
+	// The hash is computed on the concatenation of the string representation of the values in the row and the source period, to avoid having the same hash for the same row in different source periods
+	hasher := fnv.New64a()
+	// Add sourcePeriod in row_hash calculation so if same record in input
+	// for 2 different period, they get different jets:key
+	hasher.Write([]byte(strconv.Itoa(sourcePeriod)))
+	for _, v := range row {
+		if v == nil {
+			continue
 		}
-		if len(mainRules) == 0 {
-			return nil, fmt.Errorf("error: main rule file name is empty for process %s", processName)
+		switch vv := v.(type) {
+		case string:
+			hasher.Write([]byte(vv))
+		case int:
+			hasher.Write([]byte(strconv.Itoa(vv)))
+		case float64:
+			hasher.Write([]byte(strconv.FormatFloat(vv, 'f', -1, 64)))
+		case uint:
+			hasher.Write([]byte(strconv.FormatUint(uint64(vv), 10)))
+		case time.Time:
+			if vv.Hour() == 0 && vv.Minute() == 0 && vv.Second() == 0 {
+				// Date, format as 2006-01-02
+				hasher.Write([]byte(vv.Format("2006-01-02")))
+			} else {
+				// Datetime, format as 2006-01-02T15:04:05
+				hasher.Write([]byte(vv.Format("2006-01-02T15:04:05")))
+			}
+		case int64:
+			hasher.Write([]byte(strconv.FormatInt(vv, 10)))
+		case uint64:
+			hasher.Write([]byte(strconv.FormatUint(vv, 10)))
+		case int32:
+			hasher.Write([]byte(strconv.FormatInt(int64(vv), 10)))
+		case uint32:
+			hasher.Write([]byte(strconv.FormatUint(uint64(vv), 10)))
+		case float32:
+			hasher.Write([]byte(strconv.FormatFloat(float64(vv), 'f', -1, 32)))
+		default:
+			hasher.Write([]byte(fmt.Sprintf("%v", vv)))
 		}
-		log.Printf("Rule engine for ruleset '%s' for process '%s' not loaded, loading from local workspace",
-			mainRules, processName)
-		ruleEngine, err = reFactory.NewJetRuleEngine(dbpool, mainRules, isDebug)
-		if err != nil {
-			return nil,
-				fmt.Errorf("while loading ruleset '%s' for process '%s' from local workspace via NewJetRuleEngine: %v",
-					mainRules, processName, err)
-		}
-		//*** concurrent read/write og resourceMap issue
-		// ruleEngineCache.Store(processName, ruleEngine)
-	} else {
-		ruleEngine = reHdle.(JetRuleEngine)
 	}
-	return
+	return fmt.Sprintf("%016x", hasher.Sum64())
+}
+
+// GetCurrentSourcePeriod returns the current source period and its type from the environment map
+// Expecting the following keys in the env map:
+// - ${PERIOD_ID_TYPE} : the type of the period, e.g. "month_period", "day_period", "hour_period"
+// - ${MONTH_PERIOD} or ${DAY_PERIOD} or ${HOUR_PERIOD} : the current source period value, depending on the type
+func GetCurrentSourcePeriod(env map[string]any) (int, string) {
+	currentSourcePeriod := 0
+	sourcePeriodType := ""
+	pt, ok := env["${PERIOD_ID_TYPE}"].(string)
+	if !ok {
+		return currentSourcePeriod, sourcePeriodType
+	}
+	switch pt {
+	case "${MONTH_PERIOD}", "month_period":
+		sourcePeriodType = "month_period"
+	case "${DAY_PERIOD}", "day_period":
+		sourcePeriodType = "day_period"
+	case "${HOUR_PERIOD}", "hour_period":
+		sourcePeriodType = "hour_period"
+	}
+
+	switch vv := env[pt].(type) {
+	case int:
+		currentSourcePeriod = vv
+	case float64:
+		currentSourcePeriod = int(vv)
+	case string:
+		currentSourcePeriod, _ = strconv.Atoi(vv)
+	}
+	return currentSourcePeriod, sourcePeriodType
 }
 
 type RuleEngineConfig struct {
@@ -287,6 +314,7 @@ type RuleEngineConfig struct {
 
 // Function to get domain classes info from the local workspace
 func loadRuleEngineConfig(mainRuleFile string) (map[string]string, error) {
+	var err error
 	ruleConfig := &RuleEngineConfig{}
 	ruleEngineConfigMx.Lock()
 	defer ruleEngineConfigMx.Unlock()
@@ -294,9 +322,16 @@ func loadRuleEngineConfig(mainRuleFile string) (map[string]string, error) {
 	if ok {
 		return config, nil
 	}
-	fpath := fmt.Sprintf("%s/%s/build/%s.config.json", workspaceHome, wsPrefix, strings.TrimSuffix(mainRuleFile, ".jr"))
-	log.Println("Reading Rule Engine config definitions from:", fpath)
-	file, err := os.ReadFile(fpath)
+	fileName := strings.TrimSuffix(mainRuleFile, ".jr")+".config.json"
+	basePath := filepath.Join(WorkspaceHome(), WorkspacePrefix())
+	filePath := filepath.Join("build", fileName)
+	filePath, err = utils.ConfineFilePath(basePath, filePath)
+	if err != nil {
+		return nil, fmt.Errorf("while confining file path for %s: %v", filePath, err)
+	}
+
+	log.Println("Reading Rule Engine config definitions from:", fileName)
+	file, err := os.ReadFile(filePath)
 	if err != nil {
 		err = fmt.Errorf("while reading config.json file (GetRuleEngineConfig):%v", err)
 		log.Println(err)
@@ -331,7 +366,7 @@ func GetWorkspaceDomainClasses() (map[string]*rete.ClassNode, error) {
 		domainClassesMx.Lock()
 		defer domainClassesMx.Unlock()
 		if domainClassesMap == nil {
-			fmt.Println("Load Domain Tables from local Workspace")
+			log.Println("Load Domain Tables from local Workspace")
 			domainClassesMap = make(map[string]*rete.ClassNode)
 			fpath := fmt.Sprintf("%s/%s/build/classes.json", workspaceHome, wsPrefix)
 			log.Println("Reading Domain Classes definitions from:", fpath)
@@ -380,13 +415,13 @@ func GetWorkspaceDomainTables() (map[string]*rete.TableNode, error) {
 }
 
 // Function to get the domain properties info from the local workspace
-func GetWorkspaceDataProperties() (map[string]*rete.DataPropertyNode, error) {
+func GetWorkspaceDataProperties() (map[string]*rete.PropertyNode, error) {
 	if dataPropertyInfoMap == nil {
 		dataPropertyInfoMx.Lock()
 		defer dataPropertyInfoMx.Unlock()
 		if dataPropertyInfoMap == nil {
 			// log.Println("*** Load Data Properties from local Workspace")
-			dataPropertyInfoMap = make(map[string]*rete.DataPropertyNode)
+			dataPropertyInfoMap = make(map[string]*rete.PropertyNode)
 			fpath := fmt.Sprintf("%s/%s/build/properties.json", workspaceHome, wsPrefix)
 			// log.Println("Reading Data Properties definitions from:", fpath)
 			file, err := os.ReadFile(fpath)
@@ -407,7 +442,7 @@ func GetWorkspaceDataProperties() (map[string]*rete.DataPropertyNode, error) {
 	return dataPropertyInfoMap, nil
 }
 
-func GetMultiValueProperties(className string) ([]string, error) {
+func GetMultiValueDataProperties(className string) ([]string, error) {
 	cache, err := GetWorkspaceDomainTables()
 	if err != nil {
 		return nil, fmt.Errorf("while getting domain tables from local workspace: %v", err)
@@ -419,12 +454,32 @@ func GetMultiValueProperties(className string) ([]string, error) {
 	multiValueProperties := make([]string, 0)
 	for i := range tableInfo.Columns {
 		p := tableInfo.Columns[i]
-		if p.AsArray {
+		if p.AsArray && !p.IsObject {
 			multiValueProperties = append(multiValueProperties, p.ColumnName)
 		}
 	}
 	// log.Printf("*** Multi-value properties for class %s: %v", className, multiValueProperties)
 	return multiValueProperties, nil
+}
+
+func GetObjectProperties(className string) ([]string, error) {
+	cache, err := GetWorkspaceDomainTables()
+	if err != nil {
+		return nil, fmt.Errorf("while getting domain tables from local workspace: %v", err)
+	}
+	tableInfo := cache[className]
+	if tableInfo == nil {
+		return nil, fmt.Errorf("error: domain table for class %s is not found in the local workspace, cache contains %d entries", className, len(cache))
+	}
+	objectProperties := make([]string, 0)
+	for i := range tableInfo.Columns {
+		p := tableInfo.Columns[i]
+		if p.IsObject {
+			objectProperties = append(objectProperties, p.ColumnName)
+		}
+	}
+	// log.Printf("*** Object properties for class %s: %v", className, objectProperties)
+	return objectProperties, nil
 }
 
 func GetDataPropertyRdfType(className string) (map[string]string, error) {

@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/artisoft-io/jetstore/jets/utils"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
@@ -25,7 +26,7 @@ var bigChunk int64 = 100 * 1024 * 1024  // multi part: part size of 100 MB for f
 func buildCopySourceRange(start, partSize, objectSize int64) (bool, string) {
 	end := start + partSize - 1
 	isLastPart := false
-	if end >= objectSize || objectSize - end < partSize {
+	if end >= objectSize || objectSize-end < partSize {
 		end = objectSize - 1
 		isLastPart = true
 	}
@@ -38,11 +39,31 @@ func MultiPartCopy(ctx context.Context, svc *s3.Client, maxPoolSize int,
 	if maxPoolSize == 0 {
 		maxPoolSize = 20
 	}
-	if len(srcBucket) == 0 {
+	if len(destKey) == 0 {
+		err := fmt.Errorf("MultiPartCopy: destination key is empty")
+		return err
+	}
+	if len(srcKey) == 0 {
+		err := fmt.Errorf("MultiPartCopy: source key is empty")
+		return err
+	}
+	if len(srcBucket) == 0 || srcBucket == "jetstore_bucket" {
 		srcBucket = JetStoreBucket()
 	}
-	if len(destBucket) == 0 {
+	if len(destBucket) == 0 || destBucket == "jetstore_bucket" {
 		destBucket = JetStoreBucket()
+	}
+
+	// Sanitize the externally-controlled object keys to mitigate external control
+	// of file name or path (CWE-73) before using them as S3 object paths.
+	var err error
+	srcKey, err = utils.SanitizeS3Prefix(srcKey)
+	if err != nil {
+		return fmt.Errorf("MultiPartCopy: invalid source key: %v", err)
+	}
+	destKey, err = utils.SanitizeS3Prefix(destKey)
+	if err != nil {
+		return fmt.Errorf("MultiPartCopy: invalid destination key: %v", err)
 	}
 
 	// Get the list of obj and their size
@@ -62,9 +83,10 @@ func MultiPartCopy(ctx context.Context, svc *s3.Client, maxPoolSize int,
 	}
 
 	if totalFileSize < fileSizeCutoff && len(s3Objects) == 1 {
-		// Do the copy in one shot
+		// Do the copy in one shot - note s3Objects is coming from s3 so it's safe to use
 		copySource := url.QueryEscape(fmt.Sprintf("%s/%s", srcBucket, s3Objects[0].Key))
-		log.Printf("Copying using single part for file %s of size %d", copySource, totalFileSize)
+		log.Printf("Copying using single part for file %s/%s to %s/%s of size %d", srcBucket,
+			s3Objects[0].Key, destBucket, destKey, totalFileSize)
 		copyInput := &s3.CopyObjectInput{
 			CopySource: &copySource,
 			Bucket:     &destBucket,

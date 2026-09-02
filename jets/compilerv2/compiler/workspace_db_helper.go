@@ -6,14 +6,33 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/artisoft-io/jetstore/jets/jetrules/rete"
 )
 
+// sqlIdentifierRe matches safe, unqualified SQL identifiers (table or column names).
+// SQL identifiers cannot be passed as bind parameters, so any identifier that is
+// interpolated into a statement must be validated against this allowlist to prevent
+// SQL injection (CWE-89).
+var sqlIdentifierRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// validateSQLIdentifier returns an error if name is not a safe SQL identifier.
+func validateSQLIdentifier(kind, name string) error {
+	if !sqlIdentifierRe.MatchString(name) {
+		return fmt.Errorf("invalid %s identifier %q", kind, name)
+	}
+	return nil
+}
+
 // Function to get max key from table
 func getMaxKey(ctx context.Context, db *sql.DB, tableName string) (int, error) {
+	if err := validateSQLIdentifier("table", tableName); err != nil {
+		return 0, err
+	}
 	var maxKey sql.NullInt64
+	// #nosec G201 -- tableName is validated against sqlIdentifierRe by validateSQLIdentifier above.
 	query := fmt.Sprintf("SELECT MAX(key) FROM %s", tableName)
 	err := db.QueryRowContext(ctx, query).Scan(&maxKey)
 	if err != nil && !strings.Contains(err.Error(), "converting NULL to int is unsupported") {
@@ -27,7 +46,14 @@ func getMaxKey(ctx context.Context, db *sql.DB, tableName string) (int, error) {
 
 // Function to get key from table based on column name and value
 func getKeyByColumn(ctx context.Context, db *sql.DB, tableName, columnName string, columnValue any) (int, error) {
+	if err := validateSQLIdentifier("table", tableName); err != nil {
+		return 0, err
+	}
+	if err := validateSQLIdentifier("column", columnName); err != nil {
+		return 0, err
+	}
 	var key sql.NullInt64
+	// #nosec G201 -- tableName and columnName are validated against sqlIdentifierRe by validateSQLIdentifier above.
 	query := fmt.Sprintf("SELECT key FROM %s WHERE %s = ?", tableName, columnName)
 	err := db.QueryRowContext(ctx, query, columnValue).Scan(&key)
 	if err != nil && !strings.Contains(err.Error(), "converting NULL to int is unsupported") && err != sql.ErrNoRows {
@@ -110,9 +136,6 @@ func (w *WorkspaceDB) SaveJetRules(ctx context.Context, db *sql.DB, jetRuleModel
 	rulePropsData := make([][]any, 0)
 	ruleTermsData := make([][]any, 0)
 	for _, jetRule := range jetRuleModel.Jetrules {
-		if w.sourceMgr.IsPreExisting(jetRule.SourceFileName) {
-			continue
-		}
 
 		// JetRule
 		maxKey++
@@ -516,14 +539,26 @@ func (w *WorkspaceDB) SaveClassesAndTables(ctx context.Context, db *sql.DB, jetR
 		return err
 	}
 
+	// Load existing object properties since they are reference by Domain Tables
+	objectProperties2Key, err := getKeyNameFromTable(ctx, db, "object_properties", "key", "name")
+	if err != nil {
+		return err
+	}
+	maxObjectPropKey, err := getMaxKey(ctx, db, "object_properties")
+	if err != nil {
+		return err
+	}
+
 	// The insert stmts
 	classStmt := "INSERT INTO domain_classes (key, name, as_table, source_file_key) VALUES (?, ?, ?, ?)"
 	dataPropertiesStmt := "INSERT INTO data_properties (key, domain_class_key, name, type, as_array) VALUES (?, ?, ?, ?, ?)"
+	objectPropertiesStmt := "INSERT INTO object_properties (key, domain_class_key, name, type, as_array) VALUES (?, ?, ?, ?, ?)"
 	baseClassStmt := "INSERT INTO base_classes (domain_class_key, base_class_key) VALUES (?, ?)"
 
 	// Insert the new classes, it's data properties and base classes
 	classData := make([][]any, 0, len(jetRuleModel.Classes))
 	dataPropertiesData := make([][]any, 0)
+	objectPropertiesData := make([][]any, 0)
 	baseClassData := make([][]any, 0, 2*len(jetRuleModel.Classes))
 
 	// Initialize classData with owl:Thing if className2Key is empty (no classes entered yet in db)
@@ -553,6 +588,18 @@ func (w *WorkspaceDB) SaveClassesAndTables(ctx context.Context, db *sql.DB, jetR
 					dp.AsArray,
 				})
 			}
+			// It's object properties
+			for _, op := range class.ObjectProperties {
+				maxObjectPropKey++
+				objectProperties2Key[op.Name] = maxObjectPropKey
+				objectPropertiesData = append(objectPropertiesData, []any{
+					maxObjectPropKey,
+					maxClassKey,
+					op.Name,
+					op.Type,
+					op.AsArray,
+				})
+			}
 			// Insert it's base classes
 			for _, baseClass := range class.BaseClasses {
 				baseClsKey, ok := className2Key[baseClass]
@@ -574,7 +621,16 @@ func (w *WorkspaceDB) SaveClassesAndTables(ctx context.Context, db *sql.DB, jetR
 	if len(dataPropertiesData) > 0 {
 		err = DoStatement(ctx, db, dataPropertiesStmt, dataPropertiesData)
 		if err != nil {
+			// for i := range dataPropertiesData {
+			// 	fmt.Println("Data property:", dataPropertiesData[i])
+			// }
 			return fmt.Errorf("failed to insert data properties: %w", err)
+		}
+	}
+	if len(objectPropertiesData) > 0 {
+		err = DoStatement(ctx, db, objectPropertiesStmt, objectPropertiesData)
+		if err != nil {
+			return fmt.Errorf("failed to insert object properties: %w", err)
 		}
 	}
 	if len(baseClassData) > 0 {
@@ -584,12 +640,12 @@ func (w *WorkspaceDB) SaveClassesAndTables(ctx context.Context, db *sql.DB, jetR
 		}
 	}
 
-	return w.SaveTables(ctx, db, className2Key, dataProperties2Key, jetRuleModel)
+	return w.SaveTables(ctx, db, className2Key, dataProperties2Key, objectProperties2Key, jetRuleModel)
 }
 
 // Save Tables into workspace db
 func (w *WorkspaceDB) SaveTables(ctx context.Context, db *sql.DB,
-	className2Key, dataProperties2Key map[string]int, jetRuleModel *rete.JetruleModel) error {
+	className2Key, dataProperties2Key, objectProperties2Key map[string]int, jetRuleModel *rete.JetruleModel) error {
 
 	// Load existing tables put them in a set and keep tack of the max key
 	tableName2Key, err := getKeyNameFromTable(ctx, db, "domain_tables", "key", "name")
@@ -603,7 +659,7 @@ func (w *WorkspaceDB) SaveTables(ctx context.Context, db *sql.DB,
 
 	// Insert new tables that are not in tableName2Key
 	tableStmt := "INSERT INTO domain_tables (key, domain_class_key, name) VALUES (?, ?, ?)"
-	columnStmt := "INSERT INTO domain_columns (domain_table_key, data_property_key, name, type, as_array) VALUES (?, ?, ?, ?, ?)"
+	columnStmt := "INSERT INTO domain_columns (domain_table_key, data_property_key, name, type, as_array, is_object) VALUES (?, ?, ?, ?, ?, ?)"
 	tableData := make([][]any, 0, len(jetRuleModel.Tables))
 	columnData := make([][]any, 0)
 
@@ -620,12 +676,23 @@ func (w *WorkspaceDB) SaveTables(ctx context.Context, db *sql.DB,
 			}
 
 			// Table's columns
-			for _, column := range table.Columns {
-				dataPropertyKey, ok := dataProperties2Key[column.ColumnName]
-				if ok {
-					columnData = append(columnData, []any{maxTableKey, dataPropertyKey, column.ColumnName, column.Type, column.AsArray})
+			for i := range table.Columns {
+				column := &table.Columns[i]
+				if column.IsObject {
+					objectPropertyKey, ok := objectProperties2Key[column.ColumnName]
+					if ok {
+						columnData = append(columnData, []any{maxTableKey, objectPropertyKey, column.ColumnName, column.Type, column.AsArray, true})
+					} else {
+						return fmt.Errorf("failed to find object property key for column %s in table %s", column.ColumnName, table.TableName)
+					}
 				} else {
-					return fmt.Errorf("failed to find data property key for column %s in table %s", column.ColumnName, table.TableName)
+					dataPropertyKey, ok := dataProperties2Key[column.ColumnName]
+					if ok {
+						columnData = append(columnData, []any{maxTableKey, dataPropertyKey, column.ColumnName, column.Type, column.AsArray, false})
+					} else {
+						return fmt.Errorf("failed to find data property key for column %s in table %s", column.ColumnName, table.TableName)
+					}
+
 				}
 			}
 		}

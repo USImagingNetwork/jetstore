@@ -55,21 +55,11 @@ func NewJetstoreOneStack(scope constructs.Construct, id string, props *jetstores
 		alarmAction = awscloudwatchactions.NewSnsAction(awssns.Topic_FromTopicArn(stack, jsii.String("JetStoreSnsAlarmTopic"),
 			props.SnsAlarmTopicArn))
 	}
-	props.NbrShards = os.Getenv("NBR_SHARDS")
-	if props.NbrShards == "" {
-		props.NbrShards = "1"
-	}
 
 	// ---------------------------------------
 	// Define the JetStore State Machines ARNs
 	// ---------------------------------------
 	jsComp := &jetstorestack.JetStoreStackComponents{
-		LoaderSmArn: fmt.Sprintf("arn:aws:states:%s:%s:stateMachine:%s",
-			os.Getenv("AWS_REGION"), os.Getenv("AWS_ACCOUNT"), *props.MkId("loaderSM")),
-		ServerSmArn: fmt.Sprintf("arn:aws:states:%s:%s:stateMachine:%s",
-			os.Getenv("AWS_REGION"), os.Getenv("AWS_ACCOUNT"), *props.MkId("serverSM")),
-		ServerSmArnv2: fmt.Sprintf("arn:aws:states:%s:%s:stateMachine:%s",
-			os.Getenv("AWS_REGION"), os.Getenv("AWS_ACCOUNT"), *props.MkId("serverv2SM")),
 		CpipesSmArn: fmt.Sprintf("arn:aws:states:%s:%s:stateMachine:%s",
 			os.Getenv("AWS_REGION"), os.Getenv("AWS_ACCOUNT"), *props.MkId("cpipesSM")),
 		ReportsSmArn: fmt.Sprintf("arn:aws:states:%s:%s:stateMachine:%s",
@@ -261,14 +251,12 @@ func NewJetstoreOneStack(scope constructs.Construct, id string, props *jetstores
 	jsComp.RdsSecret.GrantRead(jsComp.LambdaExecutionRole, nil)
 	jsComp.SourceBucket.GrantReadWrite(jsComp.LambdaExecutionRole, nil)
 	jsComp.GrantReadWriteFromExternalBuckets(stack, jsComp.LambdaExecutionRole)
-	if jsComp.ExternalKmsKey != nil {
-		jsComp.ExternalKmsKey.GrantEncryptDecrypt(jsComp.LambdaExecutionRole)
-	}
+	jsComp.GrantEncryptDecryptExternalKmsKey(jsComp.LambdaExecutionRole)
 
 	// Create the jsComp.EcsCluster.
 	// ==============================================================================================================
 	jsComp.EcsCluster = awsecs.NewCluster(stack, props.MkId("ecsCluster"), &awsecs.ClusterProps{
-		Vpc: jsComp.Vpc,
+		Vpc:                 jsComp.Vpc,
 		ContainerInsightsV2: awsecs.ContainerInsights_ENABLED,
 	})
 	if phiTagName != nil {
@@ -307,9 +295,8 @@ func NewJetstoreOneStack(scope constructs.Construct, id string, props *jetstores
 	}))
 	jsComp.SourceBucket.GrantReadWrite(jsComp.EcsTaskRole, nil)
 	jsComp.GrantReadWriteFromExternalBuckets(stack, jsComp.EcsTaskRole)
-	if jsComp.ExternalKmsKey != nil {
-		jsComp.ExternalKmsKey.GrantEncryptDecrypt(jsComp.EcsTaskRole)
-	}
+	jsComp.GrantEncryptDecryptExternalKmsKey(jsComp.EcsTaskRole)
+
 	// Provide access to the secrets
 	jsComp.RdsSecret.GrantRead(jsComp.EcsTaskRole, nil)
 	jsComp.ApiSecret.GrantRead(jsComp.EcsTaskRole, nil)
@@ -319,8 +306,6 @@ func NewJetstoreOneStack(scope constructs.Construct, id string, props *jetstores
 	// JetStore Image from ecr -- referenced in most legacy tasks:
 	// - ui service
 	// - run reports task
-	// - loader task
-	// - server task
 	// ----------------------------------------------------------------------------------------------
 	jsComp.JetStoreImage = awsecs.AssetImage_FromEcrRepository(
 		//* example: arn:aws:ecr:us-east-1:470601442608:repository/jetstore_test_ws
@@ -335,8 +320,6 @@ func NewJetstoreOneStack(scope constructs.Construct, id string, props *jetstores
 	// Build ECS Tasks
 	// ---------------------------------------------
 	//	- RunreportTaskDefinition
-	//	- LoaderTaskDefinition
-	//	- ServerTaskDefinition
 	//	- CpipesTaskDefinition
 	jsComp.BuildEcsTasks(scope, stack, props)
 
@@ -354,18 +337,9 @@ func NewJetstoreOneStack(scope constructs.Construct, id string, props *jetstores
 	//	- JetsApi
 	jsComp.BuildApiLambdas(scope, stack, props)
 
-	// Build Loader State Machine
-	// ---------------------------------------------
-	jsComp.BuildLoaderSM(scope, stack, props)
-
 	// Build Run Reports State Machine
 	// ---------------------------------------------
 	jsComp.BuildRunReportsSM(scope, stack, props)
-
-	// JetStore Rule Server State Machine
-	// ---------------------------------------------
-	jsComp.BuildServerSM(scope, stack, props)
-	jsComp.BuildServerv2SM(scope, stack, props)
 
 	// Build lambdas used by cpipesSM/cpipesNativeSM:
 	//	- CpipesNodeLambda
@@ -379,6 +353,21 @@ func NewJetstoreOneStack(scope constructs.Construct, id string, props *jetstores
 	// Build the cpipes State Machine (cpipesSM)
 	jsComp.BuildCpipesSM(scope, stack, props)
 
+	// Build the infer State Machine (inferSM)
+	if jsComp.DoBuildInferServer() {
+		// Infer Image from ecr -- Ollama + cbooter, built from dockerfiles/Dockerfile.infer_service.
+		// Resolved here rather than alongside JetStoreImage so the ECR repo lookup construct is
+		// only created when the infer server is actually being built.
+		jsComp.InferImage = awsecs.AssetImage_FromEcrRepository(
+			awsecr.Repository_FromRepositoryArn(stack, jsii.String("jetstore-infer-image"),
+				jsii.String(jsComp.InferEcrRepoArn())),
+			jsii.String(jsComp.InferImageTag()))
+
+		if jsComp.BuildInferEc2(scope, stack, props) != nil {
+			jsComp.BuildInferService(scope, stack, props)
+		}
+	}
+
 	// RegisterKey Lambda
 	jsComp.BuildRegisterKeyLambdas(scope, stack, props)
 
@@ -388,9 +377,6 @@ func NewJetstoreOneStack(scope constructs.Construct, id string, props *jetstores
 	// These execution are performed in code so must give permission explicitly
 	// ---------------------------------------
 	resources := []*string{
-		jsComp.LoaderSM.StateMachineArn(),
-		jsComp.ServerSM.StateMachineArn(),
-		jsComp.Serverv2SM.StateMachineArn(),
 		jsComp.CpipesSM.StateMachineArn(),
 		jsComp.ReportsSM.StateMachineArn(),
 	}
@@ -402,6 +388,47 @@ func NewJetstoreOneStack(scope constructs.Construct, id string, props *jetstores
 		Actions:   jsii.Strings("states:StartExecution"),
 		Resources: &resources,
 	}))
+
+	// ---------------------------------------
+	// Allow JetStore Tasks to start and stop the Infer Server
+	// ---------------------------------------
+	// Used by awsi.StartInferServer / StopInferServer, called from the UI service. The task
+	// and its GPU instance scale independently, so this covers both the ECS service and the
+	// auto scaling group behind it. These land on the shared EcsTaskRole -- the convention
+	// stated where the role is created -- so the cpipes and run-reports tasks receive them
+	// too, which is what would be wanted if a pipeline step ever needs inference.
+	//
+	// Guarded on the components rather than DoBuildInferServer() so this cannot reference a
+	// nil resource if the infer build above was skipped for any other reason.
+	if jsComp.EcsInferService != nil && jsComp.InferAutoScalingGroup != nil {
+		jsComp.EcsTaskRole.AddToPolicy(awsiam.NewPolicyStatement(&awsiam.PolicyStatementProps{
+			Actions:   jsii.Strings("ecs:DescribeServices", "ecs:UpdateService"),
+			Resources: &[]*string{jsComp.EcsInferService.ServiceArn()},
+		}))
+		jsComp.EcsTaskRole.AddToPolicy(awsiam.NewPolicyStatement(&awsiam.PolicyStatementProps{
+			Actions:   jsii.Strings("autoscaling:SetDesiredCapacity"),
+			Resources: &[]*string{jsComp.InferAutoScalingGroup.AutoScalingGroupArn()},
+		}))
+		jsComp.EcsTaskRole.AddToPolicy(awsiam.NewPolicyStatement(&awsiam.PolicyStatementProps{
+			// Autoscaling Describe* actions have no resource types, so this cannot be scoped.
+			Actions:   jsii.Strings("autoscaling:DescribeAutoScalingGroups"),
+			Resources: jsii.Strings("*"),
+		}))
+		// The remaining two are only for awsi's fallback path, which discovers the auto
+		// scaling group through the cluster's capacity provider when JETS_INFER_ASG_NAME is
+		// absent. The UI container always has that variable set, so this is here to keep the
+		// fallback from failing with a confusing AccessDenied rather than because the normal
+		// path needs it. DescribeCapacityProviders has no resource types either.
+		jsComp.EcsTaskRole.AddToPolicy(awsiam.NewPolicyStatement(&awsiam.PolicyStatementProps{
+			Actions:   jsii.Strings("ecs:DescribeClusters"),
+			Resources: &[]*string{jsComp.EcsCluster.ClusterArn()},
+		}))
+		jsComp.EcsTaskRole.AddToPolicy(awsiam.NewPolicyStatement(&awsiam.PolicyStatementProps{
+			Actions:   jsii.Strings("ecs:DescribeCapacityProviders"),
+			Resources: jsii.Strings("*"),
+		}))
+	}
+
 	// Also to status update & register key lambda
 	jsComp.StatusUpdateLambda.AddToRolePolicy(awsiam.NewPolicyStatement(&awsiam.PolicyStatementProps{
 		Actions: jsii.Strings("states:StartExecution"),
@@ -486,7 +513,7 @@ func NewJetstoreOneStack(scope constructs.Construct, id string, props *jetstores
 // BASTION_HOST_KEYPAIR_NAME (optional, no keys deployed if not defined)
 // ENVIRONMENT (used by run_report)
 // EXTERNAL_BUCKETS (optional, list of third party buckets to read/write file for cpipes)
-// EXTERNAL_S3_KMS_KEY_ARN (optional, kms key for external bucket)
+// EXTERNAL_S3_KMS_KEY_ARN (optional, additional kms keys for reading external buckets)
 // EXTERNAL_SQS_ARN (optional, sqs queue for sqs register key lambda)
 // JETS_PIVOT_YEAR_TIME_PARSING (optional, pivot year used in date_util.ParseDateTime function)
 // JETS_ADMIN_EMAIL (optional, email of build-in admin, default: admin)
@@ -521,9 +548,6 @@ func NewJetstoreOneStack(scope constructs.Construct, id string, props *jetstores
 // DEPLOY_CPIPES_NATIVE (required for cpipes native task and lambdas, values: TRUE, FALSE, requires JETS_IMAGE_TAG)
 // JETS_INPUT_ROW_JETS_KEY_ALGO (values: uuid, row_hash, domain_key (default: uuid))
 // JETS_INVALID_CODE (optional) code value when client code is not is the code value mapping, default return the client value
-// JETS_LOADER_CHUNCK_SIZE loader file partition size
-// JETS_LOADER_TASK_CPU allocated cpu in vCPU units
-// JETS_LOADER_TASK_MEM_LIMIT_MB memory limit, based on fargate table
 // JETS_NBR_NAT_GATEWAY (optional, default to 0), set to 1 to be able to reach out to github for git integration
 // JETS_CPIPES_RUN_REPORTS_LAMBDA_ENTRY (optional, path to handler code for run_reports lambda in cpipes pipelines)
 // JETS_s3_INPUT_PREFIX (required)
@@ -533,9 +557,6 @@ func NewJetstoreOneStack(scope constructs.Construct, id string, props *jetstores
 // JETS_S3_KMS_KEY_ARN (optional, default to account default KMS key) Server side encryption of s3 objects
 // JETS_SECRETS_ROTATION_DAYS (required, nbr of days to trigger secret rotation, default 30 days)
 // JETS_SENTINEL_FILE_NAME (optional, fixed file name for multipart sentinel file - file of size 0)
-// JETS_SERVER_TASK_CPU allocated cpu in vCPU units
-// JETS_SERVER_TASK_MEM_LIMIT_MB memory limit, based on fargate table
-// JETS_SERVER_SM_TIMEOUT_MIN (optional) state machine timeout for SERVER_SM, default 60 min
 // JETS_SNS_ALARM_TOPIC_ARN (optional, sns topic for sending alarm)
 // JETS_SQS_REGISTER_KEY_LAMBDA_ENTRY (optional, path to handler code for sqs register key lambda)
 // JETS_API_GATEWAY_LAMBDA_ENTRY (optional, path to handler code for api gateway lambda)
@@ -578,7 +599,6 @@ func NewJetstoreOneStack(scope constructs.Construct, id string, props *jetstores
 // JETS_DB_VERSION (optional, default to latest version supported by jetstore, expected values are 14.5, 15.10 etc. only specific versions are supported)
 // JETS_DB_POOL_SIZE (optional, default is 8, min allowed is 5, used for serverv2 running standalone as ecs task or lambda function)
 // CPIPES_DB_POOL_SIZE (optional, default is 3, used for cpipes node, may run jetrules as cpipes operator)
-// NBR_SHARDS (defaults to 1)
 // JETS_PIPELINE_THROTTLING_JSON json configuration ThrottlingSpec
 // RETENTION_DAYS site global rentention days, delete sessions if > 0
 // PURGE_DATA_SCHEDULED_HOUR_UTC hour of day to run purge_data, default 7 UTC
@@ -588,107 +608,132 @@ func NewJetstoreOneStack(scope constructs.Construct, id string, props *jetstores
 // WORKSPACE_URI (optional, if set it will lock the workspace uri and will not take the ui value)
 // WORKSPACES_HOME  this is taken from container env (dockerfile) or hardcoded in lambda definition
 // WORKSPACE_FILE_KEY_LABEL_RE (optional) regex to extract label from file_key in UI
+// === New Entries for Infer Task ===
+// BUILD_INFER_SERVICE (optional) set to TRUE to build the infer state machine, default FALSE
+// JETS_INFER_PORT (optional) port for infer server, default 11434
+// INFER_AMI_NAME (optional) escape hatch to pin a custom AMI; when unset the stock ECS
+// GPU-optimized Amazon Linux 2023 AMI is used (NVIDIA driver + ECS agent preinstalled)
+// INFER_AMI_OWNER (optional) owner of the custom AMI, default "self"; ignored unless INFER_AMI_NAME is set
+// INFER_AMI_ROOT_DEVICE (optional) root device name of the custom AMI, default "/dev/xvda"
+// INFER_ECR_REPO_ARN (required when BUILD_INFER_SERVICE) ECR repo holding the infer image
+// INFER_IMAGE_TAG (required when BUILD_INFER_SERVICE) tag of the infer image
+// INFER_MEM_LIMIT_MB (optional) memory limit in MB for infer task, default 1024 * 16 * 10 / 8 = 12.5 GB
+// INFER_DESIRED_COUNT (optional) desired task count for the infer service. Leave unset so a
+// deploy preserves the current scale; set to 0 on the first deploy of a new stack to avoid
+// starting a GPU instance right away
+// INFER_EC2_INSTANCE_TYPE (optional) EC2 instance type for infer task, default g5.xlarge
+// INFER_ROOT_VOLUME_GB (optional) size of the infer instance root volume in GB, default 50
+// OLLAMA_NUM_PARALLEL, OLLAMA_MAX_LOADED_MODELS, OLLAMA_KEEP_ALIVE, OLLAMA_CONTEXT_LENGTH
+// (optional) Ollama tuning passed through to the infer container, defaults 4 / 1 / 30m / 32768
+// (see infer_server_readme.md before changing the last two — they are GPU-memory bound)
+//XXX JETS_INFER_SSH_KEY_NAME (optional) name of the keypair to use for infer ec2 instance, default none (*for debugging only*)
+
 func main() {
 	defer jsii.Close()
 	var err error
-	fmt.Println("Got following env var")
-	fmt.Println("env ACTIVE_WORKSPACE_URI:", os.Getenv("ACTIVE_WORKSPACE_URI"))
-	fmt.Println("env AWS_ACCOUNT:", os.Getenv("AWS_ACCOUNT"))
-	fmt.Println("env AWS_PREFIX_LIST_ROUTE53_HEALTH_CHECK:", os.Getenv("AWS_PREFIX_LIST_ROUTE53_HEALTH_CHECK"))
-	fmt.Println("env AWS_PREFIX_LIST_S3:", os.Getenv("AWS_PREFIX_LIST_S3"))
-	fmt.Println("env AWS_REGION:", os.Getenv("AWS_REGION"))
-	fmt.Println("env BASTION_HOST_KEYPAIR_NAME:", os.Getenv("BASTION_HOST_KEYPAIR_NAME"))
-	fmt.Println("env ENVIRONMENT:", os.Getenv("ENVIRONMENT"))
-	fmt.Println("env JETS_ADMIN_EMAIL:", os.Getenv("JETS_ADMIN_EMAIL"))
-	fmt.Println("env JETS_BUCKET_NAME:", os.Getenv("JETS_BUCKET_NAME"))
-	fmt.Println("env JETS_CERT_ARN:", os.Getenv("JETS_CERT_ARN"))
-	fmt.Println("env JETS_CPIPES_TASK_CPU:", os.Getenv("JETS_CPIPES_TASK_CPU"))
-	fmt.Println("env JETS_CPIPES_TASK_MEM_LIMIT_MB:", os.Getenv("JETS_CPIPES_TASK_MEM_LIMIT_MB"))
-	fmt.Println("env JETS_CPIPES_LAMBDA_MEM_LIMIT_MB:", os.Getenv("JETS_CPIPES_LAMBDA_MEM_LIMIT_MB"))
-	fmt.Println("env JETS_CPIPES_SM_TIMEOUT_MIN:", os.Getenv("JETS_CPIPES_SM_TIMEOUT_MIN"))
-	fmt.Println("env JETS_TEMP_DATA:", os.Getenv("JETS_TEMP_DATA"))
-	fmt.Println("env TMPDIR:", os.Getenv("TMPDIR"))
-	fmt.Println("env CPIPES_STATUS_NOTIFICATION_ENDPOINT:", os.Getenv("CPIPES_STATUS_NOTIFICATION_ENDPOINT"))
-	fmt.Println("env CPIPES_STATUS_NOTIFICATION_ENDPOINT_JSON:", os.Getenv("CPIPES_STATUS_NOTIFICATION_ENDPOINT_JSON"))
-	fmt.Println("env CPIPES_START_NOTIFICATION_JSON:", os.Getenv("CPIPES_START_NOTIFICATION_JSON"))
-	fmt.Println("env CPIPES_COMPLETED_NOTIFICATION_JSON:", os.Getenv("CPIPES_COMPLETED_NOTIFICATION_JSON"))
-	fmt.Println("env CPIPES_FAILED_NOTIFICATION_JSON:", os.Getenv("CPIPES_FAILED_NOTIFICATION_JSON"))
-	fmt.Println("env JETS_CPU_UTILIZATION_ALARM_THRESHOLD:", os.Getenv("JETS_CPU_UTILIZATION_ALARM_THRESHOLD"))
-	fmt.Println("env JETS_DB_MAX_CAPACITY:", os.Getenv("JETS_DB_MAX_CAPACITY"))
-	fmt.Println("env JETS_DB_MIN_CAPACITY:", os.Getenv("JETS_DB_MIN_CAPACITY"))
-	fmt.Println("env JETS_DB_VERSION:", os.Getenv("JETS_DB_VERSION"))
-	fmt.Println("env JETS_DB_POOL_SIZE:", os.Getenv("JETS_DB_POOL_SIZE"))
-	fmt.Println("env CPIPES_DB_POOL_SIZE:", os.Getenv("CPIPES_DB_POOL_SIZE"))
-	fmt.Println("env JETS_DOMAIN_KEY_HASH_ALGO:", os.Getenv("JETS_DOMAIN_KEY_HASH_ALGO"))
-	fmt.Println("env JETS_DOMAIN_KEY_HASH_SEED:", os.Getenv("JETS_DOMAIN_KEY_HASH_SEED"))
-	fmt.Println("env JETS_DOMAIN_KEY_SEPARATOR:", os.Getenv("JETS_DOMAIN_KEY_SEPARATOR"))
-	fmt.Println("env JETS_ECR_REPO_ARN:", os.Getenv("JETS_ECR_REPO_ARN"))
-	fmt.Println("env CPIPES_ECR_REPO_ARN:", os.Getenv("CPIPES_ECR_REPO_ARN"))
-	fmt.Println("env CPIPES_LAMBDA_ECR_REPO_ARN:", os.Getenv("CPIPES_LAMBDA_ECR_REPO_ARN"))
-	fmt.Println("env JETS_ELB_INTERNET_FACING:", os.Getenv("JETS_ELB_INTERNET_FACING"))
-	fmt.Println("env JETS_ELB_MODE:", os.Getenv("JETS_ELB_MODE"))
-	fmt.Println("env JETS_ELB_NO_ALL_INCOMING:", os.Getenv("JETS_ELB_NO_ALL_INCOMING"))
-	fmt.Println("env JETS_GIT_ACCESS:", os.Getenv("JETS_GIT_ACCESS"))
-	fmt.Println("**** env JETS_IMAGE_TAG:", os.Getenv("JETS_IMAGE_TAG"))
-	fmt.Println("env CPIPES_IMAGE_TAG:", os.Getenv("CPIPES_IMAGE_TAG"))
-	fmt.Println("env DEPLOY_CPIPES_NATIVE:", os.Getenv("DEPLOY_CPIPES_NATIVE"))
-	fmt.Println("env JETS_INPUT_ROW_JETS_KEY_ALGO:", os.Getenv("JETS_INPUT_ROW_JETS_KEY_ALGO"))
-	fmt.Println("env JETS_INVALID_CODE:", os.Getenv("JETS_INVALID_CODE"))
-	fmt.Println("env JETS_LOADER_CHUNCK_SIZE:", os.Getenv("JETS_LOADER_CHUNCK_SIZE"))
-	fmt.Println("env JETS_NBR_NAT_GATEWAY:", os.Getenv("JETS_NBR_NAT_GATEWAY"))
-	fmt.Println("env JETS_CPIPES_RUN_REPORTS_LAMBDA_ENTRY:", os.Getenv("JETS_CPIPES_RUN_REPORTS_LAMBDA_ENTRY"))
-	fmt.Println("env JETS_s3_INPUT_PREFIX:", os.Getenv("JETS_s3_INPUT_PREFIX"))
-	fmt.Println("env JETS_s3_OUTPUT_PREFIX:", os.Getenv("JETS_s3_OUTPUT_PREFIX"))
-	fmt.Println("env JETS_s3_STAGE_PREFIX:", os.Getenv("JETS_s3_STAGE_PREFIX"))
-	fmt.Println("env JETS_s3_SCHEMA_TRIGGERS:", os.Getenv("JETS_s3_SCHEMA_TRIGGERS"))
-	fmt.Println("env JETS_S3_KMS_KEY_ARN:", os.Getenv("JETS_S3_KMS_KEY_ARN"))
-	fmt.Println("env JETS_SENTINEL_FILE_NAME:", os.Getenv("JETS_SENTINEL_FILE_NAME"))
-	fmt.Println("env JETS_SERVER_TASK_CPU:", os.Getenv("JETS_SERVER_TASK_CPU"))
-	fmt.Println("env JETS_SERVER_TASK_MEM_LIMIT_MB:", os.Getenv("JETS_SERVER_TASK_MEM_LIMIT_MB"))
-	fmt.Println("env JETS_SERVER_SM_TIMEOUT_MIN:", os.Getenv("JETS_SERVER_SM_TIMEOUT_MIN"))
-	fmt.Println("env JETS_LOADER_TASK_CPU:", os.Getenv("JETS_LOADER_TASK_CPU"))
-	fmt.Println("env JETS_LOADER_TASK_MEM_LIMIT_MB:", os.Getenv("JETS_LOADER_TASK_MEM_LIMIT_MB"))
-	fmt.Println("env JETS_SNS_ALARM_TOPIC_ARN:", os.Getenv("JETS_SNS_ALARM_TOPIC_ARN"))
-	fmt.Println("env JETS_SQS_REGISTER_KEY_LAMBDA_ENTRY:", os.Getenv("JETS_SQS_REGISTER_KEY_LAMBDA_ENTRY"))
-	fmt.Println("env JETS_API_GATEWAY_LAMBDA_ENTRY:", os.Getenv("JETS_API_GATEWAY_LAMBDA_ENTRY"))
-	fmt.Println("env JETS_API_GATEWAY_EXTERNAL_ROLES_ARN:", os.Getenv("JETS_API_GATEWAY_EXTERNAL_ROLES_ARN"))
-	fmt.Println("env JETS_API_GATEWAY_RESOURCE_POLICY_JSON:", os.Getenv("JETS_API_GATEWAY_RESOURCE_POLICY_JSON"))
-	fmt.Println("env JETS_API_GATEWAY_EXEC_ROLE_NAME:", os.Getenv("JETS_API_GATEWAY_EXEC_ROLE_NAME"))
-	fmt.Println("env JETS_API_GATEWAY_DEPLOY_TEST_LAMBDA:", os.Getenv("JETS_API_GATEWAY_DEPLOY_TEST_LAMBDA"))
-	fmt.Println("env JETS_SQS_REGISTER_KEY_VPC_ID:", os.Getenv("JETS_SQS_REGISTER_KEY_VPC_ID"))
-	fmt.Println("env JETS_SQS_REGISTER_KEY_SG_ID:", os.Getenv("JETS_SQS_REGISTER_KEY_SG_ID"))
-	fmt.Println("env JETS_STACK_ID:", os.Getenv("JETS_STACK_ID"))
-	fmt.Println("env JETS_STACK_SUFFIX:", os.Getenv("JETS_STACK_SUFFIX"))
-	fmt.Println("env JETS_STACK_TAGS_JSON:", os.Getenv("JETS_STACK_TAGS_JSON"))
-	fmt.Println("env JETS_TAG_NAME_DESCRIPTION:", os.Getenv("JETS_TAG_NAME_DESCRIPTION"))
-	fmt.Println("env JETS_TAG_NAME_OWNER:", os.Getenv("JETS_TAG_NAME_OWNER"))
-	fmt.Println("env JETS_TAG_NAME_PHI:", os.Getenv("JETS_TAG_NAME_PHI"))
-	fmt.Println("env JETS_TAG_NAME_PII:", os.Getenv("JETS_TAG_NAME_PII"))
-	fmt.Println("env JETS_TAG_NAME_PROD:", os.Getenv("JETS_TAG_NAME_PROD"))
-	fmt.Println("env JETS_TAG_VALUE_OWNER:", os.Getenv("JETS_TAG_VALUE_OWNER"))
-	fmt.Println("env JETS_TAG_VALUE_PROD:", os.Getenv("JETS_TAG_VALUE_PROD"))
-	fmt.Println("env JETS_UI_PORT:", os.Getenv("JETS_UI_PORT"))
-	fmt.Println("env JETS_VPC_CIDR:", os.Getenv("JETS_VPC_CIDR"))
-	fmt.Println("env JETS_VPC_ID:", os.Getenv("JETS_VPC_ID"))
-	fmt.Println("env JETS_VPC_ENDPOINTS_SG_ID:", os.Getenv("JETS_VPC_ENDPOINTS_SG_ID"))
-	fmt.Println("env JETS_API_GATEWAY_VPC_ENDPOINT_ID:", os.Getenv("JETS_API_GATEWAY_VPC_ENDPOINT_ID"))
-	fmt.Println("env JETS_API_GATEWAY_CODECOMMIT_REPO_ARN:", os.Getenv("JETS_API_GATEWAY_CODECOMMIT_REPO_ARN"))
-	fmt.Println("env JETS_API_GATEWAY_LAMBDA_ASSUME_ROLE_ARN:", os.Getenv("JETS_API_GATEWAY_LAMBDA_ASSUME_ROLE_ARN"))
-	fmt.Println("env JETS_VPC_INTERNET_GATEWAY:", os.Getenv("JETS_VPC_INTERNET_GATEWAY"))
-	fmt.Println("env NBR_SHARDS:", os.Getenv("NBR_SHARDS"))
-	fmt.Println("env JETS_PIPELINE_THROTTLING_JSON:", os.Getenv("JETS_PIPELINE_THROTTLING_JSON"))
-	fmt.Println("env RETENTION_DAYS:", os.Getenv("RETENTION_DAYS"))
-	fmt.Println("env PURGE_DATA_SCHEDULED_HOUR_UTC:", os.Getenv("PURGE_DATA_SCHEDULED_HOUR_UTC"))
-	fmt.Println("env TASK_MAX_CONCURRENCY:", os.Getenv("TASK_MAX_CONCURRENCY"))
-	fmt.Println("env WORKSPACE_BRANCH:", os.Getenv("WORKSPACE_BRANCH"))
-	fmt.Println("env WORKSPACE_FILE_KEY_LABEL_RE:", os.Getenv("WORKSPACE_FILE_KEY_LABEL_RE"))
-	fmt.Println("env WORKSPACE_URI:", os.Getenv("WORKSPACE_URI"))
-	fmt.Println("env WORKSPACE:", os.Getenv("WORKSPACE"))
+	log.Println("Got following env var")
+	log.Println("env ACTIVE_WORKSPACE_URI:", os.Getenv("ACTIVE_WORKSPACE_URI"))
+	log.Println("env AWS_ACCOUNT:", os.Getenv("AWS_ACCOUNT"))
+	log.Println("env AWS_PREFIX_LIST_ROUTE53_HEALTH_CHECK:", os.Getenv("AWS_PREFIX_LIST_ROUTE53_HEALTH_CHECK"))
+	log.Println("env AWS_PREFIX_LIST_S3:", os.Getenv("AWS_PREFIX_LIST_S3"))
+	log.Println("env AWS_REGION:", os.Getenv("AWS_REGION"))
+	log.Println("env BASTION_HOST_KEYPAIR_NAME:", os.Getenv("BASTION_HOST_KEYPAIR_NAME"))
+	log.Println("env ENVIRONMENT:", os.Getenv("ENVIRONMENT"))
+	log.Println("env JETS_ADMIN_EMAIL:", os.Getenv("JETS_ADMIN_EMAIL"))
+	log.Println("env JETS_BUCKET_NAME:", os.Getenv("JETS_BUCKET_NAME"))
+	log.Println("env JETS_CERT_ARN:", os.Getenv("JETS_CERT_ARN"))
+	log.Println("env JETS_CPIPES_TASK_CPU:", os.Getenv("JETS_CPIPES_TASK_CPU"))
+	log.Println("env JETS_CPIPES_TASK_MEM_LIMIT_MB:", os.Getenv("JETS_CPIPES_TASK_MEM_LIMIT_MB"))
+	log.Println("env JETS_CPIPES_LAMBDA_MEM_LIMIT_MB:", os.Getenv("JETS_CPIPES_LAMBDA_MEM_LIMIT_MB"))
+	log.Println("env JETS_CPIPES_SM_TIMEOUT_MIN:", os.Getenv("JETS_CPIPES_SM_TIMEOUT_MIN"))
+	log.Println("env JETS_TEMP_DATA:", os.Getenv("JETS_TEMP_DATA"))
+	log.Println("env TMPDIR:", os.Getenv("TMPDIR"))
+	log.Println("env CPIPES_STATUS_NOTIFICATION_ENDPOINT:", os.Getenv("CPIPES_STATUS_NOTIFICATION_ENDPOINT"))
+	log.Println("env CPIPES_STATUS_NOTIFICATION_ENDPOINT_JSON:", os.Getenv("CPIPES_STATUS_NOTIFICATION_ENDPOINT_JSON"))
+	log.Println("env CPIPES_START_NOTIFICATION_JSON:", os.Getenv("CPIPES_START_NOTIFICATION_JSON"))
+	log.Println("env CPIPES_COMPLETED_NOTIFICATION_JSON:", os.Getenv("CPIPES_COMPLETED_NOTIFICATION_JSON"))
+	log.Println("env CPIPES_FAILED_NOTIFICATION_JSON:", os.Getenv("CPIPES_FAILED_NOTIFICATION_JSON"))
+	log.Println("env JETS_CPU_UTILIZATION_ALARM_THRESHOLD:", os.Getenv("JETS_CPU_UTILIZATION_ALARM_THRESHOLD"))
+	log.Println("env JETS_DB_MAX_CAPACITY:", os.Getenv("JETS_DB_MAX_CAPACITY"))
+	log.Println("env JETS_DB_MIN_CAPACITY:", os.Getenv("JETS_DB_MIN_CAPACITY"))
+	log.Println("env JETS_DB_VERSION:", os.Getenv("JETS_DB_VERSION"))
+	log.Println("env JETS_DB_POOL_SIZE:", os.Getenv("JETS_DB_POOL_SIZE"))
+	log.Println("env CPIPES_DB_POOL_SIZE:", os.Getenv("CPIPES_DB_POOL_SIZE"))
+	log.Println("env JETS_DOMAIN_KEY_HASH_ALGO:", os.Getenv("JETS_DOMAIN_KEY_HASH_ALGO"))
+	log.Println("env JETS_DOMAIN_KEY_HASH_SEED:", os.Getenv("JETS_DOMAIN_KEY_HASH_SEED"))
+	log.Println("env JETS_DOMAIN_KEY_SEPARATOR:", os.Getenv("JETS_DOMAIN_KEY_SEPARATOR"))
+	log.Println("env JETS_ECR_REPO_ARN:", os.Getenv("JETS_ECR_REPO_ARN"))
+	log.Println("env CPIPES_ECR_REPO_ARN:", os.Getenv("CPIPES_ECR_REPO_ARN"))
+	log.Println("env CPIPES_LAMBDA_ECR_REPO_ARN:", os.Getenv("CPIPES_LAMBDA_ECR_REPO_ARN"))
+	log.Println("env JETS_ELB_INTERNET_FACING:", os.Getenv("JETS_ELB_INTERNET_FACING"))
+	log.Println("env JETS_ELB_MODE:", os.Getenv("JETS_ELB_MODE"))
+	log.Println("env JETS_ELB_NO_ALL_INCOMING:", os.Getenv("JETS_ELB_NO_ALL_INCOMING"))
+	log.Println("env JETS_GIT_ACCESS:", os.Getenv("JETS_GIT_ACCESS"))
+	log.Println("**** env JETS_IMAGE_TAG:", os.Getenv("JETS_IMAGE_TAG"))
+	log.Println("env CPIPES_IMAGE_TAG:", os.Getenv("CPIPES_IMAGE_TAG"))
+	log.Println("env DEPLOY_CPIPES_NATIVE:", os.Getenv("DEPLOY_CPIPES_NATIVE"))
+	log.Println("env JETS_INPUT_ROW_JETS_KEY_ALGO:", os.Getenv("JETS_INPUT_ROW_JETS_KEY_ALGO"))
+	log.Println("env JETS_INVALID_CODE:", os.Getenv("JETS_INVALID_CODE"))
+	log.Println("env JETS_NBR_NAT_GATEWAY:", os.Getenv("JETS_NBR_NAT_GATEWAY"))
+	log.Println("env JETS_CPIPES_RUN_REPORTS_LAMBDA_ENTRY:", os.Getenv("JETS_CPIPES_RUN_REPORTS_LAMBDA_ENTRY"))
+	log.Println("env JETS_s3_INPUT_PREFIX:", os.Getenv("JETS_s3_INPUT_PREFIX"))
+	log.Println("env JETS_s3_OUTPUT_PREFIX:", os.Getenv("JETS_s3_OUTPUT_PREFIX"))
+	log.Println("env JETS_s3_STAGE_PREFIX:", os.Getenv("JETS_s3_STAGE_PREFIX"))
+	log.Println("env JETS_s3_SCHEMA_TRIGGERS:", os.Getenv("JETS_s3_SCHEMA_TRIGGERS"))
+	log.Println("env JETS_S3_KMS_KEY_ARN:", os.Getenv("JETS_S3_KMS_KEY_ARN"))
+	log.Println("env JETS_SENTINEL_FILE_NAME:", os.Getenv("JETS_SENTINEL_FILE_NAME"))
+	log.Println("env JETS_SNS_ALARM_TOPIC_ARN:", os.Getenv("JETS_SNS_ALARM_TOPIC_ARN"))
+	log.Println("env JETS_SQS_REGISTER_KEY_LAMBDA_ENTRY:", os.Getenv("JETS_SQS_REGISTER_KEY_LAMBDA_ENTRY"))
+	log.Println("env JETS_API_GATEWAY_LAMBDA_ENTRY:", os.Getenv("JETS_API_GATEWAY_LAMBDA_ENTRY"))
+	log.Println("env JETS_API_GATEWAY_EXTERNAL_ROLES_ARN:", os.Getenv("JETS_API_GATEWAY_EXTERNAL_ROLES_ARN"))
+	log.Println("env JETS_API_GATEWAY_RESOURCE_POLICY_JSON:", os.Getenv("JETS_API_GATEWAY_RESOURCE_POLICY_JSON"))
+	log.Println("env JETS_API_GATEWAY_EXEC_ROLE_NAME:", os.Getenv("JETS_API_GATEWAY_EXEC_ROLE_NAME"))
+	log.Println("env JETS_API_GATEWAY_DEPLOY_TEST_LAMBDA:", os.Getenv("JETS_API_GATEWAY_DEPLOY_TEST_LAMBDA"))
+	log.Println("env JETS_SQS_REGISTER_KEY_VPC_ID:", os.Getenv("JETS_SQS_REGISTER_KEY_VPC_ID"))
+	log.Println("env JETS_SQS_REGISTER_KEY_SG_ID:", os.Getenv("JETS_SQS_REGISTER_KEY_SG_ID"))
+	log.Println("env JETS_STACK_ID:", os.Getenv("JETS_STACK_ID"))
+	log.Println("env JETS_STACK_SUFFIX:", os.Getenv("JETS_STACK_SUFFIX"))
+	log.Println("env JETS_STACK_TAGS_JSON:", os.Getenv("JETS_STACK_TAGS_JSON"))
+	log.Println("env JETS_TAG_NAME_DESCRIPTION:", os.Getenv("JETS_TAG_NAME_DESCRIPTION"))
+	log.Println("env JETS_TAG_NAME_OWNER:", os.Getenv("JETS_TAG_NAME_OWNER"))
+	log.Println("env JETS_TAG_NAME_PHI:", os.Getenv("JETS_TAG_NAME_PHI"))
+	log.Println("env JETS_TAG_NAME_PII:", os.Getenv("JETS_TAG_NAME_PII"))
+	log.Println("env JETS_TAG_NAME_PROD:", os.Getenv("JETS_TAG_NAME_PROD"))
+	log.Println("env JETS_TAG_VALUE_OWNER:", os.Getenv("JETS_TAG_VALUE_OWNER"))
+	log.Println("env JETS_TAG_VALUE_PROD:", os.Getenv("JETS_TAG_VALUE_PROD"))
+	log.Println("env JETS_UI_PORT:", os.Getenv("JETS_UI_PORT"))
+	log.Println("env JETS_VPC_CIDR:", os.Getenv("JETS_VPC_CIDR"))
+	log.Println("env JETS_VPC_ID:", os.Getenv("JETS_VPC_ID"))
+	log.Println("env JETS_VPC_ENDPOINTS_SG_ID:", os.Getenv("JETS_VPC_ENDPOINTS_SG_ID"))
+	log.Println("env JETS_API_GATEWAY_VPC_ENDPOINT_ID:", os.Getenv("JETS_API_GATEWAY_VPC_ENDPOINT_ID"))
+	log.Println("env JETS_API_GATEWAY_CODECOMMIT_REPO_ARN:", os.Getenv("JETS_API_GATEWAY_CODECOMMIT_REPO_ARN"))
+	log.Println("env JETS_API_GATEWAY_LAMBDA_ASSUME_ROLE_ARN:", os.Getenv("JETS_API_GATEWAY_LAMBDA_ASSUME_ROLE_ARN"))
+	log.Println("env JETS_VPC_INTERNET_GATEWAY:", os.Getenv("JETS_VPC_INTERNET_GATEWAY"))
+	log.Println("env JETS_PIPELINE_THROTTLING_JSON:", os.Getenv("JETS_PIPELINE_THROTTLING_JSON"))
+	log.Println("env RETENTION_DAYS:", os.Getenv("RETENTION_DAYS"))
+	log.Println("env PURGE_DATA_SCHEDULED_HOUR_UTC:", os.Getenv("PURGE_DATA_SCHEDULED_HOUR_UTC"))
+	log.Println("env TASK_MAX_CONCURRENCY:", os.Getenv("TASK_MAX_CONCURRENCY"))
+	log.Println("env WORKSPACE_BRANCH:", os.Getenv("WORKSPACE_BRANCH"))
+	log.Println("env WORKSPACE_FILE_KEY_LABEL_RE:", os.Getenv("WORKSPACE_FILE_KEY_LABEL_RE"))
+	log.Println("env WORKSPACE_URI:", os.Getenv("WORKSPACE_URI"))
+	log.Println("env WORKSPACE:", os.Getenv("WORKSPACE"))
 	// WORKSPACES_HOME is taken from the container env var
-	fmt.Println("env EXTERNAL_BUCKETS:", os.Getenv("EXTERNAL_BUCKETS"))
-	fmt.Println("env EXTERNAL_S3_KMS_KEY_ARN:", os.Getenv("EXTERNAL_S3_KMS_KEY_ARN"))
-	fmt.Println("env EXTERNAL_SQS_ARN:", os.Getenv("EXTERNAL_SQS_ARN"))
-	fmt.Println("env JETS_PIVOT_YEAR_TIME_PARSING:", os.Getenv("JETS_PIVOT_YEAR_TIME_PARSING"))
+	log.Println("env EXTERNAL_BUCKETS:", os.Getenv("EXTERNAL_BUCKETS"))
+	log.Println("env EXTERNAL_S3_KMS_KEY_ARN:", os.Getenv("EXTERNAL_S3_KMS_KEY_ARN"))
+	log.Println("env EXTERNAL_SQS_ARN:", os.Getenv("EXTERNAL_SQS_ARN"))
+	log.Println("env JETS_PIVOT_YEAR_TIME_PARSING:", os.Getenv("JETS_PIVOT_YEAR_TIME_PARSING"))
+	// Infer Task env vars
+	log.Println("env BUILD_INFER_SERVICE:", os.Getenv("BUILD_INFER_SERVICE"))
+	log.Println("env JETS_INFER_PORT:", os.Getenv("JETS_INFER_PORT"))
+	log.Println("env INFER_AMI_NAME:", os.Getenv("INFER_AMI_NAME"))
+	log.Println("env INFER_AMI_OWNER:", os.Getenv("INFER_AMI_OWNER"))
+	log.Println("env INFER_AMI_ROOT_DEVICE:", os.Getenv("INFER_AMI_ROOT_DEVICE"))
+	log.Println("env INFER_ECR_REPO_ARN:", os.Getenv("INFER_ECR_REPO_ARN"))
+	log.Println("env INFER_IMAGE_TAG:", os.Getenv("INFER_IMAGE_TAG"))
+	log.Println("env INFER_MEM_LIMIT_MB:", os.Getenv("INFER_MEM_LIMIT_MB"))
+	log.Println("env INFER_EC2_INSTANCE_TYPE:", os.Getenv("INFER_EC2_INSTANCE_TYPE"))
+	log.Println("env INFER_ROOT_VOLUME_GB:", os.Getenv("INFER_ROOT_VOLUME_GB"))
+	// log.Println("env JETS_INFER_SSH_KEY_NAME:", os.Getenv("JETS_INFER_SSH_KEY_NAME"))
 
 	// Verify that we have all the required env variables
 	hasErr := false
@@ -729,10 +774,11 @@ func main() {
 		errMsg = append(errMsg, "Env variables 'JETS_ECR_REPO_ARN' is the jetstore image with the workspace.")
 	}
 	if os.Getenv("JETS_DOMAIN_KEY_HASH_ALGO") == "" && os.Getenv("JETS_DOMAIN_KEY_HASH_SEED") == "" {
-		fmt.Println("Warning: env var JETS_DOMAIN_KEY_HASH_ALGO and JETS_DOMAIN_KEY_HASH_SEED not provided, no hashing of the domain keys will be applied")
+		log.Println("Warning: env var JETS_DOMAIN_KEY_HASH_ALGO and JETS_DOMAIN_KEY_HASH_SEED not provided, no hashing of the domain keys will be applied")
 	}
 	dBMinCapacity := 0.5
 	if os.Getenv("JETS_DB_MIN_CAPACITY") != "" {
+		var err error
 		dBMinCapacity, err = strconv.ParseFloat(os.Getenv("JETS_DB_MIN_CAPACITY"), 64)
 		if err != nil {
 			hasErr = true
@@ -757,15 +803,15 @@ func main() {
 	}
 	if hasErr {
 		for _, msg := range errMsg {
-			fmt.Println("**", msg)
+			log.Println("**", msg)
 		}
-		os.Exit(1)
+		log.Panic("Terminated due to missing or invalid env variables")
 	}
 	if os.Getenv("JETS_STACK_ID") == "" && os.Getenv("JETS_STACK_SUFFIX") != "" {
-		fmt.Println("Warning: only one of env var JETS_STACK_ID and JETS_STACK_SUFFIX is provided, expecting both to be provided or none")
+		log.Println("Warning: only one of env var JETS_STACK_ID and JETS_STACK_SUFFIX is provided, expecting both to be provided or none")
 	}
 	if os.Getenv("JETS_STACK_ID") != "" && os.Getenv("JETS_STACK_SUFFIX") == "" {
-		fmt.Println("Warning: only one of env var JETS_STACK_ID and JETS_STACK_SUFFIX is provided, expecting both to be provided or none")
+		log.Println("Warning: only one of env var JETS_STACK_ID and JETS_STACK_SUFFIX is provided, expecting both to be provided or none")
 	}
 
 	app := awscdk.NewApp(nil)

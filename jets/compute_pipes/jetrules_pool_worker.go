@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"log"
 	"maps"
 	"runtime/debug"
@@ -20,19 +19,20 @@ import (
 // Worker to perform jetrules execute rules function
 
 type JrPoolWorker struct {
-	config               *JetrulesSpec
-	source               *InputChannel
-	rdfType2Columns      map[string][]string
-	multiValueProperties map[string]bool
-	column2RdfType       map[string]string
-	ruleEngine           JetRuleEngine
-	errorCount           int
-	nbrReteSessionsSaved int
-	errorOutputCh        *OutputChannel
-	outputChannels       []*JetrulesOutputChan
-	done                 chan struct{}
-	errCh                chan error
-	builderContext       *BuilderContext
+	config                   *JetrulesSpec
+	source                   *InputChannel
+	rdfType2Columns          map[string][]string
+	multiValueDataProperties map[string]bool
+	objectProperties         map[string]bool
+	column2RdfType           map[string]string
+	ruleEngine               JetRuleEngine
+	errorCount               int
+	nbrReteSessionsSaved     int
+	errorOutputCh            *OutputChannel
+	outputChannels           []*JetrulesOutputChan
+	done                     chan struct{}
+	errCh                    chan error
+	builderContext           *BuilderContext
 }
 
 func (ctx *BuilderContext) NewJrPoolWorker(config *JetrulesSpec, source *InputChannel, rdfType2Columns map[string][]string,
@@ -41,15 +41,24 @@ func (ctx *BuilderContext) NewJrPoolWorker(config *JetrulesSpec, source *InputCh
 
 	// Prepare a map of the multi-value properties for the output channels, to ensure proper cardinality.
 	mvProperties := make(map[string]bool)
+	objProperties := make(map[string]bool)
 	var column2RdfType map[string]string
 	for _, outChannel := range outputChannels {
-		pm, err := GetMultiValueProperties(outChannel.ClassName)
+		pm, err := GetMultiValueDataProperties(outChannel.ClassName)
 		if err != nil {
-			log.Println("Error getting multi-value properties for class", outChannel.ClassName, ":", err)
+			log.Println("Error getting multi-value data properties for class", outChannel.ClassName, ":", err)
 			continue
 		}
 		for _, prop := range pm {
 			mvProperties[prop] = true
+		}
+		op, err := GetObjectProperties(outChannel.ClassName)
+		if err != nil {
+			log.Println("Error getting object properties for class", outChannel.ClassName, ":", err)
+			continue
+		}
+		for _, prop := range op {
+			objProperties[prop] = true
 		}
 		p2t, err := GetDataPropertyRdfType(outChannel.ClassName)
 		if err != nil {
@@ -68,17 +77,18 @@ func (ctx *BuilderContext) NewJrPoolWorker(config *JetrulesSpec, source *InputCh
 
 	// log.Println("New Pool Worker Created")
 	return &JrPoolWorker{
-		config:               config,
-		source:               source,
-		ruleEngine:           re,
-		errorOutputCh:        errorOutputCh,
-		outputChannels:       outputChannels,
-		done:                 done,
-		errCh:                errCh,
-		rdfType2Columns:      rdfType2Columns,
-		multiValueProperties: mvProperties,
-		column2RdfType:       column2RdfType,
-		builderContext:       ctx,
+		config:                   config,
+		source:                   source,
+		ruleEngine:               re,
+		errorOutputCh:            errorOutputCh,
+		outputChannels:           outputChannels,
+		done:                     done,
+		errCh:                    errCh,
+		rdfType2Columns:          rdfType2Columns,
+		multiValueDataProperties: mvProperties,
+		objectProperties:         objProperties,
+		column2RdfType:           column2RdfType,
+		builderContext:           ctx,
 	}
 }
 
@@ -150,6 +160,7 @@ func (ctx *JrPoolWorker) executeRules(inputRecords *[]any,
 	var reteSession JetReteSession
 	var inputAsserted bool
 	var ruleFileNames []string
+	// var ctor TripleIterator
 	isDebug := ctx.config.IsDebug
 	// Create the rdf session
 	rdfSession, err := re.NewRdfSession()
@@ -290,25 +301,25 @@ func (ctx *JrPoolWorker) executeRules(inputRecords *[]any,
 		reteSession.Release()
 	}
 
-	// Print rdf session if in debug mode
-	if isDebug {
-		log.Println("Execute Rules Completed")
-		// 	//************************
-		// 	log.Println("************************")
-		// 	ctor := rdfSession.Find()
-		// 	for !ctor.IsEnd() {
-		// 		s := ctor.GetSubject()
-		// 		p := ctor.GetPredicate()
-		// 		o := ctor.GetObject()
-		// 		log.Printf("triple: (%v, %v, %v)", s, p, o)
-		// 		ctor.Next()
-		// 	}
-		// 	log.Println("************************")
-	}
+	// // Print rdf session if in debug mode
+	// // if isDebug {
+	// 	log.Println("Execute Rules Completed")
+	// 		//************************
+	// 		log.Println("************************")
+	// 		ctor = rdfSession.Find()
+	// 		for !ctor.IsEnd() {
+	// 			s := ctor.GetSubject()
+	// 			p := ctor.GetPredicate()
+	// 			o := ctor.GetObject()
+	// 			log.Printf("triple: (%v, %v, %v)", s, p, o)
+	// 			ctor.Next()
+	// 		}
+	// 		log.Println("************************")
+	// // }
 
 	// Extract data from the rdf session based on class names
 	for _, outChannel := range ctx.outputChannels {
-		err = ctx.extractSessionData(rdfSession, outChannel)
+		err = ctx.extractSessionData(rdfSession, outChannel, outChannel.OutputCh.Config)
 		if err != nil {
 			cpErr = fmt.Errorf(
 				"while extraction entity from jetrules for class %s: %v",
@@ -334,126 +345,158 @@ gotError:
 	return cpErr
 }
 
+func keepObjectForCurrentSourcePeriod(rdfSession JetRdfSession, subject RdfNode) (bool, error) {
+	// Check if subject is an entity for the current source period
+	// i.e. is not an historical entity comming from the lookback period
+	// We don't extract historical entities but only one from the current source period
+	// identified with jets:source_period_sequence == 0 or
+	// entities created during the rule session, identified with jets:source_period_sequence is null.
+	// Additional Measure: entities with jets:source_period_sequence == 0, must have jets:InputRecord
+	// as rdf:type to ensure it's a mapped entity and not an injected entity.
+	// Note: Do not save the jets:InputRecord marker type on the extracted obj.
+	var sourcePeriod int
+	var err error
+	keepObj := true
+	jr := rdfSession.JetResources()
+	obj := rdfSession.GetObject(subject, jr.Jets__source_period_sequence)
+	if obj != nil && obj.Value() != nil {
+		switch v := GetRdfNodeValue(obj).(type) {
+		case int:
+			sourcePeriod = v
+		case string:
+			sourcePeriod, err = strconv.Atoi(v)
+			if err != nil {
+				// invalid source period sequence value, don't extract the obj
+				log.Printf("warning: invalid jets:source_period_sequence value for subject %s, expected int, got string: %s, skipping obj extraction",
+					subject, v)
+				keepObj = false
+				sourcePeriod = -1
+			}
+		default:
+			// invalid source period sequence value, don't extract the obj
+			log.Printf("warning: invalid jets:source_period_sequence value for subject %s, expected int, got %v (%T), skipping obj extraction",
+				subject, GetRdfNodeValue(obj), GetRdfNodeValue(obj))
+			keepObj = false
+			sourcePeriod = -1
+		}
+		if sourcePeriod == 0 {
+			// Check if obj has marker type jets:InputRecord, extract obj if it does.
+			if !rdfSession.Contains(subject, jr.Rdf__type, jr.Jets__input_record) {
+				// jets:InputRecord marker is missing, don't extract the obj
+				keepObj = false
+			}
+		} else {
+			keepObj = false
+		}
+	}
+	// log.Printf("*** keepObject? subject: %s, sourcePeriod: %d, keepObj: %v", subject, sourcePeriod, keepObj)
+	return keepObj, err
+}
+
+func (ctx *JrPoolWorker) extractLiteralValue(rdfSession JetRdfSession, subject, predicate RdfNode,
+	currentSourcePeriod int, outChannel *JetrulesOutputChan) any {
+	var data any
+	var dataArr []any
+	var isArray bool
+	pname := predicate.String()
+	switch pname {
+	case "jets:source_period_sequence":
+		// Set the current source period to the extracted data based on the value in the rdf session
+		data = currentSourcePeriod
+	case "rdf:type":
+		// Special handling for rdf:type, keep only the asserted rdf:type, which is the channel's class name
+		data = []any{outChannel.ClassName}
+	default:
+		data = nil
+		isArray = false
+		itor := rdfSession.FindSP(subject, predicate)
+		for !itor.IsEnd() {
+			value := GetRdfNodeValue(itor.GetObject())
+			if data == nil {
+				data = value
+			} else {
+				if isArray {
+					dataArr = append(dataArr, value)
+				} else {
+					dataArr = []any{data, value}
+					isArray = true
+				}
+			}
+			itor.Next()
+		}
+		itor.Release()
+		if ctx.multiValueDataProperties[pname] {
+			if isArray {
+				data = dataArr
+			} else {
+				data = []any{data}
+			}
+		} else {
+			if isArray {
+				// If the data property is of type text, then keep as array
+				if ctx.column2RdfType[pname] == "text" {
+					data = dataArr
+				} else {
+					// Report the first 20 as error, set to null
+					if ctx.errorOutputCh != nil && ctx.errorCount < 20 {
+						peRow := ctx.builderContext.NewProcessError()
+						peRow.ErrorMessage = fmt.Sprintf("property %s is not multi-value but has multiple values for subject %s, setting value to null", pname, subject)
+						peRow.write2Chan(ctx.errorOutputCh, ctx.done)
+						ctx.errorCount += 1
+						log.Printf("warning: property %s is not multi-value but has multiple values for subject %s, setting value to null", pname, subject)
+					} else {
+						if ctx.config.IsDebug {
+							log.Printf("warning: property %s is not multi-value but has multiple values for subject %s, setting value to null", pname, subject)
+						}
+					}
+					data = nil
+				}
+			}
+		}
+	}
+	return data
+}
+
 func (ctx *JrPoolWorker) extractSessionData(rdfSession JetRdfSession,
-	outChannel *JetrulesOutputChan) error {
+	outChannel *JetrulesOutputChan, config *ChannelSpec) error {
 
 	jr := rdfSession.JetResources()
 	rm := rdfSession.GetResourceManager()
 	entityCount := 0
-	columns := outChannel.OutputCh.Config.Columns
+	columns := config.Columns
 	var data any
-	var dataArr []any
-	var isArray bool
-	var sourcePeriod, currentSourcePeriod int
+	var keepObj bool
 	var err error
 	isDebug := ctx.config.IsDebug
-	currentSourcePeriod = ctx.config.CurrentSourcePeriod
+	currentSourcePeriod := ctx.config.CurrentSourcePeriod
 
 	// Extract entity by rdf type
-	// log.Println("*** Pool Worker == Extracting entities of class", outChannel.ClassName)
+	if isDebug {
+		log.Printf("*** Pool Worker == Extracting entities of class %s", outChannel.ClassName)
+	}
 	ctor := rdfSession.FindSPO(nil, jr.Rdf__type, rm.NewResource(outChannel.ClassName))
 	for !ctor.IsEnd() {
 		subject := ctor.GetSubject()
-		// Check if subject is an entity for the current source period
-		// i.e. is not an historical entity comming from the lookback period
-		// We don't extract historical entities but only one from the current source period
-		// identified with jets:source_period_sequence == 0 or
-		// entities created during the rule session, identified with jets:source_period_sequence is null.
-		// Additional Measure: entities with jets:source_period_sequence == 0, must have jets:InputRecord
-		// as rdf:type to ensure it's a mapped entity and not an injected entity.
-		// Note: Do not save the jets:InputRecord marker type on the extracted obj.
-		keepObj := true
-		obj := rdfSession.GetObject(subject, jr.Jets__source_period_sequence)
-		if obj != nil && obj.Value() != nil {
-			switch v := GetRdfNodeValue(obj).(type) {
-			case int:
-				sourcePeriod = v
-			case string:
-				sourcePeriod, err = strconv.Atoi(v)
-				if err != nil {
-					// invalid source period sequence value, don't extract the obj
-					log.Printf("warning: invalid jets:source_period_sequence value for subject %s, expected int, got string: %s, skipping obj extraction",
-						subject, v)
-					keepObj = false
-					sourcePeriod = -1
-				}
-			default:
-				// invalid source period sequence value, don't extract the obj
-				log.Printf("warning: invalid jets:source_period_sequence value for subject %s, expected int, got %v (%T), skipping obj extraction",
-					subject, GetRdfNodeValue(obj), GetRdfNodeValue(obj))
-				keepObj = false
-				sourcePeriod = -1
-			}
-			if sourcePeriod == 0 {
-				// Check if obj has marker type jets:InputRecord, extract obj if it does.
-				if !rdfSession.Contains(subject, jr.Rdf__type, jr.Jets__input_record) {
-					// jets:InputRecord marker is missing, don't extract the obj
-					keepObj = false
-				}
-			} else {
-				keepObj = false
-			}
+		keepObj, err = keepObjectForCurrentSourcePeriod(rdfSession, subject)
+		if err != nil {
+			log.Printf("error: failed to determine if object should be kept for subject %s: %v", subject, err)
+			ctor.Next()
+			continue
 		}
 		// extract entity if we keep it (i.e. not an historical entity)
 		if keepObj {
+			// log.Printf("*** Extracting entity for subject %s", subject)
 			entityRow := make([]any, len(columns))
+			// log.Printf("*** Extracting DEFAULT encoding for subject %s", subject)
 			for i, p := range columns {
-				switch p {
-				case "jets:source_period_sequence":
-					// Set the current source period to the extracted data based on the value in the rdf session
-					data = currentSourcePeriod
-				case "rdf:type":
-					// Special handling for rdf:type, keep only the asserted rdf:type, which is the channel's class name
-					data = []any{outChannel.ClassName}
-				default:
-					data = nil
-					isArray = false
-					itor := rdfSession.FindSP(subject, rm.NewResource(p))
-					for !itor.IsEnd() {
-						value := GetRdfNodeValue(itor.GetObject())
-						if data == nil {
-							data = value
-						} else {
-							if isArray {
-								dataArr = append(dataArr, value)
-							} else {
-								dataArr = []any{data, value}
-								isArray = true
-							}
-						}
-						itor.Next()
-					}
-					itor.Release()
-					if ctx.multiValueProperties[p] {
-						if isArray {
-							data = dataArr
-						} else {
-							data = []any{data}
-						}
-					} else {
-						if isArray {
-							// If the data property is of type text, then keep as array
-							if ctx.column2RdfType[p] == "text" {
-								data = dataArr
-							} else {
-								// Report the first 20 as error, set to null
-								if ctx.errorOutputCh != nil && ctx.errorCount < 20 {
-									peRow := ctx.builderContext.NewProcessError()
-									peRow.ErrorMessage = fmt.Sprintf("property %s is not multi-value but has multiple values for subject %s, setting value to null", p, subject)
-									peRow.write2Chan(ctx.errorOutputCh, ctx.done)
-									ctx.errorCount += 1
-									log.Printf("warning: property %s is not multi-value but has multiple values for subject %s, setting value to null", p, subject)
-								} else {
-									if ctx.config.IsDebug {
-										log.Printf("warning: property %s is not multi-value but has multiple values for subject %s, setting value to null", p, subject)
-									}
-								}
-								data = nil
-							}
-						}
-					}
+				specialEncoding := outChannel.JrColumnEncodings[p]
+				if specialEncoding != nil {
+					// Special encoding for this column, extract the entire object as a json/toon/map[string]any
+					entityRow[i] = specialEncoding.EncodeColumnData(rdfSession, subject)
+				} else {
+					data = ctx.extractLiteralValue(rdfSession, subject, rm.NewResource(p), currentSourcePeriod, outChannel)
+					entityRow[i] = data
 				}
-				entityRow[i] = data
 			}
 			// Apply the TransformationColumn, these are const values
 			// NOTE there is no initialize and done called on the column evaluators
@@ -468,7 +511,7 @@ func (ctx *JrPoolWorker) extractSessionData(rdfSession JetRdfSession,
 				}
 			}
 			// Send the record to output channel
-			// log.Println("*** Extracted ENTITY_ROW:", entityRow)
+			// log.Printf("*** Extracted ENTITY_ROW: %v", entityRow)
 			select {
 			case outChannel.OutputCh.Channel <- entityRow:
 				entityCount += 1
@@ -480,6 +523,7 @@ func (ctx *JrPoolWorker) extractSessionData(rdfSession JetRdfSession,
 		ctor.Next()
 	}
 	ctor.Release()
+	// log.Printf("*** jetrules: Extracted %d entities for class %s", entityCount, outChannel.ClassName)
 	if isDebug {
 		log.Printf("jetrules: Extracted %d entities for class %s", entityCount, outChannel.ClassName)
 	}
@@ -532,7 +576,7 @@ func assertInputRow(config *JetrulesSpec, rdfSession JetRdfSession, row *[]any, 
 	var ok bool
 	jetsKey, ok = (*row)[0].(string)
 	if !ok {
-		jetsKey = computeRowHash((*row)[3:], config.CurrentSourcePeriod)
+		jetsKey = ComputeRowHash((*row)[3:], config.CurrentSourcePeriod)
 	}
 
 	rdfTypes, ok = (*row)[1].([]any)
@@ -637,51 +681,6 @@ nextField:
 		}
 	}
 	return
-}
-
-func computeRowHash(row []any, sourcePeriod int) string {
-	// Compute a hash for the row, to be used as jets:key when it's not provided in the input data
-	// The hash is computed on the concatenation of the string representation of the values in the row and the source period, to avoid having the same hash for the same row in different source periods
-	hasher := fnv.New64a()
-	// Add sourcePeriod in row_hash calculation so if same record in input
-	// for 2 different period, they get different jets:key
-	hasher.Write([]byte(strconv.Itoa(sourcePeriod)))
-	for _, v := range row {
-		if v == nil {
-			continue
-		}
-		switch vv := v.(type) {
-		case string:
-			hasher.Write([]byte(vv))
-		case int:
-			hasher.Write([]byte(strconv.Itoa(vv)))
-		case float64:
-			hasher.Write([]byte(strconv.FormatFloat(vv, 'f', -1, 64)))
-		case uint:
-			hasher.Write([]byte(strconv.FormatUint(uint64(vv), 10)))
-		case time.Time:
-			if vv.Hour() == 0 && vv.Minute() == 0 && vv.Second() == 0 {
-				// Date, format as 2006-01-02
-				hasher.Write([]byte(vv.Format("2006-01-02")))
-			} else {
-				// Datetime, format as 2006-01-02T15:04:05
-				hasher.Write([]byte(vv.Format("2006-01-02T15:04:05")))
-			}
-		case int64:
-			hasher.Write([]byte(strconv.FormatInt(vv, 10)))
-		case uint64:
-			hasher.Write([]byte(strconv.FormatUint(vv, 10)))
-		case int32:
-			hasher.Write([]byte(strconv.FormatInt(int64(vv), 10)))
-		case uint32:
-			hasher.Write([]byte(strconv.FormatUint(uint64(vv), 10)))
-		case float32:
-			hasher.Write([]byte(strconv.FormatFloat(float64(vv), 'f', -1, 32)))
-		default:
-			hasher.Write([]byte(fmt.Sprintf("%v", vv)))
-		}
-	}
-	return fmt.Sprintf("%016x", hasher.Sum64())
 }
 
 func NewRdfNode(inValue any, re JetResourceManager) (RdfNode, error) {

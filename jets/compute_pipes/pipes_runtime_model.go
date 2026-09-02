@@ -6,7 +6,7 @@ import (
 	"log"
 	"sync"
 
-	"github.com/jackc/pgx/v4/pgxpool"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // This file contains the Compute Pipes runtime data structures
@@ -316,6 +316,9 @@ func (ctx *BuilderContext) BuildPipeTransformationEvaluator(source *InputChannel
 
 	case "jetrules":
 		return ctx.NewJetrulesTransformationPipe(source, outCh, spec)
+
+	case "ollama":
+		return ctx.NewOllamaTransformationPipe(source, outCh, spec)
 
 	case "analyze":
 		return ctx.NewAnalyzeTransformationPipe(source, outCh, spec)
