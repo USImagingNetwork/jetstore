@@ -9,15 +9,17 @@ import (
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/artisoft-io/jetstore/jets/awsi"
+	"github.com/artisoft-io/jetstore/jets/utils"
 	"github.com/artisoft-io/jetstore/jets/workspace"
-	"github.com/jackc/pgx/v4"
-	"github.com/jackc/pgx/v4/pgxpool"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 )
 
@@ -333,14 +335,33 @@ func (ca *CommandArguments) RunReports(dbpool *pgxpool.Pool) (returnedErr error)
 	return nil
 }
 
+// confineReportPath verifies that reportScriptPath, after resolving to an
+// absolute path, stays within the workspace reports directory, mitigating
+// external control of file name or path (CWE-73). The report script names come
+// from the report directives config, which is externally controlled.
+func confineReportPath(reportScriptPath string) (string, error) {	
+	baseDir := filepath.Join(workspaceHome, wprefix, "reports")
+	filePath, err := utils.ConfineFilePath(baseDir, reportScriptPath)
+	if err != nil {
+		return "", err
+	}
+	return filePath, nil
+}
+
 // Support Functions
 func (ca *CommandArguments) runSqlScriptDelegate(dbpool *pgxpool.Pool, reportScriptPath string) error {
 
+	// Confine the report script path within the workspace reports directory (CWE-73)
+	safePath, err := confineReportPath(reportScriptPath)
+	if err != nil {
+		return err
+	}
+
 	// Read the sql script
-	file, err := os.ReadFile(reportScriptPath)
+	file, err := os.ReadFile(safePath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			fmt.Println("Error sql Script not found:", reportScriptPath)
+			log.Println("Error sql Script not found:", reportScriptPath)
 		}
 		return err
 	}
@@ -374,11 +395,17 @@ func (ca *CommandArguments) runSqlScriptDelegate(dbpool *pgxpool.Pool, reportScr
 
 func (ca *CommandArguments) runReportsDelegate(dbpool *pgxpool.Pool, tempDir string, reportScriptPath string, updatedKeys *[]string) error {
 
+	// Confine the report script path within the workspace reports directory (CWE-73)
+	safePath, err := confineReportPath(reportScriptPath)
+	if err != nil {
+		return err
+	}
+
 	// Get the report definitions
-	file, err := os.Open(reportScriptPath)
+	file, err := os.Open(safePath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			log.Printf("Report definitions file %s does not exist, skipping", reportScriptPath)
+			log.Printf("Report definitions file %s (safe path: %s) does not exist, skipping", reportScriptPath, safePath)
 			return nil
 		}
 		return fmt.Errorf("error while opening report definitions file %s: %v", reportScriptPath, err)
@@ -529,8 +556,8 @@ func (ca *CommandArguments) DoReport(dbpool *pgxpool.Pool, tempDir string, outpu
 		// Check if a specific kms is specified in the deployment, if so do not use the aws_s3 plug in
 		// since it does not support custom kms key but uses the default kms key of the account
 		//TODO Add support for json with custom kms key in DoCsvReport ***
-		// when UseQueryExportToS3 && is true, we use the aws_s3.query_export_to_s3 function to export the report directly to s3, this is more efficient and should be preferred when possible, 
-		// but it does not support using a custom kms key for encryption, 
+		// when UseQueryExportToS3 && is true, we use the aws_s3.query_export_to_s3 function to export the report directly to s3, this is more efficient and should be preferred when possible,
+		// but it does not support using a custom kms key for encryption,
 		// in that case we fall back to DoCsvReport which saves the report locally and then upload to s3 with the custom kms key
 		// The UseQueryExportToS3 setting is an override for case when the provided KMS key is the default S3 KMS key of the account.
 		if len(os.Getenv("JETS_S3_KMS_KEY_ARN")) > 0 && !reportDirectives.UseQueryExportToS3 && outputFormat == "csv" {
@@ -544,20 +571,18 @@ func (ca *CommandArguments) DoReport(dbpool *pgxpool.Pool, tempDir string, outpu
 			escapedStmt := strings.ReplaceAll(stmt, "'", "''")
 			s3Stmt := fmt.Sprintf("SELECT * from aws_s3.query_export_to_s3('%s', '%s', '%s','%s',options:='%s')",
 				escapedStmt, ca.BucketName, s3FileName, ca.RegionName, options)
-			// fmt.Println("S3 QUERY:", s3Stmt)
+			// log.Println("S3 QUERY:", s3Stmt)
 			var rowsUploaded, filesUploaded, bytesUploaded sql.NullInt64
 			err := dbpool.QueryRow(context.Background(), s3Stmt).Scan(&rowsUploaded, &filesUploaded, &bytesUploaded)
 			if err != nil {
 				return "", fmt.Errorf("while executing s3 query %s: %v", escapedStmt, err)
 			}
-			fmt.Println("Report:", name, "rowsUploaded", rowsUploaded.Int64, "filesUploaded", filesUploaded.Int64, "bytesUploaded", bytesUploaded.Int64)
+			log.Println("Report:", name, "rowsUploaded", rowsUploaded.Int64, "filesUploaded", filesUploaded.Int64, "bytesUploaded", bytesUploaded.Int64)
 		}
 	default:
 		// Report not saved to s3, probably as as table (see below)
 		log.Printf("Report %s not saved to s3", *outputFileName)
 	}
-
-	fmt.Println("------")
 
 	return s3FileName, nil
 }

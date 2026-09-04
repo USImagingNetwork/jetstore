@@ -10,7 +10,7 @@ import (
 	"strings"
 
 	"github.com/artisoft-io/jetstore/jets/utils"
-	"github.com/jackc/pgx/v4/pgxpool"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func (args *StartComputePipesArgs) StartReducingComputePipes(ctx context.Context, dbpool *pgxpool.Pool) (ComputePipesRun, error) {
@@ -18,8 +18,9 @@ func (args *StartComputePipesArgs) StartReducingComputePipes(ctx context.Context
 	var err error
 	// validate the args
 	if args.FileKey == "" || args.SessionId == "" || args.StepId == nil {
-		log.Println("error: missing file_key or session_id or step_id as input args of StartComputePipes (reducing mode)")
-		return result, fmt.Errorf("error: missing file_key or session_id or step_id as input args of StartComputePipes (reducing mode)")
+		err = fmt.Errorf("error: missing file_key or session_id or step_id as input args of StartReducingComputePipes (reducing mode)")
+		log.Println(err)
+		return result, err
 	}
 	cpipesStartup, err := args.reducingInitializeCpipes(ctx, dbpool)
 	if err != nil {
@@ -219,7 +220,7 @@ startStepId:
 		}
 	} else {
 		// Get the columns from the channel spec
-		chSpec := GetChannelSpec(cpipesStartup.CpConfig.Channels, inputChannel)
+		chSpec := cpipesStartup.CpConfig.GetChannelSpec(inputChannel)
 		if chSpec != nil {
 			cpipesStartup.InputColumns = chSpec.Columns
 		}

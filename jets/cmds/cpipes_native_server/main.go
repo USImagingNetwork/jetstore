@@ -12,7 +12,8 @@ import (
 	"github.com/artisoft-io/jetstore/jets/compute_pipes"
 	"github.com/artisoft-io/jetstore/jets/compute_pipes/jetrules_go_adaptor"
 	"github.com/artisoft-io/jetstore/jets/compute_pipes/jetrules_native_adaptor"
-	"github.com/jackc/pgx/v4/pgxpool"
+	"github.com/artisoft-io/jetstore/jets/utils"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // Compute Pipe Node Executor as a Container Server
@@ -26,7 +27,6 @@ import (
 // JETS_BUCKET
 // JETS_DSN_SECRET
 // JETS_REGION
-// NBR_SHARDS default nbr_nodes of cluster
 // JETS_S3_KMS_KEY_ARN
 // JETS_DB_POOL_SIZE
 
@@ -37,8 +37,9 @@ var awsBucket string
 var dsn string
 
 type JetRulesProxyImpl struct {
-	defaultFactory     compute_pipes.JetRulesFactory
+	defaultFactory compute_pipes.JetRulesFactory
 }
+
 func (j *JetRulesProxyImpl) GetDefaultFactory() compute_pipes.JetRulesFactory {
 	return j.defaultFactory
 }
@@ -50,8 +51,9 @@ func (j *JetRulesProxyImpl) GetNativeFactory() compute_pipes.JetRulesFactory {
 }
 
 func main() {
+	utils.UseJetStoreLogger()
 	args := os.Args[1]
-	fmt.Println("CMD LINE ARGS:", args)
+	log.Println("CMD LINE ARGS:", args)
 
 	hasErr := false
 	var errMsg []string
@@ -90,12 +92,14 @@ func main() {
 	var cpArgs compute_pipes.ComputePipesNodeArgs
 	err = json.Unmarshal([]byte(args), &cpArgs)
 	if err != nil {
+		hasErr = true
 		errMsg = append(errMsg, fmt.Sprintf("while unmarshaling command line json (arguments): %s", err))
 	}
 
 	// open db connection
-	dbpool, err := pgxpool.Connect(context.Background(), dsn)
+	dbpool, err := pgxpool.New(context.Background(), dsn)
 	if err != nil {
+		hasErr = true
 		errMsg = append(errMsg, fmt.Sprintf("while opening db connection: %s", err))
 	}
 	defer dbpool.Close()
@@ -108,11 +112,11 @@ func main() {
 
 	if hasErr {
 		for _, msg := range errMsg {
-			fmt.Println("**", msg)
+			log.Println("**", msg)
 		}
-		panic("Invalid argument(s)")
+		log.Panic("Invalid argument(s)")
 	}
-	
+
 	jrProxy := &JetRulesProxyImpl{
 		defaultFactory: jetrules_native_adaptor.NewJetRulesFactory(),
 	}

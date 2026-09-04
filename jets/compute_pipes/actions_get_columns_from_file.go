@@ -12,7 +12,7 @@ import (
 
 	"github.com/artisoft-io/jetstore/jets/awsi"
 	"github.com/artisoft-io/jetstore/jets/csv"
-	"github.com/artisoft-io/jetstore/jets/datatable/jcsv"
+	"github.com/artisoft-io/jetstore/jets/utils/jcsv"
 )
 
 // This file contains functions to fetch a file from s3 and read it's columns header.
@@ -27,8 +27,8 @@ type FetchFileInfoResult struct {
 }
 
 // Main function
-func FetchHeadersAndDelimiterFromFile(externalBucket, fileKey, fileFormat, compression, encoding string, delimitor rune,
-	multiColumnsInput, noQuotes, fetchHeaders, fetchDelimitor, fetchEncoding, detectCrAsEol bool, fileFormatDataJson string) (*FetchFileInfoResult, error) {
+func FetchHeadersAndDelimiterFromFile(externalBucket, fileKey string, firstKeyFileSize int64, fileFormat, compression, encoding string, delimitor rune,
+	multiColumnsInput, noQuotes, fetchHeaders, fetchDelimitor, fetchEncoding, detectCrAsEol, failOnEmptyColumnName bool, fileFormatDataJson string) (*FetchFileInfoResult, error) {
 	var fileHd *os.File
 	var err error
 	var sepFlag jcsv.Chartype
@@ -46,7 +46,6 @@ func FetchHeadersAndDelimiterFromFile(externalBucket, fileKey, fileFormat, compr
 	if err != nil {
 		return nil, fmt.Errorf("failed to open temp file: %v", err)
 	}
-	// fmt.Println("Temp error file name:", fileHd.Name())
 	defer func() {
 		if fileHd != nil {
 			fn := fileHd.Name()
@@ -54,13 +53,13 @@ func FetchHeadersAndDelimiterFromFile(externalBucket, fileKey, fileFormat, compr
 			os.Remove(fn)
 		}
 	}()
-	if externalBucket == "" {
+	if externalBucket == "" || externalBucket == "jetstore_bucket" {
 		externalBucket = bucketName
 	}
 	var byteRange *string
 	switch fileFormat {
 	case "csv", "headerless_csv", "fixed_width":
-		if compression == "none" {
+		if compression == "none" && firstKeyFileSize > 50000 {
 			s := "bytes=0-50000"
 			byteRange = &s
 		}
@@ -108,7 +107,7 @@ do_retry:
 		}
 		if fetchHeaders {
 			fileInfo.Headers, err = GetRawHeadersCsv(fileHd, fileKey, fileFormat,
-				compression, fileInfo.SepFlag, fileInfo.Encoding, fileInfo.EolByte, fileInfo.MultiColumns, noQuotes)
+				compression, fileInfo.SepFlag, fileInfo.Encoding, fileInfo.EolByte, fileInfo.MultiColumns, noQuotes, failOnEmptyColumnName)
 		}
 		return fileInfo, err
 
@@ -142,7 +141,7 @@ do_retry:
 			fileName := fileHd.Name()
 			fileHd.Close()
 			fileHd = nil
-			fileInfo.Headers, err = GetRawHeadersXlsx(fileName, fileFormatDataJson)
+			fileInfo.Headers, err = GetRawHeadersXlsx(failOnEmptyColumnName, fileName, fileFormatDataJson)
 			os.Remove(fileName)
 			return fileInfo, err
 		} else {
@@ -158,7 +157,7 @@ do_retry:
 // Get the raw headers from fileHd, put them in *ic
 // Use *sepFlag as the csv delimiter
 func GetRawHeadersCsv(fileHd *os.File, fileName, fileFormat, compression string, sepFlag jcsv.Chartype,
-	encoding string, eolByte byte, multiColumns, noQuotes bool) ([]string, error) {
+	encoding string, eolByte byte, multiColumns, noQuotes, failOnEmptyHeader bool) ([]string, error) {
 	var err error
 	utfReader, err := WrapReaderWithDecoder(WrapReaderWithDecompressor(fileHd, compression), encoding)
 	if err != nil {
@@ -196,15 +195,22 @@ func GetRawHeadersCsv(fileHd *os.File, fileName, fileFormat, compression string,
 		return nil, err
 	}
 	// Make sure we don't have empty names in rawHeaders
-	AdjustFillers(&ic)
-	fmt.Println("Got input columns (rawHeaders) from csv file:", ic)
+	err = AdjustFillers(failOnEmptyHeader, &ic)
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("Got input columns (rawHeaders) from csv file: %d headers, first 3: %v", len(ic), ic[:min(3, len(ic))])
 	return ic, nil
 }
 
-func AdjustFillers(rawHeaders *[]string) {
+func AdjustFillers(failOnEmptyHeader bool, rawHeaders *[]string) error {
 	for i := range *rawHeaders {
 		if (*rawHeaders)[i] == "" {
+			if failOnEmptyHeader {
+				return fmt.Errorf("empty header found at position %d", i+1)
+			}
 			(*rawHeaders)[i] = "FILLER"
 		}
 	}
+	return nil
 }

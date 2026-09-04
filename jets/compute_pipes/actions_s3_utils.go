@@ -14,15 +14,15 @@ import (
 
 	"github.com/artisoft-io/jetstore/jets/awsi"
 	"github.com/artisoft-io/jetstore/jets/utils"
-	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
-	"github.com/jackc/pgx/v4"
-	"github.com/jackc/pgx/v4/pgxpool"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // Common functions and types for s3, rewite of loader's version
 
 var bucketName, regionName, kmsKeyArn string
-var downloader *manager.Downloader
+var downloader *transfermanager.Client
 
 func init() {
 	bucketName = os.Getenv("JETS_BUCKET")
@@ -155,7 +155,7 @@ func GetPartitionSize4LookbackPeriod(bucket, fileKey, lookbackPeriod string, env
 }
 
 // Get the file_key(s) from s3 for the given process/session/step/partition.
-// This is used during the reducing mode.
+// This is used during the reducing mode or merge files only pipeline.
 func GetS3FileKeys(processName, sessionId, mainInputStepId, jetsPartitionLabel string,
 	inputChannelConfig *InputChannelConfig, envSettings map[string]any) ([][]*FileKeyInfo, error) {
 
@@ -282,7 +282,7 @@ func (cpCtx *ComputePipesContext) downloadS3Files(inFolderPath, externalBucket s
 		}
 		return
 	}
-	
+
 	// Regular flow for non generator input channel, need to download the file(s) from s3 and send the file name(s) to the channel
 	inputFormat := inputChannelConfig.Format
 	if strings.HasPrefix(inputFormat, "parquet") {
@@ -346,7 +346,7 @@ func DownloadS3Object(externalBucket string, s3Key *FileKeyInfo, localDir string
 	if err != nil {
 		return "", 0, fmt.Errorf("failed to open temp input file: %v", err)
 	}
-	if externalBucket == "" {
+	if externalBucket == "" || externalBucket == "jetstore_bucket" {
 		externalBucket = bucketName
 	}
 

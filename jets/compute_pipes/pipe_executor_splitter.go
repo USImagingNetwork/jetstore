@@ -21,11 +21,12 @@ type ChannelState struct {
 func (ctx *BuilderContext) StartSplitterPipe(spec *PipeSpec, source *InputChannel, writePartitionsResultCh chan ComputePipesResult) {
 	var cpErr error
 	var wg sync.WaitGroup
+	inputSourceName := source.Name
 	defer func() {
 		// Catch the panic that might be generated downstream
 		if r := recover(); r != nil {
 			var buf strings.Builder
-			fmt.Fprintf(&buf, "StartSplitterPipe: recovered error: %v\n", r)
+			fmt.Fprintf(&buf, "StartSplitterPipe[source: %s]: recovered error: %v\n", inputSourceName, r)
 			buf.WriteString(string(debug.Stack()))
 			cpErr := errors.New(buf.String())
 			ctx.errCh <- cpErr
@@ -38,22 +39,43 @@ func (ctx *BuilderContext) StartSplitterPipe(spec *PipeSpec, source *InputChanne
 		}
 		close(writePartitionsResultCh)
 		// Closing the output channels
-		fmt.Println("SPLITTER: Closing Output Channels")
+		log.Printf("StartSplitterPipe[source: %s]: Closing Output Channels", inputSourceName)
 		oc := make(map[string]bool)
 		for i := range spec.Apply {
 			// Make sure the output chan config is used
 			if len(spec.Apply[i].OutputChannel.Name) > 0 {
 				oc[spec.Apply[i].OutputChannel.Name] = true
 			}
-			if spec.Apply[i].Type == "jetrules" {
+			switch spec.Apply[i].Type {
+			case "jetrules":
 				// Get the output channels of jetrules
 				for j := range spec.Apply[i].JetrulesConfig.OutputChannels {
 					oc[spec.Apply[i].JetrulesConfig.OutputChannels[j].Name] = true
 				}
+				// Get the error output channel of jetrules
+				if spec.Apply[i].JetrulesConfig.ErrorChannel != nil {
+					oc[spec.Apply[i].JetrulesConfig.ErrorChannel.Name] = true
+				}
+
+			case "ollama":
+				// Get the error output channel of ollama
+				if spec.Apply[i].OllamaConfig.ErrorChannel != nil {
+					oc[spec.Apply[i].OllamaConfig.ErrorChannel.Name] = true
+				}
+
+			case "clustering":
+				// Get the output channels of clustering
+				oc[spec.Apply[i].ClusteringConfig.CorrelationOutputChannel.Name] = true
+
+			case "map_record":
+				// Get the error output channel of map_record
+				if spec.Apply[i].MapRecordConfig.ErrorChannel != nil {
+					oc[spec.Apply[i].MapRecordConfig.ErrorChannel.Name] = true
+				}
 			}
 		}
 		for i := range oc {
-			fmt.Println("SPLITTER: Closing Output Channel", i)
+			log.Printf("StartSplitterPipe[source: %s]: Closing Output Channel %s", inputSourceName, i)
 			ctx.channelRegistry.CloseChannel(i)
 		}
 	}()
@@ -67,6 +89,7 @@ func (ctx *BuilderContext) StartSplitterPipe(spec *PipeSpec, source *InputChanne
 	var jetsPartitionKey any
 	var splitOnColumn, splitOnDefault, splitOnHash bool
 	var hashEvaluator *HashEvaluator
+	channelHandlersCount := 0
 
 	if spec.SplitterConfig == nil {
 		cpErr = fmt.Errorf("error: missing splitter_config for splitter with source channel %s", source.Name)
@@ -123,7 +146,7 @@ func (ctx *BuilderContext) StartSplitterPipe(spec *PipeSpec, source *InputChanne
 	}
 	chanState = swiss.NewMap[any, *ChannelState](mapSize)
 
-	// fmt.Println("**!@@ start splitter loop on source:",source.Name)
+	// log.Println("**!@@ start splitter loop on source:",source.Name)
 	for inRow := range source.Channel {
 		baseKey = nil
 		switch {
@@ -173,6 +196,7 @@ func (ctx *BuilderContext) StartSplitterPipe(spec *PipeSpec, source *InputChanne
 				log.Println(ctx.sessionId, "node", ctx.nodeId, "*WARNING* splitter with nil jetsPartitionKey, with source channel", source.Name)
 			}
 			wg.Add(1)
+			channelHandlersCount += 1
 			go ctx.startSplitterChannelHandler(spec, &InputChannel{
 				Channel:        splitCh.data,
 				Columns:        source.Columns,
@@ -206,7 +230,7 @@ func (ctx *BuilderContext) StartSplitterPipe(spec *PipeSpec, source *InputChanne
 			}
 		}
 		// Send the record to the intermediate channel
-		// fmt.Println("**!@@ splitter loop, sending record to intermediate channel:", jetsPartitionKey)
+		// log.Println("**!@@ splitter loop, sending record to intermediate channel:", jetsPartitionKey)
 		select {
 		case splitCh.data <- inRow:
 		case <-ctx.done:
@@ -220,15 +244,18 @@ func (ctx *BuilderContext) StartSplitterPipe(spec *PipeSpec, source *InputChanne
 doneSplitterLoop:
 	// Close all the opened intermediate channels
 	chanState.Iter(func(key any, v *ChannelState) (stop bool) {
-		// fmt.Println("**!@@ startSplitterPipe closing intermediate channel", key)
+		// log.Println("**!@@ startSplitterPipe closing intermediate channel", key)
 		close(v.data)
 		return false
 	})
 	// Close the output channels once all ch handlers are done
-	// fmt.Println("**!@@ Splitter loop done, ABOUT to wait on wg")
+	if ctx.cpConfig.ClusterConfig.IsDebugMode {
+		log.Printf("*** StartSplitterPipe[source: %s]: waiting for %d channel handlers to finish", inputSourceName, channelHandlersCount)
+	}
 	wg.Wait()
-	// fmt.Println("**!@@ Splitter loop done, DONE waiting on wg!")
-	// Closing the output channels via the defer above
+	if ctx.cpConfig.ClusterConfig.IsDebugMode {
+		log.Printf("*** StartSplitterPipe[source: %s]: finished waiting for %d channel handlers", inputSourceName, channelHandlersCount)
+	}
 	// All good!
 	return
 gotError:
@@ -264,7 +291,7 @@ func (ctx *BuilderContext) startSplitterChannelHandler(spec *PipeSpec, source *I
 		}
 		wg.Done()
 	}()
-	// fmt.Println("**!@@ SPLITTER *1 startSplitterChannelHandler ~ Called")
+	// log.Println("**!@@ SPLITTER *1 startSplitterChannelHandler ~ Called")
 	// Build the PipeTransformationEvaluator
 	evaluators = make([]PipeTransformationEvaluator, len(spec.Apply))
 	for j := range spec.Apply {
@@ -276,7 +303,7 @@ func (ctx *BuilderContext) startSplitterChannelHandler(spec *PipeSpec, source *I
 	}
 	// Process the channel
 	for inRow := range source.Channel {
-		// fmt.Println("**!@@ SPLITTER *1 startSplitterChannelHandler ~ Processing row:", inRow)
+		// log.Println("**!@@ SPLITTER *1 startSplitterChannelHandler ~ Processing row:", inRow)
 		for i := range evaluators {
 			if evaluators[i] != nil {
 				err = evaluators[i].Apply(&inRow)
@@ -303,7 +330,7 @@ func (ctx *BuilderContext) startSplitterChannelHandler(spec *PipeSpec, source *I
 			evaluators[i].Finally()
 		}
 	}
-	// fmt.Println("**!@@ SPLITTER *1 startSplitterChannelHandler ~ All good!")
+	// log.Println("**!@@ SPLITTER *1 startSplitterChannelHandler ~ All good!")
 	// All good!
 	return
 

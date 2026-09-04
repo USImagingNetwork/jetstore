@@ -19,8 +19,8 @@ import (
 	"github.com/artisoft-io/jetstore/jets/user"
 	"github.com/artisoft-io/jetstore/jets/workspace"
 	"github.com/gorilla/mux"
-	"github.com/jackc/pgx/v4"
-	"github.com/jackc/pgx/v4/pgxpool"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 )
 
@@ -69,8 +69,11 @@ func corsh(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// DEV
 		// log.Println("* cors for",r.URL.Path,", Origin Header:", r.Header.Get("Origin"))
-		//* check that origin is what we expect
-		w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
+		// Check that origin is what we expect
+		origin := sanitizeOrigin(r.Header.Get("Origin"))
+		if origin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+		}
 		next(w, r)
 	}
 }
@@ -85,14 +88,16 @@ type OptionConfig struct {
 func (optionConfig OptionConfig) options(w http.ResponseWriter, r *http.Request) {
 	// // for devel
 	// log.Println("* Options for", r.URL, "method:",r.Method)
-
-	// write cors headers
-	//* TODO check that origin is what we expect
-	//
 	// for key, value := range r.Header {
 	// 	log.Println("OptionConfig: ",key,value)
 	// }
-	w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
+	
+	// write cors headers
+	// Check that origin is what we expect
+	origin := sanitizeOrigin(r.Header.Get("Origin"))
+	if origin != "" {
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+	}
 	if len(optionConfig.AllowedMethods) > 0 {
 		w.Header().Set("Access-Control-Allow-Methods", optionConfig.AllowedMethods)
 	}
@@ -365,7 +370,7 @@ func listenAndServe() error {
 			return fmt.Errorf("while getting dsn from aws secret: %v", err)
 		}
 	}
-	server.dbpool, err = pgxpool.Connect(context.Background(), *dsn)
+	server.dbpool, err = pgxpool.New(context.Background(), *dsn)
 	if err != nil {
 		return fmt.Errorf("while opening db connection: %v", err)
 	}
@@ -536,6 +541,15 @@ func listenAndServe() error {
 	server.Router.HandleFunc("/purgeData", purgeDataOptions.options).Methods("OPTIONS")
 	server.Router.HandleFunc("/purgeData", jsonh(corsh(authh(server.DoPurgeDataAction)))).Methods("POST")
 
+	// InferServer route
+	// Note: authh validates the token only; the infer_server_admin capability is checked
+	// inside DoInferServerAction.
+	inferServerOptions := OptionConfig{Origin: "",
+		AllowedMethods: "POST, OPTIONS",
+		AllowedHeaders: "Content-Type, Authorization"}
+	server.Router.HandleFunc("/inferServer", inferServerOptions.options).Methods("OPTIONS")
+	server.Router.HandleFunc("/inferServer", jsonh(corsh(authh(server.DoInferServerAction)))).Methods("POST")
+
 	// //* Currently not used
 	// //* TODO add options and corrs check - Users routes
 	// // server.Router.HandleFunc("/register", jsonh(server.CreateUser)).Methods("POST")
@@ -587,8 +601,18 @@ func listenAndServe() error {
 	}
 
 	log.Println("Listening to address ", serverAddr)
+	// Configure the HTTP server with explicit timeouts to mitigate slow-client
+	// (Slowloris) denial-of-service attacks (CWE-676 / OWASP Security Misconfiguration).
+	httpServer := &http.Server{
+		Addr:              serverAddr,
+		Handler:           server.Router,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      120 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 	if *usingSshTunnel {
-		return http.ListenAndServe(serverAddr, server.Router)
+		return httpServer.ListenAndServe()
 	} else {
 		err = GenerateCert()
 		if err != nil {
@@ -596,7 +620,7 @@ func listenAndServe() error {
 			log.Println(err)
 			return err
 		}
-		return http.ListenAndServeTLS(serverAddr, "cert.pem", "key.pem", server.Router)
+		return httpServer.ListenAndServeTLS("cert.pem", "key.pem")
 	}
 }
 
@@ -626,7 +650,7 @@ func (server *Server) GetLastSecretRotation() (tm *time.Time, err error) {
 				}
 				// reset the db connection
 				server.dbpool.Close()
-				server.dbpool, err = pgxpool.Connect(context.Background(), *dsn)
+				server.dbpool, err = pgxpool.New(context.Background(), *dsn)
 				if err != nil {
 					err = fmt.Errorf("while re-opening db connection in GetLastSecretRotation: %v", err)
 					log.Println(err)

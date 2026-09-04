@@ -2,6 +2,7 @@ package compute_pipes
 
 import (
 	"fmt"
+	"log"
 	"os"
 
 	"github.com/apache/arrow/go/v17/arrow/memory"
@@ -37,7 +38,10 @@ func GetRawHeadersParquet(fileHd *os.File, fileName string) ([]string, error) {
 	}
 
 	// Make sure we don't have empty names in rawHeaders
-	AdjustFillers(&rawHeaders)
-	fmt.Println("Got input columns (rawHeaders) from parquet file:", rawHeaders)
+	err = AdjustFillers(false, &rawHeaders)
+	if err != nil {
+		return nil, err
+	}
+	log.Println("Got input columns (rawHeaders) from parquet file:", rawHeaders)
 	return rawHeaders, nil
 }

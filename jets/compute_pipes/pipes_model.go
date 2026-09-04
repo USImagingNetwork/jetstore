@@ -1,6 +1,7 @@
 package compute_pipes
 
 import (
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strings"
@@ -15,6 +16,7 @@ type ComputePipesConfig struct {
 	OutputFiles            []OutputFileSpec        `json:"output_files,omitempty"`
 	LookupTables           []*LookupSpec           `json:"lookup_tables,omitempty"`
 	Channels               []ChannelSpec           `json:"channels,omitempty"`
+	PromptTemplates        []PromptTemplateSpec    `json:"prompt_templates,omitempty"`
 	Context                []ContextSpec           `json:"context,omitempty"`
 	SchemaProviders        []*SchemaProviderSpec   `json:"schema_providers,omitempty"`
 	PipesConfig            []PipeSpec              `json:"pipes_config,omitempty"`
@@ -22,6 +24,22 @@ type ComputePipesConfig struct {
 	ConditionalPipesConfig []ConditionalPipeSpec   `json:"conditional_pipes_config,omitempty"`
 }
 
+func (cp *ComputePipesConfig) GetSchemaProviderSpec(key string) *SchemaProviderSpec {
+	for i := range cp.SchemaProviders {
+		if cp.SchemaProviders[i].Key == key {
+			return cp.SchemaProviders[i]
+		}
+	}
+	return nil
+}
+func (cp *ComputePipesConfig) GetChannelSpec(name string) *ChannelSpec {
+	for i := range cp.Channels {
+		if cp.Channels[i].Name == name {
+			return &cp.Channels[i]
+		}
+	}
+	return nil
+}
 func (cp *ComputePipesConfig) MainInputChannel() *InputChannelConfig {
 	switch {
 	case len(cp.ReducingPipesConfig) > 0 && len(cp.ReducingPipesConfig[0]) > 0:
@@ -40,8 +58,9 @@ func (cp *ComputePipesConfig) NbrComputePipes() int {
 	return len(cp.ConditionalPipesConfig)
 }
 
-// This function is called once per compute pipes step (sharding or redicung)
+// This function is called once per compute pipes step (sharding or reducing)
 // so we construct the ExprNodeEvaluator as needed.
+// Returns the PipeSpec (pipeline config) for the step, the stepId to execute, and error if any.
 func (cp *ComputePipesConfig) GetComputePipes(stepId int, env map[string]any) ([]PipeSpec, int, error) {
 	switch {
 	case len(cp.ReducingPipesConfig) > stepId:
@@ -95,7 +114,7 @@ func (cp *ComputePipesConfig) GetStepName(stepId int) string {
 }
 
 // Cluster configuration
-// [DefaultMaxConcurrency] is to override the env var MAX_CONCURRENCY
+// [DefaultMaxConcurrency] is to override the env var TASK_MAX_CONCURRENCY
 // [nbrPartitions] is specified at ClusterShardingSpec level otherwise at the
 // ClusterSpec level. [nbrPartitions] is determined by the nbr of sharding nodes,
 // capped by MaxNbrPartitions.
@@ -219,7 +238,7 @@ type CsvSourceSpec struct {
 	MakeEmptyWhenNoFile bool   `json:"make_empty_source_when_no_files_found,omitzero"`
 }
 
-// ChannelSpec specifies the columns of a channel
+// ChannelSpec specifies the columns of a channel and other properties.
 // The columns can be obtained from a domain class from the
 // local workspace using class_name.
 // In that case, the columns
@@ -227,20 +246,35 @@ type CsvSourceSpec struct {
 // the domain class.
 // When direct_properties_only is true, only take the data properties
 // of the class, not including the properties of the parent classes.
+// ClassName is used to get the columns from the local workspace, and get domain key from registry, and is optional.
+// Env variables (from mainInputSchemaProvider.Env) can be used in the class_name, e.g., hc:${ENTITY}.
 // DomainKeys provide the ability to configure the domain keys in the cpipes config document.
-// DomainKeysSpec is parsed version of DomainKeys or the spec from the domain_keys_registry table.
-// DomainKeysSpec is derived from DomainKeys when provided.
+// DomainKeysInfo is obtained from the domain_keys_registry table or derived from DomainKeys - the latter takes precedence when both are available.
 // columnsMap is added in StartComputePipes
 type ChannelSpec struct {
-	Name                 string          `json:"name"`
-	Columns              []string        `json:"columns"`
-	ClassName            string          `json:"class_name,omitempty"`
-	DirectPropertiesOnly bool            `json:"direct_properties_only,omitzero"`
-	HasDynamicColumns    bool            `json:"has_dynamic_columns,omitzero"`
-	SameColumnsAsInput   bool            `json:"same_columns_as_input,omitzero"`
-	DomainKeys           map[string]any  `json:"domain_keys,omitempty"`
-	DomainKeysInfo       *DomainKeysSpec `json:"domain_keys_spec,omitzero"`
+	Name                 string                `json:"name"`
+	Columns              []string              `json:"columns"`
+	ClassName            string                `json:"class_name,omitempty"`
+	DirectPropertiesOnly bool                  `json:"direct_properties_only,omitzero"`
+	HasDynamicColumns    bool                  `json:"has_dynamic_columns,omitzero"`
+	SameColumnsAsInput   bool                  `json:"same_columns_as_input,omitzero"`
+	DomainKeys           map[string]any        `json:"domain_keys,omitempty"`
+	DomainKeysInfo       *DomainKeysSpec       `json:"domain_keys_spec,omitzero"`
+	ColumnEncodings      []*ColumnEncodingSpec `json:"column_encodings,omitzero"`
 	columnsMap           *map[string]int
+}
+
+// ColumnEncodingSpec is used to specify special encoding for a channel column, e.g., toon or json
+// Column is the column name to which the special encoding applies, this is required.
+// EntityEncoding is used to specify the encoding of the column: range values: json, toon (default is json).
+// RemoveModelPrefixes is used to remove the model prefixes from the columns, e.g., jets: or rdf: on the output (any prefix up to the character ':').
+// ExcludeProperties is used to specify the properties to exclude from the output, e.g., jets:key, rdf:type, etc.
+// This is used to exclude properties from the json or toon output.
+type ColumnEncodingSpec struct {
+	Column              string   `json:"column"`
+	EntityEncoding      string   `json:"entity_encoding,omitempty"`
+	RemoveModelPrefixes bool     `json:"remove_model_prefixes,omitzero"`
+	ExcludeProperties   []string `json:"exclude_properties,omitempty"`
 }
 
 type ContextSpec struct {
@@ -253,6 +287,7 @@ type ContextSpec struct {
 // Configuration type for factoring out all file settings.
 // This is used by more specific types such as:
 // SchemaProviderSpec, InputChannelConfig, OutputChannelConfig, OutputFileSpec
+// See those types for a description of the fields
 type FileConfig struct {
 	BadRowsConfig              *BadRowsSpec           `json:"bad_rows_config,omitzero"`
 	BlankFieldMarkers          *BlankFieldMarkersSpec `json:"blank_field_markers,omitzero"`
@@ -269,6 +304,7 @@ type FileConfig struct {
 	EnforceRowMaxLength        bool                   `json:"enforce_row_max_length,omitzero"`
 	EnforceRowMinLength        bool                   `json:"enforce_row_min_length,omitzero"`
 	EolByte                    byte                   `json:"eol_byte,omitzero"`
+	FailOnEmptyColumnName      bool                   `json:"fail_on_empty_column_name,omitzero"`
 	FileKey                    string                 `json:"file_key,omitempty"`
 	LookbackPeriods            string                 `json:"lookback_periods,omitzero"`
 	FileName                   string                 `json:"file_name,omitempty"` // Type output
@@ -302,7 +338,8 @@ type BlankFieldMarkersSpec struct {
 }
 
 type SchemaProviderSpec struct {
-	// Type range: default
+	// Type range: default, pipeline_coordinator_map
+	// Most properties applies to type default:
 	// Key is schema provider key for reference by compute pipes steps
 	// Format: csv, headerless_csv, fixed_width, parquet, parquet_select,
 	//              xlsx, headerless_xlsx
@@ -312,6 +349,7 @@ type SchemaProviderSpec struct {
 	// DiscardFileHeaders: when true, discard the headers from the input file (typically for csv format),
 	// this will force to use Headers or Columns from the configuration, or from the schema provider if Headers and Columns are not provided.
 	// EolByte: Byte to use as eol (format: csv,headerless_csv).
+	// FailOnEmptyColumnName: when true, fail if a column name is empty (format: csv,headerless_csv) - this is to prevent using a data row as headers.
 	// MultiColumnsInput: Indicate that input file must have multiple columns,
 	// this is used to detect if the wrong delimiter is used (csv,headerless_csv).
 	// ReadBatchSize: nbr of rows to read per record (format: parquet).
@@ -341,34 +379,57 @@ type SchemaProviderSpec struct {
 	// RequestID is used for logging and tracking purpose.
 	// Contains properties to register FileKey with input_registry table:
 	// Client, Vendor, ObjectType, FileDate (does not apply to Jets_Loader).
+	// NotifyApiGatewayOverride: values: no_notifications, failure_only, start_only, completion_and_failure_only, default (same as empty).
 	// NotificationTemplatesOverrides have the following keys to override the templates defined
 	// in the deployment environment var: CPIPES_START_NOTIFICATION_JSON,
 	// CPIPES_COMPLETED_NOTIFICATION_JSON, and CPIPES_FAILED_NOTIFICATION_JSON.
+	// Properties for type pipeline_coordinator_map:
+	// Type: pipeline_coordinator_map.
+	// RequestId: request_id for the pipeline coordinator map.
+	// CoordinatedPipesMap: list of schema_event_json.
+	// PostMapEvent: schema event for post map pipeline.
 	//*TODO domain_keys_json
 	//*TODO code_values_mapping_json
 	FileConfig
-	Key                              string             `json:"key"`
-	Type                             string             `json:"type"`
-	FileSize                         int64              `json:"file_size,omitzero"`
-	KmsKey                           string             `json:"kms_key_arn,omitempty"`
-	Client                           string             `json:"client,omitempty"`
-	Vendor                           string             `json:"vendor,omitempty"`
-	ObjectType                       string             `json:"object_type,omitempty"`
-	RequestID                        string             `json:"request_id,omitempty"`
-	UseOriginSourceConfig            bool               `json:"use_origin_source_config,omitempty"`
-	FileDate                         string             `json:"file_date,omitempty"`
-	SourceType                       string             `json:"source_type,omitempty"`
-	SchemaName                       string             `json:"schema_name,omitempty"`
-	Columns                          []SchemaColumnSpec `json:"columns,omitempty"`
-	Headers                          []string           `json:"headers,omitempty"`
-	CapDobYears                      int                `json:"cap_dob_years,omitzero"`
-	SetDobToJan1                     bool               `json:"set_dob_to_jan1,omitzero"`
-	SetDodToJan1                     bool               `json:"set_dod_to_jan1,omitzero"`
-	SetAllDatesToJan1                bool               `json:"set_all_dates_to_jan1,omitzero"`
-	Env                              map[string]any     `json:"env,omitempty"`
-	ReportCmds                       []ReportCmdSpec    `json:"report_cmds,omitempty"`
-	NotificationTemplatesOverrides   map[string]string  `json:"notification_templates_overrides,omitempty"`
-	NotificationRoutingOverridesJson string             `json:"notification_routing_overrides_json,omitempty"`
+	Key                              string                `json:"key"`
+	Type                             string                `json:"type"`
+	FileSize                         int64                 `json:"file_size,omitzero"`
+	KmsKey                           string                `json:"kms_key_arn,omitempty"`
+	Client                           string                `json:"client,omitempty"`
+	Vendor                           string                `json:"vendor,omitempty"`
+	ObjectType                       string                `json:"object_type,omitempty"`
+	RequestID                        string                `json:"request_id,omitempty"`
+	UseOriginSourceConfig            bool                  `json:"use_origin_source_config,omitempty"`
+	FileDate                         string                `json:"file_date,omitempty"`
+	SourceType                       string                `json:"source_type,omitempty"`
+	SchemaName                       string                `json:"schema_name,omitempty"`
+	Columns                          []SchemaColumnSpec    `json:"columns,omitempty"`
+	Headers                          []string              `json:"headers,omitempty"`
+	CapDobYears                      int                   `json:"cap_dob_years,omitzero"`
+	SetDobToJan1                     bool                  `json:"set_dob_to_jan1,omitzero"`
+	SetDodToJan1                     bool                  `json:"set_dod_to_jan1,omitzero"`
+	SetAllDatesToJan1                bool                  `json:"set_all_dates_to_jan1,omitzero"`
+	Env                              map[string]any        `json:"env,omitempty"`
+	ReportCmds                       []ReportCmdSpec       `json:"report_cmds,omitempty"`
+	NotificationTemplatesOverrides   map[string]string     `json:"notification_templates_overrides,omitempty"`
+	NotificationRoutingOverridesJson string                `json:"notification_routing_overrides_json,omitempty"`
+	NotifyApiGatewayOverride         string                `json:"notify_api_gateway_override,omitempty"`
+	CoordinatedPipesMap              []*SchemaProviderSpec `json:"coordinated_pipes_map,omitempty"`
+	PostMapEvent                     *SchemaProviderSpec   `json:"post_map_event,omitzero"`
+}
+
+// Utility function to convert to a map[string]any for use in input_registry table
+func (sp *SchemaProviderSpec) ToMap() (map[string]any, error) {
+	b, err := json.Marshal(sp)
+	if err != nil {
+		return nil, err
+	}
+	m := make(map[string]any)
+	err = json.Unmarshal(b, &m)
+	if err != nil {
+		return nil, err
+	}
+	return m, nil
 }
 
 // Commands for the run_report step
@@ -398,6 +459,9 @@ type SchemaColumnSpec struct {
 	Precision *int   `json:"precision,omitzero"` // for fixed_width
 }
 
+// TableSpec specifies the output table configuration
+// Key is the table key for reference by compute pipes steps
+// Name is the table name for reference by compute pipes steps, env var replacement used for table name (e.g., ${CLIENT}_${OBJECT_TYPE})
 // ChannelSpecName specify the channel spec.
 // Column provides metadata info
 type TableSpec struct {
@@ -515,7 +579,8 @@ type SplitterSpec struct {
 
 type TransformationSpec struct {
 	// Type range: map_record, aggregate, analyze, high_freq, partition_writer,
-	// anonymize, distinct, shuffling, group_by, filter, sort, merge, jetrules, clustering
+	// anonymize, distinct, shuffling, group_by, filter, sort, merge, jetrules, clustering,
+	// ollama
 	// Format takes precedence over SchemaProvider's Format (from OutputChannelConfig)
 	Type                  string                           `json:"type"`
 	NewRecord             bool                             `json:"new_record,omitzero"`
@@ -531,6 +596,7 @@ type TransformationSpec struct {
 	FilterConfig          *FilterSpec                      `json:"filter_config,omitzero"`
 	SortConfig            *SortSpec                        `json:"sort_config,omitzero"`
 	JetrulesConfig        *JetrulesSpec                    `json:"jetrules_config,omitzero"`
+	OllamaConfig          *OllamaSpec                      `json:"ollama_config,omitzero"`
 	ClusteringConfig      *ClusteringSpec                  `json:"clustering_config,omitzero"`
 	MergeConfig           *MergeSpec                       `json:"merge_config,omitzero"`
 	OutputChannel         OutputChannelConfig              `json:"output_channel"`
@@ -663,9 +729,10 @@ type InputChannelConfig struct {
 
 type OutputChannelConfig struct {
 	// Type range: memory (default), stage, output, sql
-	// Format: csv, headerless_csv, etc.
-	// NbrRowsInRecord: nbr of rows in record (format: parquet)
-	// Compression: none, snappy (default).
+	// Name: output channel name, required (must exist in the channels section of the config document)
+	// Format: file format, range values: csv, headerless_csv, fixed_width.
+	// NbrRowsInRecord: nbr of rows in record (applicable to format: parquet)
+	// Compression: none, snappy (default). Does not apply to parquet format (always snappy).
 	// UseInputParquetSchema to use the same schema as the input file.
 	// UseOriginalHeaders to use the headers from the input file (csv only).
 	// Must have save_parquet_schema = true in the cpipes first input_channel.
@@ -680,9 +747,10 @@ type OutputChannelConfig struct {
 	// KeyPrefix is optional, default to $PATH_FILE_KEY.
 	// Use $CURRENT_PARTITION_LABEL in KeyPrefix and FileName to substitute with
 	// current partition label.
-	// Other available env substitution:
+	// Other available env substitution (this is not comprehensive list, any defined env var can be used):
 	// $FILE_KEY main input file key.
 	// $SESSIONID current session id.
+	// ${REQUEST_ID} current request id.
 	// $PROCESS_NAME current process name.
 	// $PATH_FILE_KEY file key path portion.
 	// $NAME_FILE_KEY file key file name portion (empty when in part files mode).
@@ -690,7 +758,7 @@ type OutputChannelConfig struct {
 	// $JETS_PARTITION_LABEL current node partition label.
 	FileConfig
 	Type                  string `json:"type"`
-	Name                  string `json:"name,omitempty"`
+	Name                  string `json:"name"`
 	UseOriginalHeaders    bool   `json:"use_original_headers,omitzero"`     // Type output
 	UseInputParquetSchema bool   `json:"use_input_parquet_schema,omitzero"` // Type stage,output
 	SchemaProvider        string `json:"schema_provider,omitempty"`         // Type stage,output, alt to Format
@@ -1021,6 +1089,127 @@ type JetrulesSpec struct {
 	IsDebug                 bool                  `json:"is_debug,omitzero"`
 	OutputChannels          []OutputChannelConfig `json:"output_channels,omitempty"`
 	ErrorChannel            *OutputChannelConfig  `json:"error_channel,omitzero"`
+}
+
+// PromptTemplateSpec is a named prompt template, defined at the ComputePipesConfig level
+// so a template can be shared by several steps and pipes.
+// Key is the name used by OllamaSpec.PromptTemplateName.
+// Template is the prompt text, see OllamaSpec for the placeholder syntax.
+// SystemPrompt and ResponseFormat are defaults for the operator using this template,
+// the operator's own settings take precedence when both are provided.
+type PromptTemplateSpec struct {
+	Key            string          `json:"key"`
+	Template       string          `json:"template"`
+	SystemPrompt   string          `json:"system_prompt,omitempty"`
+	ResponseFormat json.RawMessage `json:"response_format,omitempty"`
+}
+
+// OllamaSpec configuration for the ollama transformation operator.
+// The operator calls the infer server (Ollama) once per input record and augments that
+// record *in place* with values extracted from the model response. The input and output
+// channels must therefore share the same ChannelSpec, ie be configured with the same
+// channel_spec_name; this is validated when the operator is built.
+//
+// Model is the model tag to use, eg llama3.1:8b (required).
+// Api is the ollama api to call: generate (default) or chat.
+// PromptTemplate is the prompt template, alternatively PromptTemplateName refers to a
+// template of ComputePipesConfig.PromptTemplates. Exactly one of them must be provided.
+// The template supports two kinds of placeholders:
+//   - $ENV_VAR and ${ENV_VAR} are substituted from the cpipes env when the operator is
+//     built (same syntax as the other operators, see the `context` config section);
+//   - {{column_name}} is substituted with the record's value for that column. The
+//     reserved placeholder {{@record}} expands to the whole record as a json object.
+//
+// A {{column_name}} that does not match a column of the input channel is a configuration
+// error reported when the operator is built.
+// SystemPrompt is the system message, optional.
+// ResponseFormat is passed to ollama as `format`: the string "json" or a json schema.
+// Options is passed to ollama as `options`, eg temperature, num_ctx, seed, num_predict.
+// KeepAlive is passed to ollama as `keep_alive`, it is how long the model stays resident
+// between calls; defaults to 30m since a pipeline calls the model for every record.
+// Think is passed to ollama as `think` for reasoning models.
+// Server specifies how to reach the infer server, see OllamaServerSpec.
+// OutputMapping specifies how to map the response onto the record's columns (required).
+// DisableStripCodeFences turns off the removal of markdown code fences around the model
+// response before it is parsed as json (they are removed by default).
+// PoolSize is the number of concurrent requests to the infer server, default 1.
+// NOTE: with PoolSize == 1 the record order is preserved, with PoolSize > 1 it is not.
+// RequestTimeoutSec is the timeout of a single request attempt, default 120.
+// ConnectTimeoutSec is the connection (and tls handshake) timeout, default 10.
+// MaxRetry is the number of retries on timeout, connection error, 429 and 5xx responses,
+// default 2 when not specified; set it to 0 to disable the retries.
+// RetryWaitSec is the wait before the first retry, doubled on each attempt, default 2.
+// MaxInputCount caps the number of records sent to the model (0 means unlimited), it is
+// a cost guard: records past the cap are passed through to the output channel unchanged
+// rather than filtered out.
+// OnError specifies what to do with a record that failed: pass_through (default, the
+// record is sent to the output channel unchanged), drop, or fail (interrupt the pipeline).
+// MaxErrorCount caps the number of records reported to the error channel, default 50.
+// RowKeyColumn is the column identifying the record in the error reports (row_jets_key).
+// IsDebug logs the prompt and the response of every record.
+// ErrorChannel is the channel where row-level errors are reported, using the
+// process_errors channel spec (see the jetrules operator).
+type OllamaSpec struct {
+	Model                  string               `json:"model"`
+	Api                    string               `json:"api,omitempty"`
+	PromptTemplate         string               `json:"prompt_template,omitempty"`
+	PromptTemplateName     string               `json:"prompt_template_name,omitempty"`
+	SystemPrompt           string               `json:"system_prompt,omitempty"`
+	ResponseFormat         json.RawMessage      `json:"response_format,omitempty"`
+	Options                map[string]any       `json:"options,omitempty"`
+	KeepAlive              string               `json:"keep_alive,omitempty"`
+	Think                  *bool                `json:"think,omitzero"`
+	Server                 *OllamaServerSpec    `json:"server,omitzero"`
+	OutputMapping          []OllamaMappingSpec  `json:"output_mapping,omitempty"`
+	DisableStripCodeFences bool                 `json:"disable_strip_code_fences,omitzero"`
+	PoolSize               int                  `json:"pool_size,omitzero"`
+	RequestTimeoutSec      int                  `json:"request_timeout_sec,omitzero"`
+	ConnectTimeoutSec      int                  `json:"connect_timeout_sec,omitzero"`
+	MaxRetry               *int                 `json:"max_retry,omitzero"`
+	RetryWaitSec           int                  `json:"retry_wait_sec,omitzero"`
+	MaxInputCount          int                  `json:"max_input_count,omitzero"`
+	OnError                string               `json:"on_error,omitempty"`
+	MaxErrorCount          int                  `json:"max_error_count,omitzero"`
+	RowKeyColumn           string               `json:"row_key_column,omitempty"`
+	IsDebug                bool                 `json:"is_debug,omitzero"`
+	ErrorChannel           *OutputChannelConfig `json:"error_channel,omitzero"`
+}
+
+// OllamaServerSpec specifies how to reach the infer server.
+// Url is the base url of the infer server, eg http://my-elb:11434. It is resolved in
+// this order: this property (with cpipes env var substitution), then $JETS_INFER_URL from
+// the cpipes env, then the JETS_INFER_URL environment variable - which is set on the
+// deployed containers when the stack is built with BUILD_INFER_SERVICE.
+// Headers are additional request headers, optional.
+type OllamaServerSpec struct {
+	Url     string            `json:"url,omitempty"`
+	Headers map[string]string `json:"headers,omitempty"`
+}
+
+// OllamaMappingSpec maps one element of the model response to a column of the record.
+// Column is the name of the column to set, it must be a column of the channel shared by
+// the input and output channels.
+// Source specifies what the mapping reads from:
+//   - response (default): the model's text, parsed as json when Path is specified;
+//   - raw_response: the model's text, verbatim, without parsing;
+//   - envelope: a property of the ollama api response envelope itself, eg eval_count,
+//     prompt_eval_count, total_duration, model;
+//   - thinking: the reasoning text, when Think is in use.
+//	 - model_name: the model name.
+//
+// Path is a dot notation path into the parsed json, eg summary, codes.0.icd10,
+// detail.score - a numeric element indicates the position in an array.
+// An empty Path takes the whole value.
+// AsRdfType casts the value, see CastToRdfType.
+// Default is the value to use when the path is absent or null.
+// Required indicates that an absent or null value is a row-level error.
+type OllamaMappingSpec struct {
+	Column    string `json:"column"`
+	Source    string `json:"source,omitempty"`
+	Path      string `json:"path,omitempty"`
+	AsRdfType string `json:"as_rdf_type,omitempty"`
+	Default   string `json:"default,omitempty"`
+	Required  bool   `json:"required,omitzero"`
 }
 
 // If is_debug is true, correlation results are forwarded to s3 otherwise

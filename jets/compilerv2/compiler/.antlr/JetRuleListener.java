@@ -1,4 +1,4 @@
-// Generated from /home/michel/projects/repos/jetstore/jets/compilerv2/compiler/JetRule.g4 by ANTLR 4.13.1
+// Generated from /home/michel/projects/repos/jetstore_agentic_ai/jetstore_ai/jets/compilerv2/compiler/JetRule.g4 by ANTLR 4.13.1
 import org.antlr.v4.runtime.tree.ParseTreeListener;
 
 /**
@@ -116,6 +116,16 @@ public interface JetRuleListener extends ParseTreeListener {
 	 * @param ctx the parse tree
 	 */
 	void exitDataPropertyDefinitions(JetRuleParser.DataPropertyDefinitionsContext ctx);
+	/**
+	 * Enter a parse tree produced by {@link JetRuleParser#objectPropertyDefinitions}.
+	 * @param ctx the parse tree
+	 */
+	void enterObjectPropertyDefinitions(JetRuleParser.ObjectPropertyDefinitionsContext ctx);
+	/**
+	 * Exit a parse tree produced by {@link JetRuleParser#objectPropertyDefinitions}.
+	 * @param ctx the parse tree
+	 */
+	void exitObjectPropertyDefinitions(JetRuleParser.ObjectPropertyDefinitionsContext ctx);
 	/**
 	 * Enter a parse tree produced by {@link JetRuleParser#dataPropertyType}.
 	 * @param ctx the parse tree

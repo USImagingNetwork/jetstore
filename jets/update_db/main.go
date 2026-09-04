@@ -10,8 +10,9 @@ import (
 
 	"github.com/artisoft-io/jetstore/jets/awsi"
 	"github.com/artisoft-io/jetstore/jets/jetrules/rete"
-	"github.com/artisoft-io/jetstore/jets/serverv2/workspace"
-	"github.com/jackc/pgx/v4/pgxpool"
+	"github.com/artisoft-io/jetstore/jets/utils"
+	"github.com/artisoft-io/jetstore/jets/workspace"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // cmd tool to manage db schema
@@ -50,7 +51,7 @@ func init() {
 // Main function
 func doJob() error {
 	var err error
-	dbpool, err := pgxpool.Connect(context.Background(), dsn)
+	dbpool, err := pgxpool.New(context.Background(), dsn)
 	if err != nil {
 		return fmt.Errorf("while opening db connection: %v", err)
 	}
@@ -98,7 +99,7 @@ func doJob() error {
 		}
 	}
 
-	fmt.Println("-- Create / Update JetStore Domain Tables")
+	log.Println("-- Create / Update JetStore Domain Tables")
 	tableMap := make(map[string]*rete.TableNode)
 	fpath := fmt.Sprintf("%s/%s/build/tables.json", workspaceHome, wprefix)
 	log.Println("Reading JetStore tables definitions from:", fpath)
@@ -121,7 +122,7 @@ func doJob() error {
 
 	// process tables
 	for tableName, tableSpec := range tableSpecs {
-		fmt.Println("-- Processing table", tableName)
+		log.Println("-- Processing table", tableName)
 		err = tableSpec.UpdateDomainTableSchema(dbpool, *dropExisting)
 		if err != nil {
 			return fmt.Errorf("while updating table schema for table %s: %v", tableName, err)
@@ -132,7 +133,8 @@ func doJob() error {
 }
 
 func main() {
-	fmt.Println("CMD LINE ARGS:", os.Args[1:])
+	utils.UseJetStoreLogger()
+	log.Println("CMD LINE ARGS:", os.Args[1:])
 	flag.Parse()
 
 	// validate command line arguments
@@ -191,12 +193,11 @@ func main() {
 		for _, msg := range errMsg {
 			log.Println("**", msg)
 		}
-		panic(errMsg)
+		log.Panic(errMsg)
 	}
 	//let's do it
 	err = doJob()
 	if err != nil {
-		fmt.Println(err)
-		panic(err)
+		log.Panic(err)
 	}
 }

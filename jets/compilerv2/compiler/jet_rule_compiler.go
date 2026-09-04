@@ -10,20 +10,21 @@ import (
 	"github.com/antlr4-go/antlr/v4"
 	"github.com/artisoft-io/jetstore/jets/compilerv2/parser"
 	"github.com/artisoft-io/jetstore/jets/jetrules/rete"
+	"github.com/artisoft-io/jetstore/jets/utils"
 )
 
 // This file contains the JetRule Compiler using a listener for transformation and validation logic
 
 type Compiler struct {
-	listener *JetRuleListener
-	saveJson bool
+	listener         *JetRuleListener
+	saveJson         bool
 	autoAddResources bool
 }
 
 func NewCompiler(basePath string, mainRuleFileName string, saveJson, trace, autoAddResources bool) *Compiler {
 	c := &Compiler{
-		listener: NewJetRuleListener(basePath, mainRuleFileName),
-		saveJson: saveJson,
+		listener:         NewJetRuleListener(basePath, mainRuleFileName),
+		saveJson:         saveJson,
 		autoAddResources: autoAddResources,
 	}
 	c.listener.trace = trace
@@ -40,9 +41,9 @@ func (c *Compiler) Compile() error {
 	if err != nil {
 		return fmt.Errorf("error reading rule files: %w", err)
 	}
-	if c.Trace() {
-		fmt.Printf("** Combined Rule File Content (%d lines):\n%s\n", len(strings.Split(combinedContent, "\n")), combinedContent)
-	}
+	// if c.Trace() {
+	// 	fmt.Printf("** Combined Rule File Content (%d lines):\n%s\n", len(strings.Split(combinedContent, "\n")), combinedContent)
+	// }
 	return c.CompileBuffer(combinedContent)
 }
 
@@ -65,6 +66,7 @@ func (c *Compiler) CompileBuffer(combinedContent string) error {
 	tree := p.Jetrule()
 
 	// Finally walk the tree
+	var hasError bool
 	antlr.ParseTreeWalkerDefault.Walk(c.listener, tree)
 	if c.Trace() {
 		log.Println("** Compilation successful")
@@ -73,34 +75,59 @@ func (c *Compiler) CompileBuffer(combinedContent string) error {
 		log.Println("** Parse Log:\n", c.ParseLog().String())
 	}
 	if c.ErrorLog().Len() > 0 {
-		log.Println("** Compilation Errors:\n", c.ErrorLog().String())
+		errors := strings.Split(c.ErrorLog().String(), "\n")
+		log.Println("** Compilation Errors:")
+		for _, e := range errors {
+			if strings.TrimSpace(e) != "" {
+				log.Println(e)
+				if !strings.Contains(e, "warning:") {
+					hasError = true
+				}
+			}
+		}
 	}
 	if c.saveJson {
-		outPath := fmt.Sprintf("%s/%s", c.listener.basePath, c.OutJsonFileName())
-		log.Println("Saving json to", outPath)
-		data, err := c.JetRuleModel().ToJson()
+		err := c.SaveModel()
 		if err != nil {
-			log.Println("** ERROR converting to json:", err.Error())
-			return fmt.Errorf("while converting to json: %w", err)
-		}
-		err = os.WriteFile(outPath, data, 0644)
-		if err != nil {
-			log.Println("** ERROR saving json:", err.Error())
-			return fmt.Errorf("while saving json: %w", err)
-		}
-		// Save to workspace.db file
-		wDb, err := NewWorkspaceDB(context.TODO(), c.listener.basePath)
-		if err != nil {
-			log.Println("** ERROR creating workspace.db:", err.Error())
-			return fmt.Errorf("while creating workspace.db: %w", err)
-		}
-		err = wDb.SaveJetRuleModel(context.TODO(), c.listener.jetRuleModel)
-		if err != nil {
-			log.Println("** ERROR saving to workspace.db:", err.Error())
-			return fmt.Errorf("while saving to workspace.db: %w", err)
+			log.Println("** ERROR saving model:", err.Error())
+			return err
 		}
 	}
+	if hasError {
+		return fmt.Errorf("compilation failed with errors")
+	}
+	return nil
+}
 
+func (c *Compiler) SaveModel() error {
+	// Prevent CWE-73: External Control of File Name or Path.
+	outPath, err := utils.ConfineFilePath(c.listener.basePath, c.OutJsonFileName())
+	if err != nil {
+		log.Println("** ERROR resolving output path:", err.Error())
+		return fmt.Errorf("while resolving output path: %w", err)
+	}
+	log.Println("Saving json to", outPath)
+	data, err := c.JetRuleModel().ToJson()
+	if err != nil {
+		log.Println("** ERROR converting to json:", err.Error())
+		return fmt.Errorf("while converting to json: %w", err)
+	}
+	err = os.WriteFile(outPath, data, 0644)
+	if err != nil {
+		log.Println("** ERROR saving json:", err.Error())
+		return fmt.Errorf("while saving json: %w", err)
+	}
+	// Save to workspace.db file
+	wDb, err := NewWorkspaceDB(context.TODO(), c.listener.basePath)
+	if err != nil {
+		log.Println("** ERROR creating workspace.db:", err.Error())
+		return fmt.Errorf("while creating workspace.db: %w", err)
+	}
+	err = wDb.SaveJetRuleModel(context.TODO(), c.listener.jetRuleModel)
+	if err != nil {
+		log.Println("** ERROR saving to workspace.db:", err.Error())
+		return fmt.Errorf("while saving to workspace.db: %w", err)
+	}
 	return nil
 }
 

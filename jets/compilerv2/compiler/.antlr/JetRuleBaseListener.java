@@ -1,4 +1,4 @@
-// Generated from /home/michel/projects/repos/jetstore/jets/compilerv2/compiler/JetRule.g4 by ANTLR 4.13.1
+// Generated from /home/michel/projects/repos/jetstore_agentic_ai/jetstore_ai/jets/compilerv2/compiler/JetRule.g4 by ANTLR 4.13.1
 
 import org.antlr.v4.runtime.ParserRuleContext;
 import org.antlr.v4.runtime.tree.ErrorNode;
@@ -143,6 +143,18 @@ public class JetRuleBaseListener implements JetRuleListener {
 	 * <p>The default implementation does nothing.</p>
 	 */
 	@Override public void exitDataPropertyDefinitions(JetRuleParser.DataPropertyDefinitionsContext ctx) { }
+	/**
+	 * {@inheritDoc}
+	 *
+	 * <p>The default implementation does nothing.</p>
+	 */
+	@Override public void enterObjectPropertyDefinitions(JetRuleParser.ObjectPropertyDefinitionsContext ctx) { }
+	/**
+	 * {@inheritDoc}
+	 *
+	 * <p>The default implementation does nothing.</p>
+	 */
+	@Override public void exitObjectPropertyDefinitions(JetRuleParser.ObjectPropertyDefinitionsContext ctx) { }
 	/**
 	 * {@inheritDoc}
 	 *
