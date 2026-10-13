@@ -1,5 +1,46 @@
 # Multi-stage build for Go Lambda with C++ library
-FROM cpipes_builder:latest AS builder
+#
+# The builder stage this image copies `bootstrap` out of.
+#
+# **The default is the stock builder, and that default is exit criterion 98.** A
+# build that passes no --build-arg resolves to `cpipes_builder:latest`, which is
+# the literal this line carried before the ARG existed, so a deployment with no
+# site operators builds from the same stage, with the same inputs, and the
+# COPY --from=builder lines below are unchanged.
+#
+# **This is Dockerfile.cpipes's mechanism, applied here because the two images
+# are two halves of one executor set rather than two deployment options.** Both
+# cpipes state machines are built from the same ECS task definition and differ
+# only in their node Lambda (`buildCpipesSMInternal`, `build_cpipes_sm.go:21`
+# and `:25`). Inside one execution of either, sharding always runs on the node
+# Lambda (`runSharingNodeTask`, `build_cpipes_sm.go:71`) while each reducing
+# iteration runs on the Lambda or on the ECS task, chosen at run time by
+# `$.useECSReducingTask` (`ecsOrLambdaChoice`, `build_cpipes_sm.go:208`) from
+# the pipeline's own `use_ecs_tasks` / `use_ecs_tasks_when`
+# (`EvalUseEcsTask`, `actions_start_common.go:1918`). So a site operator present
+# in cpipes_native_server and absent from this bootstrap does not fail a
+# deployment: it fails a step, as a function of a field in the .pc.json, inside
+# a running worker. That is why selecting the builder here is not optional once
+# Dockerfile.cpipes selects one, and why Dockerfile.cpipes_builder_ws refuses to
+# build one site entry without the other.
+#
+# A site that ships its own compute_pipes operators passes
+# CPIPES_BUILDER_IMAGE=cpipes_builder_ws:latest, whose bootstrap is built from
+# the site's own cp_node_native main package over the stock binary's path.
+# Everything else copied below -- libjets.so and the three system libraries -- is
+# the parent image's, byte for byte, because nothing in that Dockerfile rebuilds
+# them.
+#
+# **The name is forced rather than chosen, for the same kind of reason the task
+# binary's is.** CpipesNativeNodeLambda is a container-image function with
+# `Cmd: bootstrap` (`build_cpipes_lambdas.go:144`), and DockerImageFunctionProps
+# has no Entry property, so nothing at synth time can name a different binary.
+#
+# An ARG before the first FROM is a global ARG -- in scope for FROM lines and
+# out of scope inside every stage, which is why the stage below re-declares the
+# ARGs it uses.
+ARG CPIPES_BUILDER_IMAGE=cpipes_builder:latest
+FROM ${CPIPES_BUILDER_IMAGE} AS builder
 
 # RUN \
 #     echo "/usr/local/lib64/ DIRECTORY Contains" \
@@ -16,14 +57,48 @@ RUN dnf update -y && \
 
 ENV JETS_SOURCE_DIR=/app JETS_BUILD_DIR=/app
 
+# JETS_VERSION is the build's timestamp, stamped identically into every image of
+# a build run by build_cpipes.sh. It is not only provenance: compile_workspace
+# writes it into the database as the workspace version, and
+# SyncComputePipesWorkspace skips fetching workspace.tgz and sqlite when the two
+# match - because this image already carries the compiled workspace that
+# Dockerfile.cpipes_native_lambda_ws bakes in at WORKSPACES_REPO.
+#
+# Promoting it was held back until the handler could use it. The reason is that
+# this image has no cbooter: a container process gets WORKSPACES_REPO copied to
+# WORKSPACES_HOME before the binary is exec'd, and a Lambda's entrypoint is the
+# runtime interface, so nothing copied anything. The CDK gives this function
+# WORKSPACES_HOME=/tmp/workspaces, which starts empty on every cold start, and
+# skipping the fetch would have left jetrules_utils.go reading
+# <WORKSPACES_HOME>/<workspace>/build/classes.json out of an empty directory
+# while the real one sat unread at /workspaces.
+#
+# jets/workspace's ensureLocalRepoSeeded now does that copy, on the skip path
+# itself so a run that is about to fetch a newer workspace does not pay for one
+# it would overwrite. With that in place the skip is safe here, and this is the
+# image it was worth the most on: /tmp is empty at every cold start, so this
+# function was fetching the workspace it already had.
+ARG JETS_VERSION
+ENV JETS_VERSION=${JETS_VERSION}
+ARG JETS_GIT_SHA
+ENV JETS_GIT_SHA=${JETS_GIT_SHA}
+RUN echo "----------------JetStore-Version------------------" >> /VERSION.txt && \
+    echo "JETS_VERSION: ${JETS_VERSION}"                      >> /VERSION.txt && \
+    echo "JETS_GIT_SHA: ${JETS_GIT_SHA}"                      >> /VERSION.txt && \
+    echo "----------------*********************-------------" >> /VERSION.txt
+
 # Copy the binary as 'bootstrap' to the Lambda task root
 COPY --from=builder $JETS_SOURCE_DIR/bootstrap ${LAMBDA_RUNTIME_DIR}
 
 # COPY native rule engine library
 COPY --from=builder ${JETS_BUILD_DIR}/jets/libjets.so /usr/local/lib/
+# libsqlite3 is not copied: libjets.so needs libsqlite3.so.0, and nothing here
+# ever linked that soname to a copy, so the loader always took the base image's
+# /lib64/libsqlite3.so.0 and the builder's libsqlite3.so.0.8.6 sat unused --
+# measured on 2026-10-11 (rules_unit_test_harness I-35). The base's is what has
+# been running, and the ldd check below fails the build if it ever goes missing.
 #* Verify lib version when upgrading dependencies
 COPY --from=builder /usr/lib64/libboost_date_time.so.1.75.0 /usr/local/lib/
-COPY --from=builder /lib64/libsqlite3.so.0.8.6 /usr/local/lib/
 COPY --from=builder /lib64/libgflags.so.2.2 /usr/local/lib/
 COPY --from=builder /usr/local/lib64/libglog.so.0.6.0 /usr/local/lib/
 
@@ -32,20 +107,24 @@ ENV LD_LIBRARY_PATH=/usr/local/lib
 # Create a simple library cache manually
 RUN echo "/usr/local/lib" > /etc/ld.so.conf.d/local.conf
 
-# Make sure bootstrap is executable
-RUN chmod +x ${LAMBDA_RUNTIME_DIR}/bootstrap
-
+# **No chmod on bootstrap.** go build in Dockerfile.cpipes_builder writes it
+# 0755 and COPY keeps the mode, and a chmod in a later layer stores the whole
+# file again -- measured on 2026-10-11, the RUN that chmod'ed it added 55 MB, the
+# binary's own size, and changed no mode. Dockerfile.ui_service carries the same
+# note (rules_unit_test_harness I-31, I-34).
+#
+# **No chmod on the libraries either.** All four are already 0755 where they
+# are copied from in the builder (`ls -lL` there, 2026-10-11), COPY keeps the mode, and the dynamic loader needs no execute bit on a shared
+# object in any case -- it maps it, it does not exec it. The four chmods that stood
+# here rewrote 1.8 MB for nothing; the symlink, the listing and the ldd stay.
 RUN \
     cd /usr/local/lib/ \
-    && chmod +x libglog.so.0.6.0 \
-    && chmod +x libboost_date_time.so.1.75.0 \
-    && chmod +x libsqlite3.so.0.8.6 \
-    && chmod +x libgflags.so.2.2 \
     && ln -s libglog.so.0.6.0 libglog.so.1  \
     && echo "/usr/local/lib/ DIRECTORY Contains" \
     && ls -la /usr/local/lib/ \
     && echo "ldd libjets.so" \
     && ldd libjets.so \
+    && ! ldd libjets.so | grep -q 'not found' \
     && echo "LAMBDA_RUNTIME_DIR DIRECTORY Contains" \
     && ls -la ${LAMBDA_RUNTIME_DIR} \
     && cd / 

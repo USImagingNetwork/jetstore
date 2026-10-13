@@ -7,12 +7,14 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/artisoft-io/jetstore/jets/compilerv2/analyzer"
 	"github.com/artisoft-io/jetstore/jets/compilerv2/compiler"
 	"github.com/artisoft-io/jetstore/jets/jetrules/rete"
 	"github.com/artisoft-io/jetstore/jets/run_reports/tarextract"
+	"github.com/artisoft-io/jetstore/jets/utils"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -27,7 +29,7 @@ func compileWorkspaceV2(dbpool *pgxpool.Pool, workspaceControl *rete.WorkspaceCo
 
 	// Make the build directory if not exists
 	buildDir := fmt.Sprintf("%s/%s/build", workspaceHome, workspaceName)
-	err = os.MkdirAll(buildDir, 0770)
+	err = utils.EnsureWorkspaceDir(buildDir)
 	if err != nil {
 		return "", fmt.Errorf("while creating build directory: %v", err)
 	}
@@ -67,8 +69,20 @@ func compileWorkspaceV2(dbpool *pgxpool.Pool, workspaceControl *rete.WorkspaceCo
 	var tables []*rete.TableNode
 	var lookupTables []*rete.LookupTableNode
 
-	workspacePath := fmt.Sprintf("%s/%s", workspaceHome, workspaceName)
+	// Compile in a fixed order. Ranging over mainRuleFiles put the main files in
+	// map order, which Go randomises, so two compiles of the same workspace
+	// assigned workspace.db keys differently and merged the workspace-wide class
+	// view differently. Neither is a correctness bug on its own, but a build
+	// whose output cannot be compared with the previous one is a build whose
+	// output cannot be reviewed.
+	orderedRuleFiles := make([]string, 0, len(mainRuleFiles))
 	for name := range mainRuleFiles {
+		orderedRuleFiles = append(orderedRuleFiles, name)
+	}
+	sort.Strings(orderedRuleFiles)
+
+	workspacePath := fmt.Sprintf("%s/%s", workspaceHome, workspaceName)
+	for _, name := range orderedRuleFiles {
 		// name is the file path relative to workspace home
 		fmt.Fprintf(&buf, "Compiling rule file: %s\n", name)
 		jrCompiler = compiler.NewCompiler(
@@ -87,6 +101,13 @@ func compileWorkspaceV2(dbpool *pgxpool.Pool, workspaceControl *rete.WorkspaceCo
 			return cmdLog, fmt.Errorf("while compiling rule file '%s': %v", name, err)
 		}
 		buf.WriteString(jrCompiler.ParseLog().String())
+		// A compile that succeeded may still have warned. The warnings are in
+		// the error log, which only a failed compile wrote here; the ones the
+		// compiler also writes to the parse log (an identifier created as a
+		// resource) were shown, and the rest -- the aggregate and salience
+		// warnings -- reached the process log only, until 2026-10-12
+		// (rules_unit_test_harness I-55).
+		buf.WriteString(compileWarnings(jrCompiler.ErrorLog().String(), jrCompiler.ParseLog().String()))
 		// Perform predicate dependency
 		analyzer := analyzer.NewAnalyzer(workspacePath, name, "predicates", "", true, jrCompiler)
 		err = analyzer.Analyze()
@@ -124,7 +145,7 @@ func compileWorkspaceV2(dbpool *pgxpool.Pool, workspaceControl *rete.WorkspaceCo
 		fpath := fmt.Sprintf("%s/%s/build/%s.rete.json", workspaceHome,
 			wprefix, strings.TrimSuffix(name, ".jr"))
 		// Make sure the directory exists
-		err = os.MkdirAll(filepath.Dir(fpath), 0770)
+		err = utils.EnsureWorkspaceDir(filepath.Dir(fpath))
 		if err != nil {
 			return "", fmt.Errorf("while creating build sub-directory: %v", err)
 		}
@@ -210,14 +231,25 @@ func compileWorkspaceV2(dbpool *pgxpool.Pool, workspaceControl *rete.WorkspaceCo
 		return buf.String(), fmt.Errorf("failed to save rule sequences: %w", err)
 	}
 
+	// Record the rules unit tests (rules_unit_test_harness AD.1). A test file
+	// that fails validation is recorded with its findings rather than failing
+	// the compile: a broken test must not stop a workspace deploying.
+	recorded, invalid, err := SaveUnitTests(context.TODO(), wdb.DB, workspacePath)
+	if err != nil {
+		return buf.String(), fmt.Errorf("failed to save rules unit tests: %w", err)
+	}
+	fmt.Fprintf(&buf, "Recorded %d rules unit tests in workspace.db, %d of them invalid\n", recorded, invalid)
+
 	// All files are now compiled
+	// The rebuild is skipped when the existing lookup.db was built from the same
+	// inputs (lookup_db_fingerprint.go); the log says which happened and why.
 	buf.WriteString("All main rule files compiled, now package the lookup.db file\n")
-	err = PackageLookupTablesToSqlite(lookupTables)
+	lookupDbResult, err := EnsureLookupDb(lookupTables)
 	if err != nil {
 		log.Println("Error packaging lookup tables to SQLite:", err)
 		return buf.String(), err
 	}
-	buf.WriteString("Lookup tables packaged into lookup.db\n")
+	buf.WriteString(lookupDbResult.String())
 
 	// Archive reports
 	inputPath := []string{fmt.Sprintf("%s/%s/reports/", workspaceHome, workspaceName)}
@@ -232,13 +264,23 @@ func compileWorkspaceV2(dbpool *pgxpool.Pool, workspaceControl *rete.WorkspaceCo
 	buf.WriteString("Workspace reports archived in reports.tgz\n")
 
 	// Save the workspace-wide classes and tables in the workspace build directory
-	// Create a map to save them in a lookup-like structure
+	// Create a map to save them in a lookup-like structure.
+	// A class imported by more than one main rule file is compiled once per main
+	// file, and each of those nodes only knows what its own compilation unit saw -
+	// in particular SubClasses, which is derived from the classes declared in that
+	// unit. Keeping the last node visited would therefore give the workspace-wide
+	// view one main file's answer, chosen by map iteration order. Merge instead.
 	domainClasses := make(map[string]*rete.ClassNode)
 	domainTables := make(map[string]*rete.TableNode)
 	domainProperties := make(map[string]*rete.PropertyNode)
 	for _, cls := range classes {
-		domainClasses[cls.Name] = cls
-		for _, prop := range cls.DataProperties {
+		if existing, ok := domainClasses[cls.Name]; ok {
+			mergeClassNode(existing, cls)
+		} else {
+			domainClasses[cls.Name] = cloneClassNode(cls)
+		}
+		for i := range cls.DataProperties {
+			prop := cls.DataProperties[i]
 			domainProperties[prop.Name] = &prop
 		}
 	}
@@ -282,11 +324,7 @@ func compileWorkspaceV2(dbpool *pgxpool.Pool, workspaceControl *rete.WorkspaceCo
 	file.Close()
 
 	// Archive the build rules and cpipes config
-	inputPath = []string{
-		fmt.Sprintf("%s/%s/workspace_control.json", workspaceHome, workspaceName),
-		fmt.Sprintf("%s/%s/build/", workspaceHome, workspaceName),
-		fmt.Sprintf("%s/%s/pipes_config/", workspaceHome, workspaceName),
-	}
+	inputPath = workspaceArchivePaths(workspaceHome, workspaceName)
 	outputPath = fmt.Sprintf("%s/%s/workspace.tgz", workspaceHome, workspaceName)
 	buf.WriteString("\nArchiving the build and cpipes config directories\n")
 	err = tarextract.CreateTarGz(fmt.Sprintf("%s/%s", workspaceHome, workspaceName), inputPath, outputPath)
@@ -326,4 +364,29 @@ func compileWorkspaceV2(dbpool *pgxpool.Pool, workspaceControl *rete.WorkspaceCo
 	}
 
 	return buf.String(), err
+}
+
+// compileWarnings returns the warning lines of a rule file's error log that
+// its parse log does not already carry, under a heading, or "" when there are
+// none. The compiler marks a warning by the text "warning:" (compilerv2's
+// severityOf); anything else in the error log is an error and fails the compile
+// before this is reached.
+func compileWarnings(errorLog, parseLog string) string {
+	shown := make(map[string]bool)
+	for _, line := range strings.Split(parseLog, "\n") {
+		shown[strings.TrimSpace(line)] = true
+	}
+	var b strings.Builder
+	for _, line := range strings.Split(errorLog, "\n") {
+		if strings.TrimSpace(line) == "" || !strings.Contains(line, "warning:") || shown[strings.TrimSpace(line)] {
+			continue
+		}
+		if b.Len() == 0 {
+			b.WriteString("Compilation warnings:\n")
+		}
+		b.WriteString("  ")
+		b.WriteString(strings.TrimSpace(line))
+		b.WriteString("\n")
+	}
+	return b.String()
 }

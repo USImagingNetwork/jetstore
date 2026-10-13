@@ -190,6 +190,18 @@ class AlphaNodeImpl: public AlphaNode {
     };
   }
 
+  bool
+  mints_resource()const override
+  {
+    return fu_.mints_resource() or fv_.mints_resource() or fw_.mints_resource();
+  }
+
+  bool
+  reads_graph()const override
+  {
+    return fu_.reads_graph() or fv_.reads_graph() or fw_.reads_graph();
+  }
+
   /**
    * @brief Return find statement as a `triple`
    * 

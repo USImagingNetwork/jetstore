@@ -64,8 +64,8 @@ classStmt
   ;
 
 subClassOfStmt: baseClassName=declIdentifier;
-dataPropertyDefinitions: dataPName=declIdentifier 'as' array=ARRAY? dataPType=dataPropertyType;
-objectPropertyDefinitions: objectPName=declIdentifier 'as' array=ARRAY? ResourceType;
+dataPropertyDefinitions: dataPName=declIdentifier 'as' array=ARRAY? dataPType=dataPropertyType deleted=DELETED?;
+objectPropertyDefinitions: objectPName=declIdentifier 'as' array=ARRAY? ResourceType deleted=DELETED?;
 dataPropertyType
   : Int32Type
   | UInt32Type
@@ -198,7 +198,10 @@ jetRuleStmt: '[' ruleName=Identifier ruleProperties* ']' ':'
 ruleProperties: ',' key=Identifier ASSIGN valCtx=propertyValue ;
 propertyValue: ( val=STRING | val=TRUE | val=FALSE | intval=intExpr ) ;
 
-antecedent: n=NOT? '(' s=atom p=atom o=objectAtom ')' '.'? ( '[' f=exprTerm ']' '.'? )? ;
+// COMMENT* before the filter: a filter belongs to the antecedent before it, and
+// jetRuleStmt admits comments only between whole antecedents, so without it a
+// comment line between a term and its filter was a syntax error.
+antecedent: n=NOT? '(' s=atom p=atom o=objectAtom ')' '.'? ( COMMENT* '[' f=exprTerm ']' '.'? )? ;
 consequent: '(' s=atom p=atom o=exprTerm ')' '.'? ;
 
 atom
@@ -280,6 +283,10 @@ AsTable: '$as_table';
 DataProperties: '$data_properties';
 ObjectProperties: '$object_properties';
 ARRAY: 'array of';
+// A tombstone: the property's column is to be dropped from the domain table.
+// See UpdateDomainTableSchema; this is the model's counterpart of the "deleted"
+// flag jets_schema.json carries for the JetStore tables.
+DELETED: 'deleted';
 GroupingProperties: '$grouping_properties';
 
 // JetStore Config
