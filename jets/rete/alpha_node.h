@@ -236,6 +236,25 @@ class AlphaNode {
   virtual rdf::Triple
   compute_consequent_triple(ReteSession * rete_session, BetaRow const* beta_row)const=0;
 
+  /**
+   * @brief True when a functor is an expression that mints a resource (see
+   * ExprBase::mints_resource), so compute_consequent_triple gives a different triple
+   * each time it is called on the same beta row.
+   *
+   * Applicable to consequent terms. ReteMetaStore::initialize uses it to decide which
+   * node vertexes record their inferred triples on the beta row.
+   */
+  virtual bool
+  mints_resource()const=0;
+
+  /**
+   * @brief True when a functor is an expression that reads the graph (see
+   * ExprBase::reads_graph). Applicable to consequent terms. ReteMetaStore::initialize
+   * consults it only when its RetractionMode turns LEGACY defect 1 off.
+   */
+  virtual bool
+  reads_graph()const=0;
+
   virtual std::ostream & describe(std::ostream & out)const=0;
 
  private:

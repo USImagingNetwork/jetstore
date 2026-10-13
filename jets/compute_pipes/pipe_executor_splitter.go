@@ -46,32 +46,35 @@ func (ctx *BuilderContext) StartSplitterPipe(spec *PipeSpec, source *InputChanne
 			if len(spec.Apply[i].OutputChannel.Name) > 0 {
 				oc[spec.Apply[i].OutputChannel.Name] = true
 			}
+			// A site operator's `site_config.output_channels`. StartFanOutPipe's arm
+			// verbatim, reading the same function for the same reason: a channel
+			// declared there is registered and resolved, and without this it is
+			// closed by nothing (P9-I13). Outside the switch because a site token is
+			// none of the cases below, and it answers nil for every document that
+			// declares no site output channels, so such a document takes exactly the
+			// path it took before.
+			for _, siteChannel := range siteOutputChannelConfigs(&spec.Apply[i]) {
+				if len(siteChannel.Name) > 0 {
+					oc[siteChannel.Name] = true
+				}
+			}
+			// Every operator's error channel, through errorChannelConfig: StartFanOutPipe's
+			// arm verbatim, and for its reason -- the per-type list here named no
+			// `render` and no site operator, so their error channels were closed by
+			// nothing.
+			if ec := errorChannelConfig(&spec.Apply[i]); ec != nil && len(ec.Name) > 0 {
+				oc[ec.Name] = true
+			}
 			switch spec.Apply[i].Type {
 			case "jetrules":
 				// Get the output channels of jetrules
 				for j := range spec.Apply[i].JetrulesConfig.OutputChannels {
 					oc[spec.Apply[i].JetrulesConfig.OutputChannels[j].Name] = true
 				}
-				// Get the error output channel of jetrules
-				if spec.Apply[i].JetrulesConfig.ErrorChannel != nil {
-					oc[spec.Apply[i].JetrulesConfig.ErrorChannel.Name] = true
-				}
-
-			case "ollama":
-				// Get the error output channel of ollama
-				if spec.Apply[i].OllamaConfig.ErrorChannel != nil {
-					oc[spec.Apply[i].OllamaConfig.ErrorChannel.Name] = true
-				}
 
 			case "clustering":
 				// Get the output channels of clustering
 				oc[spec.Apply[i].ClusteringConfig.CorrelationOutputChannel.Name] = true
-
-			case "map_record":
-				// Get the error output channel of map_record
-				if spec.Apply[i].MapRecordConfig.ErrorChannel != nil {
-					oc[spec.Apply[i].MapRecordConfig.ErrorChannel.Name] = true
-				}
 			}
 		}
 		for i := range oc {
@@ -198,6 +201,11 @@ func (ctx *BuilderContext) StartSplitterPipe(spec *PipeSpec, source *InputChanne
 			wg.Add(1)
 			channelHandlersCount += 1
 			go ctx.startSplitterChannelHandler(spec, &InputChannel{
+				// Name is the channel the splitter reads, carried through to
+				// the split so that downstream writers can name the edge of the
+				// DAG they are on. The ChannelSpec's name below is generated
+				// per split and is a label rather than a config identity.
+				Name:           source.Name,
 				Channel:        splitCh.data,
 				Columns:        source.Columns,
 				DomainKeySpec:  source.DomainKeySpec,
@@ -220,6 +228,9 @@ func (ctx *BuilderContext) StartSplitterPipe(spec *PipeSpec, source *InputChanne
 				// syart a go routine to manage the new channel
 				wg.Add(1)
 				go ctx.startSplitterChannelHandler(spec, &InputChannel{
+					// See the note above: Name is the config channel, the
+					// ChannelSpec's name is a per-split label.
+					Name:    source.Name,
 					Channel: splitCh.data,
 					Columns: source.Columns,
 					Config: &ChannelSpec{
