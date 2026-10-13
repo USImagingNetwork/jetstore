@@ -1,4 +1,12 @@
 # =======================================================================================
+# jetstore-owned-asset: data_model/jets_model.jr — DO NOT EDIT.
+# Source: hand-authored in JetStore at jets/workspace_assets/data_model/jets_model.jr;
+# the platform base model, one copy for every workspace.
+# Installed into this workspace at image build time and overwritten on every build; a
+# local edit is lost, and the build fails rather than clobbering it silently. Extend the
+# model from your own file that imports this one.
+#   import "data_model/jets_model.jr"
+# =======================================================================================
 # Jets Data Model 
 # ---------------------------------------------------------------------------------------
 # Define the jets data model version

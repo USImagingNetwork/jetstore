@@ -180,12 +180,15 @@ var sqlInsertStmts = map[string]*SqlInsertDefinition{
 	},
 
 	// pipeline_execution_status
+	// workspace_name and workspace_version are not supplied by the caller: InsertRows
+	// stamps them into the row's data before this statement runs, the same way it
+	// supplies input_session_id and request_id. See setWorkspaceBinding.
 	"pipeline_execution_status": {
-		Stmt: `INSERT INTO jetsapi.pipeline_execution_status 
-			(pipeline_config_key, main_input_registry_key, main_input_file_key, merged_input_registry_keys, client, process_name, main_object_type, input_session_id, request_id, session_id, source_period_key, status, user_email) 
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		Stmt: `INSERT INTO jetsapi.pipeline_execution_status
+			(pipeline_config_key, main_input_registry_key, main_input_file_key, merged_input_registry_keys, client, process_name, main_object_type, input_session_id, request_id, session_id, source_period_key, status, user_email, workspace_name, workspace_version)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 			RETURNING key`,
-		ColumnKeys: []string{"pipeline_config_key", "main_input_registry_key", "main_input_file_key", "merged_input_registry_keys", "client", "process_name", "main_object_type", "input_session_id", "request_id", "session_id", "source_period_key", "status", "user_email"},
+		ColumnKeys: []string{"pipeline_config_key", "main_input_registry_key", "main_input_file_key", "merged_input_registry_keys", "client", "process_name", "main_object_type", "input_session_id", "request_id", "session_id", "source_period_key", "status", "user_email", "workspace_name", "workspace_version"},
 		Capability: "run_pipelines",
 	},
 
@@ -305,6 +308,20 @@ var sqlInsertStmts = map[string]*SqlInsertDefinition{
 			(last_git_log, status, user_email, last_update) 
 			= ($1, $2, $3, DEFAULT) WHERE key = $4`,
 		ColumnKeys: []string{"last_git_log", "status", "user_email", "key"},
+		Capability: "workspace_ide",
+	},
+	// rules unit tests: queue one run per selected test of the active workspace.
+	// The statement is executed by queueRulesUnitTests (rules_unit_test_runs.go), not by
+	// WorkspaceInsertRows' per-row loop, because the refusals and the insert must
+	// share one transaction; the entry is here for its capability and its columns.
+	// "check" in rules_unit_test_check is a reserved word and is quoted wherever
+	// it is written by hand.
+	rulesUnitTestTarget: {
+		Stmt: `INSERT INTO jetsapi.rules_unit_test_execution
+			(workspace_name, test_path, test_name, legacy_mode, status, user_email)
+			VALUES ($1, $2, $3, $4, $5, $6)
+			RETURNING key`,
+		ColumnKeys: []string{"workspace_name", "test_path", "test_name", "legacy_mode", "status", "user_email"},
 		Capability: "workspace_ide",
 	},
 	// delete workspace in workspace_registry

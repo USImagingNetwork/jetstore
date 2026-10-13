@@ -1,4 +1,31 @@
-FROM cpipes_builder:latest AS builder
+# The builder stage this image copies its binaries out of.
+#
+# **The default is the stock builder, and that default is exit criterion 98.** A
+# build that passes no --build-arg resolves to `cpipes_builder:latest`, which is
+# the literal this line carried before the ARG existed, so a deployment with no
+# site operators builds from the same stage, with the same inputs, and the
+# COPY --from=builder lines below are unchanged.
+#
+# A site that ships its own compute_pipes operators passes
+# CPIPES_BUILDER_IMAGE=cpipes_builder_ws:latest -- Dockerfile.cpipes_builder_ws,
+# which is `FROM cpipes_builder` plus one binary. Its cpipes_native_server is
+# built from the site's own main package, and everything else copied below
+# (cbooter, run_reports, libjets.so and the three system libraries) is the parent
+# image's, byte for byte, because nothing in that Dockerfile rebuilds them.
+#
+# **The site binary keeps the stock name, and that is forced rather than
+# chosen.** The ECS task's entry point is `cbooter cpipes_native_server`
+# (`build_ecs_tasks.go:150`); cbooter refuses any command outside its allowlist
+# (`allowedCommands`, `jets/cmds/cbooter/main.go:63`) and execs it by PATH
+# lookup (`runCommandAsJsuser`). A site task binary under any other name would
+# need a stack change and a cbooter change; one written over the stock path
+# needs neither.
+#
+# An ARG before the first FROM is a global ARG -- in scope for FROM lines and
+# out of scope inside every stage, which is why the stages below re-declare the
+# ARGs they use.
+ARG CPIPES_BUILDER_IMAGE=cpipes_builder:latest
+FROM ${CPIPES_BUILDER_IMAGE} AS builder
 
 # RUN \
 #     echo "/usr/local/lib64/ DIRECTORY Contains" \
@@ -20,6 +47,26 @@ RUN groupadd -g ${GROUP_ID} jsuser \
 
 ENV JETS_SOURCE_DIR=/app JETS_BUILD_DIR=/app
 
+# JETS_VERSION is the build's timestamp, stamped identically into every image of
+# a build run by build_cpipes.sh. It is not only provenance: compile_workspace
+# writes it into the database as the workspace version (Dockerfile.compile_ws,
+# which inherits it from cpipes_builder), and SyncComputePipesWorkspace skips
+# fetching workspace.tgz and sqlite when the database's version matches this
+# one - because an image carrying its own compiled workspace already has them.
+#
+# It was passed by build_cpipes.sh and discarded here until 2026-08-22: an ARG
+# is scoped to its stage and ENV does not cross the FROM above, so this final
+# stage inherited neither and every task cold-started with a download it did
+# not need.
+ARG JETS_VERSION
+ENV JETS_VERSION=${JETS_VERSION}
+ARG JETS_GIT_SHA
+ENV JETS_GIT_SHA=${JETS_GIT_SHA}
+RUN echo "----------------JetStore-Version------------------" >> /VERSION.txt && \
+    echo "JETS_VERSION: ${JETS_VERSION}"                      >> /VERSION.txt && \
+    echo "JETS_GIT_SHA: ${JETS_GIT_SHA}"                      >> /VERSION.txt && \
+    echo "----------------*********************-------------" >> /VERSION.txt
+
 # Copy the binaries to usr/local/bin for ecs tasks
 COPY --from=builder $JETS_SOURCE_DIR/cbooter /usr/local/bin/
 COPY --from=builder $JETS_SOURCE_DIR/run_reports /usr/local/bin/
@@ -27,9 +74,13 @@ COPY --from=builder $JETS_SOURCE_DIR/cpipes_native_server /usr/local/bin/
 
 # COPY native rule engine library
 COPY --from=builder ${JETS_BUILD_DIR}/jets/libjets.so /usr/local/lib/
+# libsqlite3 is not copied: libjets.so needs libsqlite3.so.0, and nothing here
+# ever linked that soname to a copy, so the loader always took the base image's
+# /lib64/libsqlite3.so.0 and the builder's libsqlite3.so.0.8.6 sat unused --
+# measured on 2026-10-11 (rules_unit_test_harness I-35). The base's is what has
+# been running, and the ldd check below fails the build if it ever goes missing.
 #* Verify lib version when upgrading dependencies
 COPY --from=builder /usr/lib64/libboost_date_time.so.1.75.0 /usr/local/lib/
-COPY --from=builder /lib64/libsqlite3.so.0.8.6 /usr/local/lib/
 COPY --from=builder /lib64/libgflags.so.2.2 /usr/local/lib/
 COPY --from=builder /usr/local/lib64/libglog.so.0.6.0 /usr/local/lib/
 
@@ -38,20 +89,22 @@ ENV LD_LIBRARY_PATH=/usr/local/lib
 # Create a simple library cache manually
 RUN echo "/usr/local/lib" > /etc/ld.so.conf.d/local.conf
 
-# Make sure it is executable
-RUN \
-chmod +x /usr/local/bin/cpipes_native_server \
-&& chmod +x /usr/local/bin/cbooter
-
+# **No chmod on the binaries.** go build in Dockerfile.cpipes_builder writes
+# them 0755 and COPY keeps the mode, and a chmod in a later layer stores every
+# file it touches again -- measured on 2026-10-11, a RUN that chmod'ed these two
+# added 60 MB, their sizes summed, and changed no mode. Dockerfile.ui_service
+# carries the same note (rules_unit_test_harness I-31, I-34).
+#
+# **No chmod on the libraries either.** All four are already 0755 where they
+# are copied from in the builder (`ls -lL` there, 2026-10-11), COPY keeps the mode, and the dynamic loader needs no execute bit on a shared
+# object in any case -- it maps it, it does not exec it. The four chmods that stood
+# here rewrote 1.8 MB for nothing; the symlink, the listing and the ldd stay.
 RUN \
     cd /usr/local/lib/ \
-    && chmod +x libglog.so.0.6.0 \
-    && chmod +x libboost_date_time.so.1.75.0 \
-    && chmod +x libsqlite3.so.0.8.6 \
-    && chmod +x libgflags.so.2.2 \
     && ln -s libglog.so.0.6.0 libglog.so.1  \
     && echo "/usr/local/lib/ DIRECTORY Contains" \
     && ls -la /usr/local/lib/ \
     && echo "ldd libjets.so" \
     && ldd libjets.so \
+    && ! ldd libjets.so | grep -q 'not found' \
     && cd / 
