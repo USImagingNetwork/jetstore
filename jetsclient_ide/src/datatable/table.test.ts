@@ -34,7 +34,7 @@ import {
   type TableConfigDocument,
 } from "./table";
 import { validateTableActions } from "../userflow/documentSet";
-import { ROWS_PER_PAGE, fromDocument, restoreActions, toDocument, toDocuments,
+import { ROWS_PER_PAGE, fromDocument, toDocument, toDocuments,
   CORPUS_CORRECTIONS,
 } from "./tableTranslate";
 import type { TableConfig } from "./types";
@@ -53,7 +53,7 @@ const tablesDir = fileURLToPath(new URL("./tables/", import.meta.url));
  * A table document a JetStore flow draws is installed into a workspace by
  * `install_workspace_assets` and read from there by `FlowStore.loadTables`; a
  * table a *screen* draws is imported into this bundle and never leaves it. So the
- * 64 documents this emitter owns are committed in two directories, and which one
+ * 61 documents this emitter owns are committed in two directories, and which one
  * a key belongs to is a property of who reads it rather than of this test.
  */
 const assetTablesDir = fileURLToPath(
@@ -317,6 +317,9 @@ const HAND_MAINTAINED_KEYS = [
   // A Refresh, so a save in the Workspace IDE shows without reloading the page
   // (Michel, 2026-10-11).
   "workspaceChangesTable",
+  // 25 rows per page rather than 50, as the flow's first table has, so the
+  // Start Pipeline steps page alike (Michel, 2026-10-15).
+  "main_input_registry_key",
 ] as const;
 
 /**
@@ -383,7 +386,9 @@ describe("the emitted JSON Schema", () => {
   // **61 since 2026-10-01**: the three add-or-edit option tables `D06` removed
   // were retired, not moved (`jetstore_maintenance_02` `AF.2`–`AF.4`). **64 since
   // 2026-10-11**, the three rules unit test tables (`FEATURE_KEYS`).
-  it("has the 64 configurations committed beside it, for the Go check", () => {
+  // **61 since 2026-10-15 (Release 4.0.4)**: `startPipelineUF` stopped choosing
+  // merged and historical sources, and its three tables were retired.
+  it("has the 61 configurations committed beside it, for the Go check", () => {
     // `jets/userflow/table_schema_test.go` reads this directory and the emitted
     // schema and asserts the same documents pass the Go validator that enforces
     // them at save time — two languages against one artifact rather than two
@@ -444,8 +449,8 @@ describe("the emitted JSON Schema", () => {
   });
 });
 
-describe("the 31 configurations still translated from the flow fixture", () => {
-  it("all translate, and with the authored ones make 64", () => {
+describe("the 28 configurations still translated from the flow fixture", () => {
+  it("all translate, and with the authored ones make 61", () => {
     // 37 + F.5's one + C.2's one + C.4's one + C.7's two + C.6's three + C.9's
     // five + C.13's two + C.10's one + C.3's six + C.3a's two + C.3b's two + the
     // workspace home's one, of which four are authored rather than translated. The
@@ -464,19 +469,24 @@ describe("the 31 configurations still translated from the flow fixture", () => {
     // by going nowhere. **52 and 5 the same evening**, when `workspaceRegistryTable`
     // left too, to drop a label that repeated its screen title. **51 on
     // 2026-10-11**, when `workspaceChangesTable` left to gain a Refresh.
-    expect(Object.keys(flowDocuments).length).toBe(31);
-    expect(Object.keys(translated).length).toBe(51);
+    // **28, 48 and 61 on 2026-10-15 (Release 4.0.4)**, when `startPipelineUF`
+    // stopped choosing merged and historical sources and
+    // `mergeProcessInputTable`, `merged_input_registry_keys` and
+    // `spInjectedProcessInput` were retired with their fixture entries.
+    expect(Object.keys(flowDocuments).length).toBe(28);
+    expect(Object.keys(translated).length).toBe(48);
     expect(Object.keys(handAuthored).length).toBe(2);
     // **8 since 2026-10-02**: `org` and the two `pcView*` tables, which keep
     // their fixture entry as the Flutter record other tests use as material —
     // the on-disk document overrides the translation in `documents`, so the total
     // stays 61 (Phase 2, a plain Show/Hide Select Row and org's + Add).
     // **9 on 2026-10-11**, with `workspaceChangesTable`; the total is unchanged.
-    expect(Object.keys(handMaintained).length).toBe(9);
+    // **10 on 2026-10-15**, with `main_input_registry_key` (25 rows per page).
+    expect(Object.keys(handMaintained).length).toBe(10);
     // **64 since 2026-10-11**: the three rules unit test tables
     // (`rules_unit_test_harness` `AD.4`), written rather than translated.
     expect(Object.keys(featureDocuments).length).toBe(3);
-    expect(Object.keys(documents).length).toBe(64);
+    expect(Object.keys(documents).length).toBe(61);
   });
 
   it("all validate against the schema", () => {
@@ -557,7 +567,8 @@ describe("the 31 configurations still translated from the flow fixture", () => {
   // **28 query until 2026-10-01**: the three tables `AF.1` moved out are all query
   // tables.
   // **Nine static until the same day's `AF.2`–`AF.4`**, which retired three.
-  it("split six static and 25 query, as the corpus does", () => {
+  // **22 query since 2026-10-15**: the three tables Release 4.0.4 retired all query.
+  it("split six static and 22 query, as the corpus does", () => {
     // Derived from the documents; checked against a count taken from the corpus
     // a different way — `apiPath` being empty is how the Dart says "static", and
     // the discriminant is this schema's invention.
@@ -566,11 +577,11 @@ describe("the 31 configurations still translated from the flow fixture", () => {
       {},
     );
     const fromCorpus = Object.values(tables).filter((t) => t.apiPath === "").length;
-    expect(byKind).toEqual({ static: 6, query: 25 });
+    expect(byKind).toEqual({ static: 6, query: 22 });
     expect(fromCorpus).toBe(6);
   });
 
-  it("carry the corpus's 232 columns, 23 actions and 48 where clauses", () => {
+  it("carry the corpus's 203 columns, 22 actions and 37 where clauses", () => {
     /*
       **25 until D.10, and the two it gained are the first configuration in this
       corpus with no Dart original** — `fmInputSourceMappingUF`'s *Load Data* and
@@ -589,7 +600,11 @@ describe("the 31 configurations still translated from the flow fixture", () => {
       // columns, 1 action), `scSourceConfigKey` (15, 2) and `pcPipelineConfigTable`
       // (16, 1, and the one where clause, its join) out of the fixture; 232 after
       // `AF.2`–`AF.4` retired three static option tables of three columns each.
-    }).toEqual({ columns: 232, actions: 23, where: 48 });
+      // **203, 22 and 37 since 2026-10-15**, when Release 4.0.4 retired
+      // `mergeProcessInputTable` (10 columns, 1 where clause),
+      // `merged_input_registry_keys` (14, its *Clear Filters*, 9) and
+      // `spInjectedProcessInput` (5, 1).
+    }).toEqual({ columns: 203, actions: 22, where: 37 });
   });
 
   it("name two escapes between them, not six", () => {
@@ -735,12 +750,14 @@ describe("workspaceRegistryTable, the /workspaces screen's table", () => {
   const doc = documents["workspaceRegistryTable"]!;
   const config = configOf("workspaceRegistryTable");
   /**
-   * The registry's actions wherever they are drawn. **Since 2026-10-11 the ten
-   * that act on a workspace are the Workspace IDE's toolbar**
-   * (`screens/documents/workspaceIdeToolbar.json`), still in this table's action
-   * format and still run against a registry row; the table keeps the four about
-   * the registry itself. So the claims below about the registry's actions are
-   * asserted over both documents, and where each button lives is asserted once.
+   * The registry's actions wherever they are drawn. **From 2026-10-11 to
+   * 2026-10-15 the ten that act on a workspace were the Workspace IDE's toolbar**
+   * (`screens/documents/workspaceIdeToolbar.json`), in this table's action format.
+   * **They came back to this table on 2026-10-15**, at Michel's request: a compile
+   * started from the IDE showed no progress, because the compile's status is on
+   * this table. The toolbar keeps only Refresh. The claims below are still
+   * asserted over both documents, so a button that moves again is still counted,
+   * and where each button lives is asserted once.
    */
   const toolbar = WorkspaceToolbarDocumentSchema.parse(toolbarJson).rows;
   const registryActions = doc.source === "query" ? [...(doc.actions ?? []), ...(doc.secondRowActions ?? [])] : [];
@@ -800,14 +817,15 @@ describe("workspaceRegistryTable, the /workspaces screen's table", () => {
     // **Nine since 2026-10-11**: *Rules Unit Tests* (`rules_unit_test_harness`
     // `AD.2`) takes `Open`'s gate. The Flutter corpus still has eight, which is
     // why `actionBar.test.tsx`, reading that corpus, still counts eight.
-    // Registry first, then the toolbar's rows: the order the two documents hold.
     // **Six since the same evening**: *Commit & Push*, *Push Only* and *Pull*
-    // lost their gates on the IDE's toolbar (Michel: always enabled).
+    // lost their gates on the IDE's toolbar (Michel: always enabled), and kept
+    // them off when they came back to this table on 2026-10-15. The table's two
+    // rows in order, as on the Flutter screen; the toolbar adds none.
     expect(gated.map((a) => a.key)).toEqual([
       "openWorkspace",
-      "deleteWorkspace",
       "exportWorkspaceClientConfig",
       "loadWorkspaceConfig",
+      "deleteWorkspace",
       "compileWorkspace",
       "rulesUnitTests",
     ]);
@@ -825,8 +843,9 @@ describe("workspaceRegistryTable, the /workspaces screen's table", () => {
     // `doAction`, and the claim is about what the user sees enabled.
     const model = fromDocument("workspaceRegistryTable", doc);
     const open = model.actions.find((a) => a.key === "openWorkspace")!;
-    // On the IDE's toolbar since 2026-10-11, restored against this table's columns.
-    const tests = restoreActions(doc, toolbar.flat()).find((a) => a.key === "rulesUnitTests")!;
+    // On the IDE's toolbar from 2026-10-11 to 2026-10-15; this table's second
+    // row again since.
+    const tests = model.secondRowActions.find((a) => a.key === "rulesUnitTests")!;
     expect(tests.label).toBe("Rules Unit Tests");
     expect(tests.style).toBe("primary");
     expect(tests.capability).toBe("workspace_ide");
@@ -885,35 +904,34 @@ describe("workspaceRegistryTable, the /workspaces screen's table", () => {
     }
   });
 
-  it("keeps the registry's own buttons in one row, and gives the IDE the workspace actions", () => {
+  it("draws the workspace actions in its two rows again, and leaves the IDE only Refresh", () => {
     if (doc.source !== "query") return;
-    // The split is by what a button acts on: a registry row as such (add,
-    // open, delete) or the table (refresh) stay; what acts on a workspace moves.
+    // The pre-2026-10-11 layout, restored on 2026-10-15 (Michel). Each table
+    // button is gated on a selected row; the toolbar's Refresh needs none.
     expect((doc.actions ?? []).map((a) => a.key)).toEqual([
       "addWorkspace",
       "openWorkspace",
+      "exportWorkspaceClientConfig",
+      "loadWorkspaceConfig",
       "deleteWorkspace",
+    ]);
+    expect((doc.secondRowActions ?? []).map((a) => a.key)).toEqual([
+      "compileWorkspace",
+      "rulesUnitTests",
+      "commitWorkspace",
+      "pushOnlyWorkspace",
+      "pullWorkspace",
+      "doGitStatus",
+      "doGitCommand",
+      "viewGitLogWorkspace",
       "refreshTable",
     ]);
-    expect(doc.secondRowActions).toBeUndefined();
-    expect(toolbar.map((row) => row.map((a) => a.key))).toEqual([
-      ["exportWorkspaceClientConfig", "loadWorkspaceConfig", "refreshTable"],
-      [
-        "compileWorkspace",
-        "rulesUnitTests",
-        "commitWorkspace",
-        "pushOnlyWorkspace",
-        "pullWorkspace",
-        "doGitStatus",
-        "doGitCommand",
-        "viewGitLogWorkspace",
-      ],
-    ]);
+    expect(toolbar.map((row) => row.map((a) => a.key))).toEqual([["refreshTable"]]);
   });
 
-  it("was the second table with a second action row in the Flutter corpus, which has no third", () => {
-    // The frozen corpus still carries the registry's two rows; the document
-    // above no longer does.
+  it("is the second table with a second action row, and the Flutter corpus has no third", () => {
+    // The frozen corpus carries the registry's two rows, and so does the
+    // document again since 2026-10-15.
     const withSecondRow = Object.entries(screenTables)
       .filter(([, t]) => t.secondRowActions.length > 0)
       .map(([key]) => key);
@@ -921,7 +939,7 @@ describe("workspaceRegistryTable, the /workspaces screen's table", () => {
   });
 
   it("names no escape, so this screen needs no predicate registered", () => {
-    // All nine gates are row criteria, which are data; `hasIsEnabledFnc` is
+    // All six gates are row criteria, which are data; `hasIsEnabledFnc` is
     // false on every action of this table. The two mechanisms look alike and are
     // not the same one — see `tableTranslate.ts`.
     expect(escapeNamesOf(doc)).toEqual([]);
@@ -929,17 +947,19 @@ describe("workspaceRegistryTable, the /workspaces screen's table", () => {
     expect(toolbar.flat().some((a) => a.isEnabled !== undefined)).toBe(false);
   });
 
-  it("names three action-document entries and five dialog forms on the toolbar's second row", () => {
-    // `compileWorkspace` moved to the toolbar; the registry keeps the other two.
-    expect(actionNamesOf(doc)).toEqual(["deleteWorkspace", "openWorkspace"]);
+  it("names three action-document entries and five dialog forms on the second row", () => {
+    // `compileWorkspace` is the table's again since 2026-10-15, and the
+    // toolbar's Refresh names no entry, so the two lists agree.
+    expect(actionNamesOf(doc)).toEqual(["compileWorkspace", "deleteWorkspace", "openWorkspace"]);
     expect(
       [...registryActions, ...toolbar.flat()]
         .filter((a) => a.action === "doAction")
         .map((a) => a.actionName)
         .sort(),
     ).toEqual(["compileWorkspace", "deleteWorkspace", "openWorkspace"]);
+    if (doc.source !== "query") return;
     expect(
-      toolbar[1]!.filter((a) => a.action === "showDialog").map((a) => a.configForm),
+      (doc.secondRowActions ?? []).filter((a) => a.action === "showDialog").map((a) => a.configForm),
     ).toEqual([
       "commitWorkspaceDialog",
       "pushOnlyWorkspaceDialog",
