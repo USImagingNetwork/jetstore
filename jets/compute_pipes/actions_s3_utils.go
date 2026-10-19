@@ -125,6 +125,44 @@ func GetPartitionSize4LookbackPeriod(bucket, fileKey, lookbackPeriod, sourceObje
 	return nil
 }
 
+// objectsOfPartition keeps the objects of one jets_partition.
+//
+// A stage channel read through file_key (a client's staged feed, with or
+// without a lookback) lists the whole folder, every partition of every session
+// it keeps. GetComputePipesPartitions starts one node per jets_partition found
+// in those keys, so each node must read its own partition only, as the
+// read_step_id branch does by building the partition into the prefix. Until
+// 2026-10-16 the file_key branch did not, and every node read every partition:
+// a feed staged in four partitions was read four times (a client's medical
+// claims, 4 x 195,971 rows). An empty label keeps everything, for a caller
+// that is not partitioned.
+//
+// Since 2026-10-18 the reducing starter no longer runs one node per producer
+// label for such a step: it assigns the files to nodes itself (StageFileKeys,
+// stage_file_assignment.go), because the producers' labels do not match each
+// other's or this session's, and a merge channel's files were dropped when no
+// main input file carried their label. This filter remains for a node given a
+// reducing config written by an earlier starter, which carries no assignment.
+func objectsOfPartition(objects []*awsi.S3Object, jetsPartitionLabel string) ([]*awsi.S3Object, error) {
+	if jetsPartitionLabel == "" {
+		return objects, nil
+	}
+	kept := make([]*awsi.S3Object, 0, len(objects))
+	for _, obj := range objects {
+		if obj.Size == 0 {
+			continue
+		}
+		label, err := ExtractPartitionLabelFromS3Key(obj.Key)
+		if err != nil {
+			return nil, err
+		}
+		if label == jetsPartitionLabel {
+			kept = append(kept, obj)
+		}
+	}
+	return kept, nil
+}
+
 // Get the file_key(s) from s3 for the given process/session/step/partition.
 // This is used during the reducing mode or merge files only pipeline.
 func GetS3FileKeys(processName, sessionId, mainInputStepId, jetsPartitionLabel string,
@@ -153,6 +191,10 @@ func GetS3FileKeys(processName, sessionId, mainInputStepId, jetsPartitionLabel s
 		if err != nil {
 			return nil, fmt.Errorf("failed to download list of files from s3 for main input: %v", err)
 		}
+		s3Objects, err = objectsOfPartition(s3Objects, jetsPartitionLabel)
+		if err != nil {
+			return nil, fmt.Errorf("main input: %v", err)
+		}
 	}
 	allS3Objects[0] = s3Objects
 
@@ -177,6 +219,10 @@ func GetS3FileKeys(processName, sessionId, mainInputStepId, jetsPartitionLabel s
 				mergeChannelConfig.LookbackPeriods, mergeChannelConfig.SourceObjectType, envSettings)
 			if err != nil {
 				return nil, fmt.Errorf("failed to download list of files from s3 for merge channel %d: %v", i, err)
+			}
+			s3Objects, err = objectsOfPartition(s3Objects, jetsPartitionLabel)
+			if err != nil {
+				return nil, fmt.Errorf("merge channel %d: %v", i, err)
 			}
 		}
 		allS3Objects[i+1] = s3Objects
