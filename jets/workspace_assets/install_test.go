@@ -250,15 +250,15 @@ func TestModifiedPipelineConfigIsRefusedAndDiagnosedFromTheManifest(t *testing.T
 	}
 }
 
-// A21.3, second clause and the reason it exists: usi_ws's jets_model.jr, a
+// A21.3, second clause and the reason it exists: a client workspace's jets_model.jr, a
 // client file at a path JetStore has since claimed. It carries no ownership
 // header, so it is diagnosed as never-installed rather than as edited — and
 // nothing else is installed either, in either directory, so the workspace is
 // not left half-updated.
 func TestUnownedFileAtAReservedPathIsRefusedWholesale(t *testing.T) {
 	dir := newWorkspace(t)
-	usi := []byte("# usi specific extension\nresource iWorkBook = \"iWorkBook\";\n")
-	if err := os.WriteFile(filepath.Join(dir, dataModel, "jets_model.jr"), usi, 0644); err != nil {
+	client := []byte("# client specific extension\nresource iWorkBook = \"iWorkBook\";\n")
+	if err := os.WriteFile(filepath.Join(dir, dataModel, "jets_model.jr"), client, 0644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -278,7 +278,7 @@ func TestUnownedFileAtAReservedPathIsRefusedWholesale(t *testing.T) {
 		t.Error("pipes_config was installed despite a data_model conflict; " +
 			"the guard does not span the groups")
 	}
-	if string(read(t, dir, dataModel, "jets_model.jr")) != string(usi) {
+	if string(read(t, dir, dataModel, "jets_model.jr")) != string(client) {
 		t.Error("the client's file was overwritten")
 	}
 }
@@ -310,8 +310,8 @@ func TestPipesConfigConflictRefusesDataModelToo(t *testing.T) {
 // -force is the documented one-time adoption, and nothing else.
 func TestForceAdoptsTheJetStoreVersion(t *testing.T) {
 	dir := newWorkspace(t)
-	usi := []byte("# usi specific extension\nresource iWorkBook = \"iWorkBook\";\n")
-	if err := os.WriteFile(filepath.Join(dir, dataModel, "jets_model.jr"), usi, 0644); err != nil {
+	client := []byte("# client specific extension\nresource iWorkBook = \"iWorkBook\";\n")
+	if err := os.WriteFile(filepath.Join(dir, dataModel, "jets_model.jr"), client, 0644); err != nil {
 		t.Fatal(err)
 	}
 	mine := []byte("{\"comment\": \"the workspace's own loader\"}\n")
@@ -445,9 +445,13 @@ var projectedKeys = map[string]bool{
 
 // A flow's documents are read together and a set that lost one fails at load in
 // the browser — the layer this repository has least visibility into, so the glob
-// is checked here instead (task U.2).
+// is checked here instead.
 //
-// **Two shapes since the eleven ported flows moved in.** FlowStore reads the
+// **Two shapes since the ported flows moved in** — eleven on 2026-08-26, ten
+// since `registerFileKeyUF` was retired on 2026-10-01, and `rulesUnitTestUF`,
+// written rather than ported, has the same three documents. This sentence said
+// *the eleven ported flows* until 2026-11-10; the test asserts no count, so
+// none is kept here either. FlowStore reads the
 // .uf.json, .ua.json and .form.json of every flow; a projection has a fourth,
 // the .apply.json, which no UserFlow schema describes and only the escape reads.
 // So three documents is the rule and the fourth is a property of being generated

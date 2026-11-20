@@ -17,6 +17,13 @@ import (
 // functions to build the cpipes state machine
 
 func (jsComp *JetStoreStackComponents) BuildEcsTasks(scope constructs.Construct, stack awscdk.Stack, props *JetstoreOneStackProps) {
+	if !jsComp.SkipReportsSM {
+		jsComp.buildRunreportTaskDefinition(stack)
+	}
+	jsComp.buildCpipesTaskDefinition(scope, stack, props)
+}
+
+func (jsComp *JetStoreStackComponents) buildRunreportTaskDefinition(stack awscdk.Stack) {
 
 	// Define the run_reports task, used in jsComp.ServerSM, and jsComp.LoaderSM
 	// Run Reports ECS Task Definition
@@ -50,13 +57,12 @@ func (jsComp *JetStoreStackComponents) BuildEcsTasks(scope constructs.Construct,
 		Essential:     jsii.Bool(true),
 		EntryPoint:    jsii.Strings("cbooter", "run_reports"),
 		Environment: &map[string]*string{
+			"JETS_IDE_CODE_GUARD":           jsii.String(os.Getenv("JETS_IDE_CODE_GUARD")), // runs dblogin.Ensure when a restricted login is missing; "off" keeps the guard off
 			"JETS_BUCKET":                   jsComp.SourceBucket.BucketName(),
 			"JETS_TEMP_DATA":                jsii.String(jsComp.JetsTempData()),
 			"TMPDIR":                        jsii.String(jsComp.TempDir()),
 			"JETS_DOMAIN_KEY_HASH_ALGO":     jsii.String(os.Getenv("JETS_DOMAIN_KEY_HASH_ALGO")),
 			"JETS_DOMAIN_KEY_HASH_SEED":     jsii.String(os.Getenv("JETS_DOMAIN_KEY_HASH_SEED")),
-			"JETS_INPUT_ROW_JETS_KEY_ALGO":  jsii.String(os.Getenv("JETS_INPUT_ROW_JETS_KEY_ALGO")),
-			"JETS_INVALID_CODE":             jsii.String(os.Getenv("JETS_INVALID_CODE")),
 			"JETS_REGION":                   jsii.String(os.Getenv("AWS_REGION")),
 			"JETS_PIVOT_YEAR_TIME_PARSING":  jsii.String(os.Getenv("JETS_PIVOT_YEAR_TIME_PARSING")),
 			"JETS_s3_INPUT_PREFIX":          jsii.String(os.Getenv("JETS_s3_INPUT_PREFIX")),
@@ -72,7 +78,6 @@ func (jsComp *JetStoreStackComponents) BuildEcsTasks(scope constructs.Construct,
 			"JETS_CPIPES_SM_ARN":            jsii.String(jsComp.CpipesSmArn),
 			"JETS_CPIPES_NATIVE_SM_ARN":     jsii.String(jsComp.CpipesNativeSmArn),
 			"JETS_REPORTS_SM_ARN":           jsii.String(jsComp.ReportsSmArn),
-			"JETS_DB_POOL_SIZE":             jsii.String(os.Getenv("JETS_DB_POOL_SIZE")),
 			"WORKSPACES_HOME":               jsii.String(jsComp.JetsTempData() + "/workspaces"),
 			"WORKSPACE":                     jsii.String(os.Getenv("WORKSPACE")),
 		},
@@ -91,6 +96,9 @@ func (jsComp *JetStoreStackComponents) BuildEcsTasks(scope constructs.Construct,
 		ContainerPath: jsii.String(jsComp.JetsTempData()),
 		ReadOnly:      jsii.Bool(false),
 	})
+}
+
+func (jsComp *JetStoreStackComponents) buildCpipesTaskDefinition(scope constructs.Construct, stack awscdk.Stack, props *JetstoreOneStackProps) {
 	var memLimit, cpu float64
 
 	// JetStore ECS Task for cpipes
@@ -150,14 +158,12 @@ func (jsComp *JetStoreStackComponents) BuildEcsTasks(scope constructs.Construct,
 		EntryPoint:    jsii.Strings("cbooter", "cpipes_native_server"),
 
 		Environment: &map[string]*string{
-			"DEPLOY_CPIPES_NATIVE":          jsii.String("1"),
+			"JETS_IDE_CODE_GUARD":           jsii.String(os.Getenv("JETS_IDE_CODE_GUARD")), // runs dblogin.Ensure when a restricted login is missing; "off" keeps the guard off
 			"JETS_BUCKET":                   jsComp.SourceBucket.BucketName(),
 			"JETS_TEMP_DATA":                jsii.String(jsComp.JetsTempData()),
 			"TMPDIR":                        jsii.String(jsComp.TempDir()),
 			"JETS_DOMAIN_KEY_HASH_ALGO":     jsii.String(os.Getenv("JETS_DOMAIN_KEY_HASH_ALGO")),
 			"JETS_DOMAIN_KEY_HASH_SEED":     jsii.String(os.Getenv("JETS_DOMAIN_KEY_HASH_SEED")),
-			"JETS_INPUT_ROW_JETS_KEY_ALGO":  jsii.String(os.Getenv("JETS_INPUT_ROW_JETS_KEY_ALGO")),
-			"JETS_INVALID_CODE":             jsii.String(os.Getenv("JETS_INVALID_CODE")),
 			"JETS_REGION":                   jsii.String(os.Getenv("AWS_REGION")),
 			"JETS_PIVOT_YEAR_TIME_PARSING":  jsii.String(os.Getenv("JETS_PIVOT_YEAR_TIME_PARSING")),
 			"JETS_s3_INPUT_PREFIX":          jsii.String(os.Getenv("JETS_s3_INPUT_PREFIX")),

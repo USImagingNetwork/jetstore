@@ -1,15 +1,20 @@
 package compute_pipes
 
 import (
+	"cmp"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"maps"
+	"math"
+	"math/big"
 	"runtime/debug"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/artisoft-io/jetstore/jets/jetrules/rete"
@@ -35,6 +40,11 @@ type JrPoolWorker struct {
 	// groupingKey computes the domain key of a session's input, nil when the
 	// input has none (see jetrulesGroupingDomainKey).
 	groupingKey *HashEvaluator
+	// stats counts the optimizer's statistics after each rule set when the step's
+	// optimizer_statistics is on; nil otherwise. statsSession collects the
+	// running bundle's, committed only when the bundle ends without failing.
+	stats        *OptimizerStats
+	statsSession *OptimizerStatsSession
 	// The keys of the rete session running, which its error rows carry (setSessionKeys).
 	sessionGroupingKey sql.NullString
 	sessionRowJetsKey  sql.NullString
@@ -44,7 +54,29 @@ func (ctx *BuilderContext) NewJrPoolWorker(config *JetrulesSpec, source *InputCh
 	re JetRuleEngine, errorOutputCh *OutputChannel, outputChannels []*JetrulesOutputChan,
 	done chan struct{}, errCh chan error) *JrPoolWorker {
 
-	// Prepare a map of the multi-value properties for the output channels, to ensure proper cardinality.
+	mvProperties, column2RdfType := outputChannelProperties(outputChannels)
+
+	// log.Println("New Pool Worker Created")
+	return &JrPoolWorker{
+		config:                   config,
+		source:                   source,
+		ruleEngine:               re,
+		errorOutputCh:            errorOutputCh,
+		outputChannels:           outputChannels,
+		done:                     done,
+		errCh:                    errCh,
+		rdfType2Columns:          rdfType2Columns,
+		multiValueDataProperties: mvProperties,
+		column2RdfType:           column2RdfType,
+		builderContext:           ctx,
+		groupingKey:              ctx.newJetrulesGroupingKey(source),
+	}
+}
+
+// outputChannelProperties is what extraction reads about the output channels'
+// classes: the multi-value properties, to ensure proper cardinality, and each
+// property's rdf type.
+func outputChannelProperties(outputChannels []*JetrulesOutputChan) (map[string]bool, map[string]string) {
 	mvProperties := make(map[string]bool)
 	var column2RdfType map[string]string
 	for _, outChannel := range outputChannels {
@@ -70,22 +102,115 @@ func (ctx *BuilderContext) NewJrPoolWorker(config *JetrulesSpec, source *InputCh
 	if column2RdfType == nil {
 		column2RdfType = make(map[string]string)
 	}
+	return mvProperties, column2RdfType
+}
 
-	// log.Println("New Pool Worker Created")
-	return &JrPoolWorker{
-		config:                   config,
-		source:                   source,
-		ruleEngine:               re,
-		errorOutputCh:            errorOutputCh,
-		outputChannels:           outputChannels,
-		done:                     done,
-		errCh:                    errCh,
-		rdfType2Columns:          rdfType2Columns,
-		multiValueDataProperties: mvProperties,
-		column2RdfType:           column2RdfType,
-		builderContext:           ctx,
-		groupingKey:              ctx.newJetrulesGroupingKey(source),
+// ExtractClass is one class a SessionExtractor extracts, as a jetrules output
+// channel names it: the class and the channel's columns, which a pipeline takes
+// from the class's domain properties (GetDomainProperties) followed by the
+// channel spec's own columns.
+type ExtractClass struct {
+	ClassName string
+	Columns   []string
+}
+
+// SessionExtractor extracts the entities of a list of classes from rdf sessions
+// through the pipeline's own extraction, extractSessionData, as executeRules does
+// once a session's rules have run. It is built once and used for many sessions,
+// as a pool worker is: what NewJrPoolWorker prepares (the classes' multi-value
+// properties and rdf types) is prepared once, and each class's rows go to an
+// output channel read by a goroutine that lives as long as the extractor, as a
+// pipeline's downstream pipe does. Extract therefore costs the extraction and
+// the channel sends, and nothing that a pipeline pays once per worker.
+//
+// Two things a pipeline does are left out, and both are outside the rules: the
+// output channel's column evaluators (constant columns such as session_id, set
+// by the transformation's columns), and the error channel, so a property with
+// several values is logged and counted but reported nowhere.
+//
+// It is for the rules_bench command (jets/cmds/rules_bench); no pipeline calls
+// it. One extractor serves one goroutine at a time, as a pool worker does.
+type SessionExtractor struct {
+	worker  *JrPoolWorker
+	drains  []chan []any
+	flushed []chan int
+	done    sync.WaitGroup
+}
+
+// NewSessionExtractor prepares the extraction of classes. emit, when not nil,
+// receives every row, on the class's drain goroutine. Close releases the
+// goroutines.
+func NewSessionExtractor(config *JetrulesSpec, classes []ExtractClass, emit func(className string, row []any)) *SessionExtractor {
+	outputChannels := make([]*JetrulesOutputChan, 0, len(classes))
+	for _, c := range classes {
+		outputChannels = append(outputChannels, &JetrulesOutputChan{
+			ClassName:         c.ClassName,
+			JrColumnEncodings: map[string]*JrSpecialColumnEncoding{},
+			OutputCh: &OutputChannel{
+				Name:   c.ClassName,
+				Config: &ChannelSpec{Name: c.ClassName, ClassName: c.ClassName, Columns: c.Columns},
+			},
+		})
 	}
+	mvProperties, column2RdfType := outputChannelProperties(outputChannels)
+	x := &SessionExtractor{
+		worker: &JrPoolWorker{
+			config:                   config,
+			outputChannels:           outputChannels,
+			done:                     make(chan struct{}),
+			multiValueDataProperties: mvProperties,
+			column2RdfType:           column2RdfType,
+		},
+	}
+	for _, outChannel := range outputChannels {
+		ch := make(chan []any, 1)
+		flushed := make(chan int)
+		outChannel.OutputCh.Channel = ch
+		x.drains = append(x.drains, ch)
+		x.flushed = append(x.flushed, flushed)
+		x.done.Add(1)
+		go func(className string) {
+			defer x.done.Done()
+			n := 0
+			for row := range ch {
+				// A nil row is Extract's end-of-session mark: extractSessionData
+				// never sends one.
+				if row == nil {
+					flushed <- n
+					n = 0
+					continue
+				}
+				if emit != nil {
+					emit(className, row)
+				}
+				n++
+			}
+		}(outChannel.ClassName)
+	}
+	return x
+}
+
+// Extract extracts every class from rdfSession and returns the number of rows
+// extracted per class, once each class's drain goroutine has received them all.
+func (x *SessionExtractor) Extract(rdfSession JetRdfSession) (map[string]int, error) {
+	counts := make(map[string]int, len(x.drains))
+	for i, outChannel := range x.worker.outputChannels {
+		err := x.worker.extractSessionData(rdfSession, outChannel, outChannel.OutputCh.Config)
+		x.drains[i] <- nil
+		counts[outChannel.ClassName] = <-x.flushed[i]
+		if err != nil {
+			return counts, fmt.Errorf("while extracting entities of class %s: %v", outChannel.ClassName, err)
+		}
+	}
+	return counts, nil
+}
+
+// Close stops the drain goroutines and waits for them.
+func (x *SessionExtractor) Close() {
+	for _, ch := range x.drains {
+		close(ch)
+	}
+	x.done.Wait()
 }
 
 func (ctx *JrPoolWorker) DoWork(mgr *JrPoolManager, resultCh chan JetrulesWorkerResult) {
@@ -156,6 +281,12 @@ func (ctx *JrPoolWorker) executeRules(inputRecords *[]any,
 	var cpErr error
 	var outcome RuleSetsOutcome
 	re := ctx.ruleEngine
+	// The bundle's optimizer statistics, when the step counts them: collected by
+	// reportRuleSet, committed at the end only if the bundle did not fail.
+	ctx.statsSession = nil
+	if ctx.stats != nil {
+		ctx.statsSession = ctx.stats.NewSession()
+	}
 	// The engine's JetResources are created on first use, through the meta graph,
 	// so they must exist before any rdf session opens (see RunRuleSets).
 	re.JetResources()
@@ -180,6 +311,22 @@ func (ctx *JrPoolWorker) executeRules(inputRecords *[]any,
 	if outcome.Err != nil {
 		cpErr = outcome.Err
 		goto gotError
+	}
+	if ctx.statsSession != nil && ctx.statsSession.Err() != nil {
+		cpErr = ctx.statsSession.Err()
+		goto gotError
+	}
+	// The bundle's statistics count only if it did not fail: no ExecuteRules error
+	// (the vertex cap is one) and no jets:exception, as rules_bench -stats counts
+	// a session. A bundle that reached max_looping counts, as there, so this is
+	// before the on_error policy, whose drop would return before it. Every
+	// failure after it goes to gotError, which ends the step, and a node whose
+	// step has failed writes no partial.
+	if ctx.statsSession != nil && outcome.ExecuteErr == nil && len(outcome.Exceptions) == 0 {
+		if err = ctx.statsSession.Commit(); err != nil {
+			cpErr = err
+			goto gotError
+		}
 	}
 
 	// // Print rdf session if in debug mode
@@ -245,6 +392,9 @@ gotError:
 // a saved session holds the triples as they were when the rule set ended.
 // Every failure counts toward max_error_count whether or not it is reported.
 func (ctx *JrPoolWorker) reportRuleSet(rdfSession JetRdfSession, rs *RuleSetOutcome) {
+	if ctx.statsSession != nil {
+		ctx.statsSession.Count(rs.RuleSet, rdfSession)
+	}
 	if rs.ExecuteErr != nil {
 		ctx.errorCount++
 		switch {
@@ -322,6 +472,53 @@ type RuleSetsConfig struct {
 	// released, with that rule set's outcome. executeRules reports failures
 	// through it; it must not retain rdfSession.
 	AfterRuleSet func(rdfSession JetRdfSession, outcome *RuleSetOutcome)
+	// Timing, when not nil, receives the time of each phase of the loop, read on
+	// the monotonic clock. It is nil in every pipeline, and RunRuleSets then reads
+	// no clock at all. The rules_bench command (jets/cmds/rules_bench) sets it.
+	Timing RuleSetsTimer
+}
+
+// RuleSetsTimer receives RunRuleSets' phase times. Its methods are called on the
+// goroutine running RunRuleSets, between the phases they time, so an
+// implementation that is slow delays the loop and is counted in no phase of
+// RuleSetTiming. The caller's own measure around RunRuleSets does include it.
+type RuleSetsTimer interface {
+	// InputAsserted is called once, after assertInput returned, with its time.
+	InputAsserted(d time.Duration)
+	// RuleSetDone is called once per rule set that ran, after its exception scan
+	// and before its rete session is released, so that the timer may read the
+	// sessions. It must not retain reteSession or rdfSession.
+	RuleSetDone(rdfSession JetRdfSession, reteSession JetReteSession, timing *RuleSetTiming)
+	// RuleSetReleased is called after each RuleSetDone, once the rule set's rete
+	// session is released, with the same timing and its Release set. A rule set
+	// that ends on an error releases its rete session without either call.
+	RuleSetReleased(timing *RuleSetTiming)
+}
+
+// RuleSetTiming is the time one rule set took in RunRuleSets, by phase. Every
+// duration is wall time on the monotonic clock. The input assertion, which runs
+// inside the first rule set, is not in any of them: it is
+// RuleSetsTimer.InputAsserted.
+type RuleSetTiming struct {
+	RuleSet string
+	// ReteSession is NewReteSession: the rete session's set-up for this rule set.
+	ReteSession time.Duration
+	// Prepare is the erase of jets:loop and jets:completed and the read of
+	// $max_looping.
+	Prepare time.Duration
+	// Loops holds one ExecuteRules time per loop run, loop 0 first.
+	Loops []time.Duration
+	// Control is the looping protocol around ExecuteRules, summed over the loops:
+	// the jets:loop inserts and the jets:completed checks.
+	Control time.Duration
+	// ExceptionScan is the scan of (jets:iState jets:exception ?) at the end.
+	ExceptionScan time.Duration
+	// Total runs from before NewReteSession to after the exception scan, less the
+	// input assertion.
+	Total time.Duration
+	// Release is the rete session's Release() at the end of the rule set. It is
+	// not in Total: it runs after RuleSetDone, and is read by RuleSetReleased.
+	Release time.Duration
 }
 
 // RuleSetOutcome is what happened in one rule set.
@@ -339,7 +536,7 @@ type RuleSetOutcome struct {
 	// MaxLoopReached is true when the loop ran out of iterations: every loop
 	// MaxLooping allows ran, and none set jets:completed or returned an
 	// ExecuteRules error. Completion or an error on the last allowed loop is not
-	// the maximum reached (rules_unit_test_harness I-7, fixed by AA.3).
+	// the maximum reached.
 	MaxLoopReached bool
 	// ExecuteErr is the error ExecuteRules returned, which ends the rule set's
 	// loop; the max vertex visit limit is one.
@@ -348,7 +545,7 @@ type RuleSetOutcome struct {
 	// rule set raised: in the rdf session once it has run, and not there when it
 	// started. An exception stays in the session for the later rule sets, whose
 	// rules may read it, but only the rule set that raised it reports it
-	// (rules_unit_test_harness I-8, Michel 2026-10-11: report each exception
+	// (decided 2026-10-11: report each exception
 	// once). See exceptionKey for what makes two exceptions the same.
 	Exceptions []string
 }
@@ -403,8 +600,8 @@ func (o *RuleSetsOutcome) Failed() bool {
 // adaptors create the JetResources on first use, through the meta graph's
 // resource manager, and the meta graph locks when the first rdf session opens:
 // after that a new meta resource is refused, a nil node on Go and an error on
-// C++. (On C++ it aborted the process until 2026-10-11, rules_unit_test_harness
-// I-15.) A pipeline meets it because
+// C++. (On C++ it aborted the process until 2026-10-11.) A pipeline meets it
+// because
 // AssertSourcePeriodInfo, at pipe construction, and executeRules both call it
 // first; the harness must call it before NewRdfSession. RunRuleSets cannot do it
 // for the caller, since the session is already open when it is called. The
@@ -424,6 +621,11 @@ func RunRuleSets(rdfSession JetRdfSession, engine JetRuleEngine, config *RuleSet
 	// are the previous rule set's scan; nothing between two scans asserts one.
 	var exceptionsBefore map[string]bool
 	isDebug := config.IsDebug
+	// The phase times, read only when there is a timer (RuleSetsConfig.Timing).
+	timer := config.Timing
+	var timing *RuleSetTiming
+	var t0, t1 time.Time
+	var inputTime time.Duration
 
 	wc, err = GetWorkspaceControl()
 	if err != nil {
@@ -446,24 +648,44 @@ func RunRuleSets(rdfSession JetRdfSession, engine JetRuleEngine, config *RuleSet
 		}
 	}()
 	for _, ruleset := range ruleFileNames {
+		if timer != nil {
+			timing = &RuleSetTiming{RuleSet: ruleset}
+			inputTime = 0
+			t0 = time.Now()
+		}
 		// Create the rete session
 		reteSession, err = rdfSession.NewReteSession(ruleset)
 		rm = rdfSession.GetResourceManager()
+		if timer != nil {
+			timing.ReteSession = time.Since(t0)
+		}
 		if err != nil {
 			outcome.Err = fmt.Errorf("error: while creating rete session for ruleset %s: %v", ruleset, err)
 			return
 		}
 		// From here every return releases the rete session, as the end of the
-		// rule set does (rules_unit_test_harness I-10).
+		// rule set does.
 		if !inputAsserted {
 			// Assert the input records to rdf session
+			if timer != nil {
+				t1 = time.Now()
+			}
 			err = assertInput(rdfSession)
+			if timer != nil {
+				timer.InputAsserted(time.Since(t1))
+				// Subtracted from the rule set's Total with the callback's own time,
+				// which is in no phase.
+				inputTime = time.Since(t1)
+			}
 			if err != nil {
 				outcome.Err = fmt.Errorf("while asserting input records to rdf session: %v", err)
 				reteSession.Release()
 				return
 			}
 			inputAsserted = true
+		}
+		if timer != nil {
+			t1 = time.Now()
 		}
 
 		// Step 0 of loop is pre loop or no loop
@@ -498,19 +720,39 @@ func RunRuleSets(rdfSession JetRdfSession, engine JetRuleEngine, config *RuleSet
 			log.Printf("jetrules: looping in use, max number of loops is %d", maxLooping)
 		}
 		rs := RuleSetOutcome{RuleSet: ruleset, MaxLooping: maxLooping}
+		if timer != nil {
+			timing.Prepare = time.Since(t1)
+		}
 		// do for iloop <= maxloop (since looping start at one!)
 		for iloop = 0; iloop <= maxLooping; iloop++ {
 			rs.Loops = iloop
+			if timer != nil {
+				t1 = time.Now()
+			}
 			if iloop > 0 {
 				rdfSession.Insert(jr.Jets__istate, jr.Jets__loop, rm.NewIntLiteral(iloop))
 			}
+			if timer != nil {
+				now := time.Now()
+				timing.Control += now.Sub(t1)
+				t1 = now
+			}
 			err2 := reteSession.ExecuteRules()
+			if timer != nil {
+				now := time.Now()
+				timing.Loops = append(timing.Loops, now.Sub(t1))
+				t1 = now
+			}
 			if err2 != nil {
 				rs.ExecuteErr = err2
 				break
 			}
 			// Check if looping is completed (Jets__completed)
-			if rdfSession.ContainsSP(jr.Jets__istate, jr.Jets__completed) {
+			completed := rdfSession.ContainsSP(jr.Jets__istate, jr.Jets__completed)
+			if timer != nil {
+				timing.Control += time.Since(t1)
+			}
+			if completed {
 				log.Printf("jetrules: Rete Session Looping Completed with iloop %d", iloop)
 				rs.Completed = true
 				break
@@ -525,6 +767,9 @@ func RunRuleSets(rdfSession JetRdfSession, engine JetRuleEngine, config *RuleSet
 		// Check for any jets:exceptions in the rdfSession, and keep the ones this
 		// rule set raised. The exceptions stay in the session: a later rule set's
 		// rules may read them, and its scan finds them again without reporting them.
+		if timer != nil {
+			t1 = time.Now()
+		}
 		exceptionsNow := make(map[string]bool)
 		ctor := rdfSession.FindSP(jr.Jets__istate, jr.Jets__exception)
 		for !ctor.IsEnd() {
@@ -540,6 +785,10 @@ func RunRuleSets(rdfSession JetRdfSession, engine JetRuleEngine, config *RuleSet
 		}
 		ctor.Release()
 		exceptionsBefore = exceptionsNow
+		if timer != nil {
+			timing.ExceptionScan = time.Since(t1)
+			timing.Total = time.Since(t0) - inputTime
+		}
 
 		outcome.RuleSets = append(outcome.RuleSets, rs)
 		outcome.Loops = rs.Loops
@@ -554,7 +803,15 @@ func RunRuleSets(rdfSession JetRdfSession, engine JetRuleEngine, config *RuleSet
 		if config.AfterRuleSet != nil {
 			config.AfterRuleSet(rdfSession, &outcome.RuleSets[len(outcome.RuleSets)-1])
 		}
+		if timer != nil {
+			timer.RuleSetDone(rdfSession, reteSession, timing)
+			t1 = time.Now()
+		}
 		reteSession.Release()
+		if timer != nil {
+			timing.Release = time.Since(t1)
+			timer.RuleSetReleased(timing)
+		}
 	}
 	return
 }
@@ -566,8 +823,8 @@ func RunRuleSets(rdfSession JetRdfSession, engine JetRuleEngine, config *RuleSet
 // fixed it is the object node; the rdf session is a set of triples, so one
 // exception value is one triple however many rules or rule sets assert it. The
 // node itself cannot be the key, because neither adaptor exposes it: Hdle()
-// returns the RdfNode wrapper, which GetObject allocates afresh on every call
-// (rules_unit_test_harness F93). The type and the text name the node instead,
+// returns the RdfNode wrapper, which GetObject allocates afresh on every call.
+// The type and the text name the node instead,
 // the type keeping the text "1" apart from the int 1 and a resource from a
 // literal of the same name.
 //
@@ -626,12 +883,174 @@ func keepObjectForCurrentSourcePeriod(rdfSession JetRdfSession, subject RdfNode)
 	return keepObj, err
 }
 
-func (ctx *JrPoolWorker) extractLiteralValue(rdfSession JetRdfSession, subject, predicate RdfNode,
-	currentSourcePeriod int, outChannel *JetrulesOutputChan) any {
+// NodeKeyer is implemented by an engine's RdfNode when the node has an identity
+// key: a comparable value, equal for two nodes exactly when Equals says they are
+// the same node, which FindSP and Contains match on. Both adaptors implement it,
+// by the engine's own handle, at no cost. A node without one is read as before.
+type NodeKeyer interface {
+	NodeKey() any
+}
+
+// nodeKey is n's identity key, or nil when it has none.
+func nodeKey(n RdfNode) any {
+	if k, ok := n.(NodeKeyer); ok {
+		return k.NodeKey()
+	}
+	return nil
+}
+
+// PredicateKeyer is implemented by an engine's TripleIterator when it can give
+// the current triple's predicate's identity key, NodeKey of GetPredicate, without
+// making the node. Both adaptors implement it.
+type PredicateKeyer interface {
+	PredicateKey() any
+}
+
+// columnReader reads the columns of an output channel that come from the graph,
+// for one subject at a time, in one pass over the subject's triples grouped by
+// predicate, rather than with one FindSP per column.
+//
+// Each column's predicate is the node FindSP read, rm.NewResource(column), looked
+// up once per session rather than once per subject, and a triple is put in the
+// column whose predicate is the same node, by identity key: so a column's objects
+// are FindSP's. And they come in FindSP's order, which a multi-valued column
+// keeps: on the C++ engine, as on the retired Go one, FindS and FindSP walk the
+// same graphs in the same order and, within a graph, the same container of a
+// (subject, predicate)'s objects.
+//
+// When a predicate has no identity key, the reader falls back to one FindSP per
+// column, which is the extraction as it was.
+type columnReader struct {
+	// names are each slot's predicate name; a duplicated column shares a slot
+	names []string
+	// colSlot is each column's slot, or -1 for a column not read from the graph:
+	// a special encoding, rdf:type or jets:source_period_sequence
+	colSlot []int
+	// preds are each slot's predicate in the session bound
+	preds []RdfNode
+	// slotOf maps a predicate's identity key to its slot; nil reads by FindSP
+	slotOf map[any]int
+	// objects are each slot's objects for the current subject, reused across subjects
+	objects [][]RdfNode
+}
+
+func newColumnReader(columns []string, outChannel *JetrulesOutputChan) *columnReader {
+	r := &columnReader{colSlot: make([]int, len(columns))}
+	slot := make(map[string]int, len(columns))
+	for i, p := range columns {
+		if outChannel.JrColumnEncodings[p] != nil || p == "rdf:type" || p == "jets:source_period_sequence" {
+			r.colSlot[i] = -1
+			continue
+		}
+		s, ok := slot[p]
+		if !ok {
+			s = len(r.names)
+			slot[p] = s
+			r.names = append(r.names, p)
+		}
+		r.colSlot[i] = s
+	}
+	r.objects = make([][]RdfNode, len(r.names))
+	r.preds = make([]RdfNode, len(r.names))
+	return r
+}
+
+// bind looks up the slots' predicates in rdfSession, and reads by FindSP unless
+// every one has an identity key.
+func (r *columnReader) bind(rdfSession JetRdfSession) {
+	rm := rdfSession.GetResourceManager()
+	r.slotOf = make(map[any]int, len(r.names))
+	for s, name := range r.names {
+		r.preds[s] = rm.NewResource(name)
+		k := nodeKey(r.preds[s])
+		if k == nil {
+			r.slotOf = nil
+			continue
+		}
+		if r.slotOf != nil {
+			r.slotOf[k] = s
+		}
+	}
+}
+
+// read collects subject's objects for every graph column.
+func (r *columnReader) read(rdfSession JetRdfSession, subject RdfNode) {
+	for i := range r.objects {
+		clear(r.objects[i])
+		r.objects[i] = r.objects[i][:0]
+	}
+	if len(r.objects) == 0 {
+		return
+	}
+	// A Find returns nil when the engine refuses its arguments; the column is then
+	// empty.
+	if r.slotOf == nil {
+		for s, p := range r.preds {
+			itor := rdfSession.FindSP(subject, p)
+			if itor == nil {
+				continue
+			}
+			for !itor.IsEnd() {
+				r.objects[s] = append(r.objects[s], itor.GetObject())
+				itor.Next()
+			}
+			itor.Release()
+		}
+		return
+	}
+	itor := rdfSession.FindS(subject)
+	if itor == nil {
+		return
+	}
+	pk, _ := itor.(PredicateKeyer)
+	for !itor.IsEnd() {
+		var key any
+		if pk != nil {
+			key = pk.PredicateKey()
+		} else {
+			key = nodeKey(itor.GetPredicate())
+		}
+		if s, ok := r.slotOf[key]; ok {
+			r.objects[s] = append(r.objects[s], itor.GetObject())
+		}
+		itor.Next()
+	}
+	itor.Release()
+}
+
+// column is column i's objects for the subject last read, nil for a column not
+// read from the graph.
+func (r *columnReader) column(i int) []RdfNode {
+	if s := r.colSlot[i]; s >= 0 {
+		return r.objects[s]
+	}
+	return nil
+}
+
+// entityRow is subject's row of columns, before the channel's column evaluators.
+func (ctx *JrPoolWorker) entityRow(rdfSession JetRdfSession, subject RdfNode, columns []string,
+	cols *columnReader, currentSourcePeriod int, outChannel *JetrulesOutputChan) []any {
+	entityRow := make([]any, len(columns))
+	cols.read(rdfSession, subject)
+	for i, p := range columns {
+		specialEncoding := outChannel.JrColumnEncodings[p]
+		if specialEncoding != nil {
+			// Special encoding for this column, extract the entire object as a json/toon/map[string]any
+			entityRow[i] = specialEncoding.EncodeColumnData(rdfSession, subject)
+		} else {
+			entityRow[i] = ctx.extractLiteralValue(rdfSession, subject, p, cols.column(i), currentSourcePeriod, outChannel)
+		}
+	}
+	return entityRow
+}
+
+// extractLiteralValue is column pname's value for subject: objects are the
+// column's objects, as columnReader gives them.
+func (ctx *JrPoolWorker) extractLiteralValue(rdfSession JetRdfSession, subject RdfNode, pname string,
+	objects []RdfNode, currentSourcePeriod int, outChannel *JetrulesOutputChan) any {
 	var data any
 	var dataArr []any
 	var isArray bool
-	pname := predicate.String()
 	switch pname {
 	case "jets:source_period_sequence":
 		// Set the current source period to the extracted data based on the value in the rdf session
@@ -642,9 +1061,8 @@ func (ctx *JrPoolWorker) extractLiteralValue(rdfSession JetRdfSession, subject, 
 	default:
 		data = nil
 		isArray = false
-		itor := rdfSession.FindSP(subject, predicate)
-		for !itor.IsEnd() {
-			value := GetRdfNodeValue(itor.GetObject())
+		for _, o := range objects {
+			value := GetRdfNodeValue(o)
 			if data == nil {
 				data = value
 			} else {
@@ -655,9 +1073,13 @@ func (ctx *JrPoolWorker) extractLiteralValue(rdfSession JetRdfSession, subject, 
 					isArray = true
 				}
 			}
-			itor.Next()
 		}
-		itor.Release()
+		if isArray {
+			// The graph returns a subject's values in its hash set's order, which
+			// is seeded per process; sorting makes the cell a function of its
+			// values alone. A single value is left as it is.
+			sortCellValues(dataArr)
+		}
 		if ctx.multiValueDataProperties[pname] {
 			if isArray {
 				data = dataArr
@@ -685,6 +1107,141 @@ func (ctx *JrPoolWorker) extractLiteralValue(rdfSession JetRdfSession, subject, 
 		}
 	}
 	return data
+}
+
+// sortCellValues puts a multi-valued cell's values in a total order that
+// depends on the values only, not on the order the graph returned them in:
+// numbers numerically, dates and datetimes chronologically, text bytewise. Values
+// of different kinds are grouped by kind, in the order of cellValueRank. It is
+// the counterpart, for literal columns, of sortEntityLists for an encoded
+// entity; that one orders on a rendering, which would put 10 before 9.
+func sortCellValues(values []any) {
+	if len(values) < 2 {
+		return
+	}
+	slices.SortStableFunc(values, compareCellValues)
+}
+
+// cellValueRank is the order of the kinds GetRdfNodeValue returns: null, then
+// numbers, then dates and datetimes, then text, then anything else.
+func cellValueRank(v any) int {
+	switch v.(type) {
+	case nil:
+		return 0
+	case int, uint, float64:
+		return 1
+	case time.Time:
+		return 2
+	case string:
+		return 3
+	default:
+		return 4
+	}
+}
+
+// compareCellValues is a total order on cell values. Two values it reports
+// equal have the same type and the same rendering, so no output can tell which
+// came first and the sort's result does not depend on its input order.
+func compareCellValues(a, b any) int {
+	ra, rb := cellValueRank(a), cellValueRank(b)
+	if ra != rb {
+		return cmp.Compare(ra, rb)
+	}
+	switch ra {
+	case 0:
+		return 0
+	case 1:
+		if c := compareNumbers(a, b); c != 0 {
+			return c
+		}
+		// Equal numbers of different types, int 1 and double 1: by type; and
+		// -0 before 0, which render differently.
+		if c := cmp.Compare(numberTypeRank(a), numberTypeRank(b)); c != 0 {
+			return c
+		}
+		if fa, ok := a.(float64); ok {
+			return -cmp.Compare(boolRank(math.Signbit(fa)), boolRank(math.Signbit(b.(float64))))
+		}
+		return 0
+	case 2:
+		ta, tb := a.(time.Time), b.(time.Time)
+		if c := ta.Compare(tb); c != 0 {
+			return c
+		}
+		// One instant in two zones renders differently.
+		return strings.Compare(ta.Format(time.RFC3339Nano), tb.Format(time.RFC3339Nano))
+	case 3:
+		return strings.Compare(a.(string), b.(string))
+	default:
+		if c := strings.Compare(fmt.Sprintf("%T", a), fmt.Sprintf("%T", b)); c != 0 {
+			return c
+		}
+		return strings.Compare(fmt.Sprintf("%v", a), fmt.Sprintf("%v", b))
+	}
+}
+
+func boolRank(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func numberTypeRank(v any) int {
+	switch v.(type) {
+	case int:
+		return 0
+	case uint:
+		return 1
+	default:
+		return 2
+	}
+}
+
+// compareNumbers compares two of int, uint and float64 by value, exactly: a
+// conversion to float64 would make distinct large integers equal, and an order
+// that is not transitive is not a total one. NaN is after every other number.
+func compareNumbers(a, b any) int {
+	switch x := a.(type) {
+	case int:
+		if y, ok := b.(int); ok {
+			return cmp.Compare(x, y)
+		}
+	case uint:
+		if y, ok := b.(uint); ok {
+			return cmp.Compare(x, y)
+		}
+	case float64:
+		if y, ok := b.(float64); ok && !math.IsNaN(x) && !math.IsNaN(y) {
+			return cmp.Compare(x, y)
+		}
+	}
+	na, nb := isNaN(a), isNaN(b)
+	switch {
+	case na && nb:
+		return 0
+	case na:
+		return 1
+	case nb:
+		return -1
+	}
+	return bigFloat(a).Cmp(bigFloat(b))
+}
+
+func isNaN(v any) bool {
+	f, ok := v.(float64)
+	return ok && math.IsNaN(f)
+}
+
+func bigFloat(v any) *big.Float {
+	switch x := v.(type) {
+	case int:
+		return new(big.Float).SetInt64(int64(x))
+	case uint:
+		return new(big.Float).SetUint64(uint64(x))
+	default:
+		return new(big.Float).SetFloat64(v.(float64))
+	}
 }
 
 // reportMultipleValues reports a property that is not multi-value and has
@@ -719,7 +1276,8 @@ func (ctx *JrPoolWorker) extractSessionData(rdfSession JetRdfSession,
 	rm := rdfSession.GetResourceManager()
 	entityCount := 0
 	columns := config.Columns
-	var data any
+	cols := newColumnReader(columns, outChannel)
+	cols.bind(rdfSession)
 	var keepObj bool
 	var err error
 	isDebug := ctx.config.IsDebug
@@ -741,18 +1299,7 @@ func (ctx *JrPoolWorker) extractSessionData(rdfSession JetRdfSession,
 		// extract entity if we keep it (i.e. not an historical entity)
 		if keepObj {
 			// log.Printf("*** Extracting entity for subject %s", subject)
-			entityRow := make([]any, len(columns))
-			// log.Printf("*** Extracting DEFAULT encoding for subject %s", subject)
-			for i, p := range columns {
-				specialEncoding := outChannel.JrColumnEncodings[p]
-				if specialEncoding != nil {
-					// Special encoding for this column, extract the entire object as a json/toon/map[string]any
-					entityRow[i] = specialEncoding.EncodeColumnData(rdfSession, subject)
-				} else {
-					data = ctx.extractLiteralValue(rdfSession, subject, rm.NewResource(p), currentSourcePeriod, outChannel)
-					entityRow[i] = data
-				}
-			}
+			entityRow := ctx.entityRow(rdfSession, subject, columns, cols, currentSourcePeriod, outChannel)
 			// Apply the TransformationColumn, these are const values
 			// NOTE there is no initialize and done called on the column evaluators
 			//      since they should be only of type 'select' or 'value'
@@ -959,12 +1506,33 @@ nextField:
 // them once per process and returns the cached map after that, so calling it
 // per row costs a lock and a lookup.
 func AssertTextRow(config *JetrulesSpec, rdfSession JetRdfSession, columns []string, cells []string) error {
+	row, err := CastTextRow(config, columns, cells)
+	if err != nil {
+		return err
+	}
+	return AssertCastRow(config, rdfSession, row)
+}
+
+// CastRow is a row of text cells cast by CastTextRow and ready for
+// AssertCastRow: the layout assertInputRow reads and the typed values.
+type CastRow struct {
+	assertType string
+	layout     []string
+	row        []any
+}
+
+// CastTextRow is the first half of AssertTextRow: it checks and casts a row of
+// text cells, and asserts nothing. A pipeline casts its input when it reads it,
+// before the jetrules step, so the rules_bench command casts its input once
+// with this and times AssertCastRow alone. A CastRow may be asserted any number
+// of times, into any session.
+func CastTextRow(config *JetrulesSpec, columns []string, cells []string) (*CastRow, error) {
 	if len(cells) != len(columns) {
-		return fmt.Errorf("error: row has %d cells for %d columns", len(cells), len(columns))
+		return nil, fmt.Errorf("error: row has %d cells for %d columns", len(cells), len(columns))
 	}
 	dpMap, err := GetWorkspaceDataProperties()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	// assertInputRow's layout: jets:key, rdf:type, jets:source_period_sequence,
 	// then the other columns in the order given.
@@ -974,7 +1542,7 @@ func AssertTextRow(config *JetrulesSpec, rdfSession JetRdfSession, columns []str
 	for i, column := range columns {
 		dp := dpMap[column]
 		if dp == nil {
-			return fmt.Errorf("error: column '%s' is not a data property of the workspace", column)
+			return nil, fmt.Errorf("error: column '%s' is not a data property of the workspace", column)
 		}
 		isArray := dp.AsArray
 		if column == "rdf:type" {
@@ -982,7 +1550,7 @@ func AssertTextRow(config *JetrulesSpec, rdfSession JetRdfSession, columns []str
 		}
 		value, err := castToRdfTypeFromTxt(cells[i], dp.Type, &isArray)
 		if err != nil {
-			return fmt.Errorf("error: column '%s' value '%s' is not a %s: %v", column, cells[i], dp.Type, err)
+			return nil, fmt.Errorf("error: column '%s' value '%s' is not a %s: %v", column, cells[i], dp.Type, err)
 		}
 		switch column {
 		case "jets:key":
@@ -1000,12 +1568,20 @@ func AssertTextRow(config *JetrulesSpec, rdfSession JetRdfSession, columns []str
 	assertType := config.InputRdfType
 	if types, ok := row[1].([]any); ok && len(types) > 0 {
 		if assertType, ok = types[0].(string); !ok {
-			return fmt.Errorf("error: rdf:type value %v (%T) is not a resource name", types[0], types[0])
+			return nil, fmt.Errorf("error: rdf:type value %v (%T) is not a resource name", types[0], types[0])
 		}
 	} else {
 		row[1] = nil
 	}
-	return assertInputRow(config, rdfSession, &row, map[string][]string{assertType: layout})
+	return &CastRow{assertType: assertType, layout: layout, row: row}, nil
+}
+
+// AssertCastRow is the second half of AssertTextRow: it asserts a row cast by
+// CastTextRow into rdfSession, exactly as a pipeline asserts an input row
+// (assertInputRow). It leaves the CastRow unchanged.
+func AssertCastRow(config *JetrulesSpec, rdfSession JetRdfSession, cr *CastRow) error {
+	row := cr.row
+	return assertInputRow(config, rdfSession, &row, map[string][]string{cr.assertType: cr.layout})
 }
 
 func NewRdfNode(inValue any, re JetResourceManager) (RdfNode, error) {

@@ -32,7 +32,7 @@ class Generator(InputChannel):
     """
 
     token = "generator"
-    owed_by = "P9-T04"
+    owed_by = "the channel and fan-out work"
     summary = "source with no input: nbr_nodes partitions of nbr_rows empty records"
 
     @classmethod
@@ -44,8 +44,7 @@ class Generator(InputChannel):
         graph owns the width and the termination signal. **The point of routing
         through here is that `graph.py` contains no `if type == "generator"`** —
         the dispatch is the declaration, so a channel type this node grows is
-        reached by the class being written and not by an `if` being remembered
-        (P3-I20).
+        reached by the class being written and not by an `if` being remembered.
         """
         from .. import graph
 
@@ -58,11 +57,11 @@ class Memory(InputChannel):
     Declared although the charter's list of six does not name it, because the
     twelve partition writers read the site operator's twelve output channels
     and there is no other type they could read them as. See the package
-    docstring and P9-I26.
+    docstring.
     """
 
     token = "memory"
-    owed_by = "P9-T04"
+    owed_by = "the channel and fan-out work"
     summary = "an in-process channel a previous step of this node wrote"
 
     @classmethod

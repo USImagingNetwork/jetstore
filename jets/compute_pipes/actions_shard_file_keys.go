@@ -25,7 +25,7 @@ type ShardFileKeyResult struct {
 	clusterShardingInfo *ClusterShardingInfo
 	nbrShardingNodes    int
 	firstKey            string
-	firstKeyFileSize		int64
+	firstKeyFileSize    int64
 	clusterSpec         *ClusterShardingSpec
 }
 
@@ -66,8 +66,7 @@ func ShardFileKeys(exeCtx context.Context, dbpool *pgxpool.Pool, baseFileKey str
 		fileKey := fmt.Sprintf("%s/%s", awsi.JetStoreStagePrefix(), inputChannelConfig.FileKey)
 		lback := inputChannelConfig.LookbackPeriods
 		if len(lback) > 0 {
-			s3Objects, err = GetS3Objects4LookbackPeriod("", fileKey,
-				inputChannelConfig.LookbackPeriods, inputChannelConfig.SourceObjectType, envSettings)
+			s3Objects, err = ListStageChannel(exeCtx, dbpool, "", &inputChannelConfig, envSettings)
 			if err != nil {
 				cpErr = fmt.Errorf("failed to download list of files from s3 for lookback periods: %v", err)
 				return
@@ -78,6 +77,19 @@ func ShardFileKeys(exeCtx context.Context, dbpool *pgxpool.Pool, baseFileKey str
 			s3Objects, err = awsi.ListS3Objects("", &fileKeyPrefix)
 			if err != nil {
 				cpErr = fmt.Errorf("failed to download list of files from s3: %v", err)
+				return
+			}
+			// The folder may hold several sessions' folders (a period's deliveries):
+			// skip those a user deleted, as a lookback read does (cumulative_source.go).
+			s3Objects = dropDeletedSessionObjects(fileKeyPrefix, s3Objects, envSettings)
+			// And keep only the latest completed session when the channel says so
+			// (latest_session.go).
+			opts, err := stageReadOptionsOf(exeCtx, dbpool, &inputChannelConfig)
+			if err == nil {
+				s3Objects, err = keepLatestCompletedSessionOfFolder(fileKeyPrefix, s3Objects, opts)
+			}
+			if err != nil {
+				cpErr = err
 				return
 			}
 		}
@@ -180,9 +192,7 @@ func ShardFileKeys(exeCtx context.Context, dbpool *pgxpool.Pool, baseFileKey str
 	mergeS3Objects = make([][]*awsi.S3Object, len(inputChannelConfig.MergeChannels))
 	for i := range inputChannelConfig.MergeChannels {
 		mergeConfig := inputChannelConfig.MergeChannels[i]
-		fileKey := fmt.Sprintf("%s/%s", awsi.JetStoreStagePrefix(), mergeConfig.FileKey)
-		mergeObjects, err := GetS3Objects4LookbackPeriod(mergeConfig.Bucket, fileKey,
-			mergeConfig.LookbackPeriods, mergeConfig.SourceObjectType, envSettings)
+		mergeObjects, err := ListStageChannel(exeCtx, dbpool, mergeConfig.Bucket, &mergeConfig, envSettings)
 		if err != nil {
 			cpErr = fmt.Errorf("failed to download list of files from s3 for merge channel: %v", err)
 			return
@@ -350,8 +360,8 @@ func assignShardInfo(s3Objects []*awsi.S3Object, shardSize, maxShardSize, offset
 			var end int64
 			reminder := obj.Size
 			for reminder > 0 {
-				if start+shardSize-currentShardSize >= obj.Size - 1 {
-					end = obj.Size -1
+				if start+shardSize-currentShardSize >= obj.Size-1 {
+					end = obj.Size - 1
 					nextStart = 0
 					reminder = 0
 				} else {
@@ -458,9 +468,11 @@ func selectClusterShardingTier(totalSizeMb int, inputFormat string, clusterConfi
 // included (e.g. "test_harness_filters.txt|notes/readme.txt").
 //
 // The match is strings.HasSuffix against the whole object key, so an entry may carry a
-// path portion. An empty or absent ignore prunes nothing, and so does an empty entry
-// within the list - an empty suffix matches every key, and pruning the whole folder is
-// never what an unset value means.
+// path portion. Each entry is trimmed of surrounding whitespace first, so a list
+// written as "a.txt | b.txt" prunes both rather than matching nothing (a key does not
+// end in "a.txt "). An empty or absent ignore prunes nothing, and so does an entry that
+// is empty after trimming, which is logged and skipped - an empty suffix matches every
+// key, and pruning the whole folder is never what an unset value means.
 //
 // Note there is deliberately no '/' path boundary on the match: a configured value of
 // ".txt" prunes every text file in the folder, and "filters.txt" also prunes
@@ -473,10 +485,13 @@ func pruneIgnoredFileKeys(s3Objects []*awsi.S3Object, ignore string) []*awsi.S3O
 		return s3Objects
 	}
 	ignoredSuffixes := make([]string, 0, 4)
-	for _, suffix := range strings.Split(ignore, "|") {
-		if len(suffix) > 0 {
-			ignoredSuffixes = append(ignoredSuffixes, suffix)
+	for i, entry := range strings.Split(ignore, "|") {
+		suffix := strings.TrimSpace(entry)
+		if len(suffix) == 0 {
+			log.Printf("Skipping empty entry %d of ${JETS_IGNORE_FILE} %q", i+1, ignore)
+			continue
 		}
+		ignoredSuffixes = append(ignoredSuffixes, suffix)
 	}
 	if len(ignoredSuffixes) == 0 {
 		return s3Objects

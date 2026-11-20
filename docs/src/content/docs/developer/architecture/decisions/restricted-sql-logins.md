@@ -1,0 +1,67 @@
+---
+title: "User SQL runs on restricted database logins"
+description: "Why the SQL a user sends runs on two restricted PostgreSQL logins rather than on the apiserver's connection after SET ROLE."
+kind: explanation
+---
+
+*Decided 2026-11-11.*
+
+## Context
+
+JetStore lets a user send SQL: the Query Tool, *Submit DDL*, a runbook's query, wait and ddl steps, and
+the SQL fragments of a data table. That SQL used to run on the apiserver's own database connection.
+The writing paths ran with the apiserver's full rights, so a user allowed to use the IDE could change
+`jetsapi.users` or `role_capability` and give themselves any role. Reads ran after
+`SET LOCAL ROLE jets_reader`, but a PostgreSQL session may switch back to any role its *login* is a
+member of, and the statement itself can do it, with `set_config('role', ...)` in a `DO` block or a
+function call. So a role switch on the apiserver's login restricts nothing the restricted SQL cannot
+undo.
+
+## Decision
+
+Run user SQL on logins that are themselves restricted. Package `jets/dblogin` creates two logins per
+database, each a member of one group role and of nothing else, so there is no role to switch back
+to:
+
+- **`jets_reader`**, for every read whose SQL comes from the client: every table, less the secret
+  columns and the login table.
+- **`jets_ide`**, for the free-SQL paths that write, for the workspace's own init scripts in
+  `update_db`, and, from 2026-11-14, for the workspace's reports in `run_reports`: every table, but the security tables read-only and without their secret columns, and
+  no `TRIGGER` privilege, since a trigger on a table the apiserver writes would run as the apiserver.
+
+## Consequences
+
+- The apiserver and `update_db` create and update the logins at every start, so the apiserver's
+  database user needs `CREATEROLE`.
+- Each login's password is generated once per database and kept in `jetsapi.restricted_login`, which
+  only the apiserver's user may read. It is sent to PostgreSQL as a SCRAM verifier, so it never
+  appears in a statement a server log could record, and no deployment setting is involved.
+- The login is per database, a member of a cluster-wide group role, because roles are cluster-wide:
+  two databases on one cluster would otherwise reset each other's passwords.
+- The apiserver's user is a member of both logins, so it can cancel their statements (a runbook's
+  *Abort*) and owns, by membership, the tables the IDE login creates.
+- *Added 2026-11-14.* A workspace's `reports/*.sql` ran as the apiserver's user until then, so a
+  workspace author could change the security tables through a report. They now run as `jets_ide`,
+  the login *Submit DDL* uses, because a report is a workspace file edited from the same IDE. A table
+  an earlier `run_reports` created belongs to the apiserver's user, so a report that indexes, alters
+  or drops one fails until the table is given to the IDE login; the
+  [upgrade note](/docs/developer/workspace/system-tables/#reports-run-as-jets_ide) says how.
+- *Added 2026-11-14.* Owning its tables let `jets_ide` attach code to them, a trigger or a
+  row-level security policy calling a function it wrote, and PostgreSQL runs that code as whoever
+  reads or writes the table, the apiserver's user included. Withholding `TRIGGER` covered only the
+  tables `jets_ide` does not own. An event trigger, `jets_ide_code_guard`, now refuses `jets_ide`'s
+  functions, procedures, triggers, policies, rules, operators and row-level security, and its
+  defaults, checks, index expressions and views that call a function that runs SQL or changes more
+  than the row (`aws_s3`'s among them). Creating it needs a superuser or the RDS master user; with
+  neither, the apiserver starts without it and says so. Code `jets_ide` created before is listed at
+  every start and not dropped. See
+  [the code jets_ide may not create](/docs/developer/workspace/system-tables/#the-code-jets_ide-may-not-create).
+- `jets_ide` may drop or alter only the tables it created, so a table the apiserver's user created
+  (by a pipeline, by a report before 2026-11-14, or by a workspace init script before 4.1.6) can be
+  given to it only by the apiserver's user.
+
+## Where the reason is recorded
+
+- The package documentation of `jets/dblogin` (`dblogin.go`), *Why logins, and not SET ROLE*.
+- Commit `40ecb1da`, *User SQL runs on restricted database logins, not the apiserver's*.
+- [Design of the system tables](/docs/developer/workspace/system-tables/#the-security-tables-and-the-restricted-logins).

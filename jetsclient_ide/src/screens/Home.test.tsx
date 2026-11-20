@@ -34,11 +34,12 @@ import { ApiClient } from "../api/client";
 import { ApiProvider } from "../shell/capabilities";
 import { NotificationsProvider, useNotifications } from "../shell/notifications";
 import { PromptsProvider } from "../shell/prompts";
-import { answerPrompt } from "../shell/promptsTesting";
+import { answerConfirm, answerPrompt } from "../shell/promptsTesting";
 import { resetHomeFilters, updateHomeFilters } from "../actions/homeFilters";
 import { FormState } from "../datatable/formState";
 import { resetSelectedClient, setSelectedClient } from "../shell/selectedClient";
 import pipelineExecStatusTable from "../../../jets/workspace_assets/table_configs/pipelineExecStatusTable.tc.json";
+import { RELOAD_HINT } from "../userflow/store";
 import { Home, documentFindings } from "./Home";
 
 afterEach(() => {
@@ -46,10 +47,14 @@ afterEach(() => {
   resetHomeFilters();
   resetSelectedClient();
   putSchemaEventResponse = { status: 200, body: {} };
+  startPendingResponse = { status: 200, body: { pending_count: 0 } };
   loginCapabilities = ["run_pipelines"];
   loginCustomButtons = undefined;
   stageFiles = {};
   schemaEvents = {};
+  workspaceTableDocument = pipelineExecStatusTable;
+  previewResponse = { status: 200, body: { rows: previewRows } };
+  deleteResponse = { status: 200, body: { queued: 2, waiting: ["2002"] } };
 });
 
 /**
@@ -72,6 +77,59 @@ const registryRows: (string | null)[][] = [
   ["1", "acme", "acme_org", "claim", "2026", "8", "25", "claim_staging", "sess-1", "File", "s3://in/claims.csv", "u@x", "now", "7"],
 ];
 
+/**
+ * `session_registry_view` rows, positional in `sessionRegistryTable.tc.json`'s
+ * column order: session_id, client, source_type, year, month, day, file_key,
+ * process_name, status, last_update, deletion_status,
+ * deletion_reason, deletion_requested_by, deletion_requested_at, session_num,
+ * source_period_key. A live file session, a mapping session with a deletion
+ * queued, and a user's tombstone.
+ */
+const sessionRows: (string | null)[][] = [
+  ["1001", "acme", "file", "2026", "11", "1", "s3://in/claims.csv", null, null, "2026-11-01 10:00", null, null, null, null, "1001", "7"],
+  ["2002", "(unknown)", "domain_table", "2026", "11", "2", null, "map_records", "completed", "2026-11-02 10:00", "pending", "user", "u@x", "2026-11-08 09:00", "2002", "7"],
+  ["3003", "acme", "file", "2026", "11", null, null, null, null, "2026-11-04 10:00", "done", "user", "u@x", "2026-11-03 09:00", "3003", null],
+];
+
+/** `process_config` rows, as the Session Registry filters' process list reads them. */
+const processRows: (string | null)[][] = [["Map_MedicalClaim"], ["Map_Eligibility"]];
+
+/** What `/dataTable` answers to `resubmit_sessions_as_pending`. */
+const resubmitSessionsResponse: { status: number; body: unknown } = {
+  status: 200,
+  body: { resubmitted: 1, sessions: ["9009"], no_run: [], already_pending: [] },
+};
+
+/** `pipeline_execution_status_archive` rows: the pipelines columns, then archived_at and archive_reason. */
+const archiveRows: (string | null)[][] = [
+  [
+    "9", "pc1", "acme", "map_records", "claim", "2026", "8", "25", "completed",
+    "s3://in/old.csv", "sess-9", "req-9", null, null, "42", "{}", "u@x", "00:02:00", "then",
+    "2026-11-08 09:30", "user",
+  ],
+];
+
+/**
+ * What `preview_session_deletion` answers: the selected file session, and the
+ * mapping session reading it, whose run is active. The shape the plan agreed
+ * (§3.3); `sessionDeletion.ts`'s `previewRowOf` is the one reader of it.
+ */
+const previewRows = [
+  {
+    session_id: "1001", client: "acme", source_type: "file", month_period: null,
+    reads_session: "", process_name: "", object_type: "claim", active: false,
+  },
+  {
+    session_id: "2002", client: "(unknown)", source_type: "domain_table", month_period: 313,
+    reads_session: "1001", process_name: "map_records", object_type: "claim", active: true,
+  },
+];
+let previewResponse: { status: number; body: unknown } = { status: 200, body: { rows: previewRows } };
+let deleteResponse: { status: number; body: unknown } = {
+  status: 200,
+  body: { queued: 2, waiting: ["2002"] },
+};
+
 interface Posted {
   body: Record<string, unknown>;
   path?: string;
@@ -83,6 +141,9 @@ interface Posted {
  * the message `PutSchemaEventToS3` returns for an empty event.
  */
 let putSchemaEventResponse: { status: number; body: unknown } = { status: 200, body: {} };
+
+/** What `/dataTable` answers to `start_pending_tasks`, *Check Pending*'s post. */
+let startPendingResponse: { status: number; body: unknown } = { status: 200, body: { pending_count: 0 } };
 
 /** The signed-in user's capabilities; one case removes `run_pipelines`. */
 let loginCapabilities = ["run_pipelines"];
@@ -100,6 +161,9 @@ let stageFiles: Record<string, string> = {};
 /** `input_registry.schema_provider_json` by registry key, for *Get Schema Event*. */
 let schemaEvents: Record<string, string | null> = {};
 
+/** The workspace's `pipelineExecStatusTable.tc.json`; one case serves a newer one. */
+let workspaceTableDocument: unknown = pipelineExecStatusTable;
+
 function stubServer() {
   const posts: Posted[] = [];
   const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit) => {
@@ -111,8 +175,8 @@ function stubServer() {
       return new Response(
         JSON.stringify({
           token: "t0",
-          name: "Michel",
-          user_email: "michel@artisoft.io",
+          name: "Test User",
+          user_email: "user@example.com",
           is_admin: false,
           capabilities: loginCapabilities,
           ...(loginCustomButtons !== undefined ? { custom_buttons: loginCustomButtons } : {}),
@@ -130,14 +194,23 @@ function stubServer() {
       // reason the bundled copy was removed.
       case "get_workspace_document":
         return new Response(
-          JSON.stringify({ file_content: JSON.stringify(pipelineExecStatusTable) }),
+          JSON.stringify({ file_content: JSON.stringify(workspaceTableDocument) }),
           { status: 200 },
         );
       case "read": {
         const from = (body["fromClauses"] as { table: string }[])[0]!.table;
         // Two tables since D.10 — the loader table moved to `/fileLoaderStatus`,
         // and its rows and its assertions went with it.
-        const rows = from === "pipeline_execution_status" ? execRows : registryRows;
+        const rows =
+          from === "pipeline_execution_status"
+            ? execRows
+            : from === "session_registry_view"
+              ? sessionRows
+              : from === "pipeline_execution_status_archive"
+                ? archiveRows
+                : from === "process_config"
+                  ? processRows
+                  : registryRows;
         return new Response(JSON.stringify({ rows, totalRowCount: rows.length }), { status: 200 });
       }
       case "raw_query": {
@@ -159,6 +232,18 @@ function stubServer() {
       }
       case "resubmit_pipeline":
         return new Response("{}", { status: 200 });
+      case "start_pending_tasks":
+        return new Response(JSON.stringify(startPendingResponse.body), {
+          status: startPendingResponse.status,
+        });
+      case "preview_session_deletion":
+        return new Response(JSON.stringify(previewResponse.body), { status: previewResponse.status });
+      case "resubmit_sessions_as_pending":
+        return new Response(JSON.stringify(resubmitSessionsResponse.body), {
+          status: resubmitSessionsResponse.status,
+        });
+      case "delete_sessions":
+        return new Response(JSON.stringify(deleteResponse.body), { status: deleteResponse.status });
       case "put_schema_event_to_s3":
         return new Response(JSON.stringify(putSchemaEventResponse.body), {
           status: putSchemaEventResponse.status,
@@ -184,17 +269,17 @@ function Banners() {
   );
 }
 
-async function mount() {
+async function mount(entry = "/home", marker = PIPELINES_MARKER) {
   const { fetchImpl, posts } = stubServer();
   const api = new ApiClient("", fetchImpl);
-  await api.login("michel@artisoft.io", "pw");
+  await api.login("user@example.com", "pw");
 
   render(
     <ApiProvider api={api}>
       <NotificationsProvider>
         <PromptsProvider>
           <Banners />
-          <MemoryRouter initialEntries={["/home"]}>
+          <MemoryRouter initialEntries={[entry]}>
             <Routes>
               <Route path="/home" element={<Home api={api} />} />
               <Route path="/executionStatusDetails/:session_id" element={<div>details screen</div>} />
@@ -214,7 +299,7 @@ async function mount() {
   // loader table is no longer what mounts. `acme_org` would not do for both: the
   // pipelines table hides `main_object_type`, and a hidden cell is not in the DOM
   // at all — which is the same trap the previous comment recorded, one column over.
-  await screen.findByText(PIPELINES_MARKER);
+  await screen.findByText(marker);
   return { posts, api };
 }
 
@@ -287,6 +372,32 @@ describe("the table this screen shares with a flow", () => {
     );
   });
 
+  /**
+   * **A tab opened before a deployment keeps its bundle's schemas**, and this
+   * document comes from the workspace, so it can use a value the deployment
+   * added. The refusal says to reload, as a flow's does; a refusal of a document
+   * that is wrong on its own terms does not.
+   */
+  it("asks for a reload when the workspace document holds a value this page does not know", async () => {
+    const doc = structuredClone(pipelineExecStatusTable) as { actions: { style: string }[] };
+    doc.actions[0]!.style = "newerStyle";
+    workspaceTableDocument = doc;
+    await mount("/home", "This screen's documents cannot be loaded.");
+    const finding = within(screen.getByRole("alert")).getByRole("listitem").textContent!;
+    expect(finding).toContain("pipelineExecStatusTable.tc.json: actions/0/style");
+    expect(finding.endsWith(RELOAD_HINT)).toBe(true);
+  });
+
+  it("does not ask for a reload when the workspace document is wrong on its own terms", async () => {
+    const doc = structuredClone(pipelineExecStatusTable) as { label: unknown };
+    doc.label = 7;
+    workspaceTableDocument = doc;
+    await mount("/home", "This screen's documents cannot be loaded.");
+    const finding = within(screen.getByRole("alert")).getByRole("listitem").textContent!;
+    expect(finding).toContain("pipelineExecStatusTable.tc.json: label");
+    expect(finding).not.toContain(RELOAD_HINT);
+  });
+
   it("asks for the deployment's workspace rather than assuming one", async () => {
     const { posts } = await mount();
     expect(posts.map((p) => p.body["action"])).toContain("get_workspace_uri");
@@ -296,7 +407,7 @@ describe("the table this screen shares with a flow", () => {
 });
 
 describe("the screen", () => {
-  it("draws two tabs, pipelines first, and mounts one", async () => {
+  it("draws four tabs, pipelines first, and mounts one", async () => {
     await mount();
     /*
       ~~The order is the document's and it is the order a user's muscle memory is
@@ -308,9 +419,13 @@ describe("the screen", () => {
       to `/fileLoaderStatus`, reached from `fileMappingUF`'s *Loader Status*
       button. Three tabs to two, which is the whole of I-260's first line.
     */
+    // **Four since `session_registry` Phase 2 (2026-11-08)**: *Session
+    // Registry* third and *Archived Pipelines* fourth, the plan's order (§3.6).
     expect(screen.getAllByRole("tab").map((t) => t.textContent)).toEqual([
       "Pipelines Status",
       "Data Registry",
+      "Session Registry",
+      "Archived Pipelines",
     ]);
     expect(screen.getAllByRole("tabpanel")).toHaveLength(1);
   });
@@ -457,7 +572,7 @@ describe("the three filters, none of which is visible on the screen", () => {
 });
 
 describe("the table's buttons", () => {
-  it("draws both action rows — seven above and five below", async () => {
+  it("draws both action rows — eight above and five below", async () => {
     // I-104's other half: `secondRowActions` was authored and nothing drew it.
     // `TableView` draws both bars, and this table is the reason it has to.
     await mount();
@@ -470,6 +585,7 @@ describe("the table's buttons", () => {
       "Set Request Id",
       "Clear Filters",
       "Put Schema Event",
+      "Check Pending",
       "View Execution Details",
       "View Process Errors",
       "View Failure Details",
@@ -751,6 +867,124 @@ describe("Put Schema Event", () => {
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
     expect(putPosts(posts)).toHaveLength(0);
   });
+
+  /**
+   * JM-061 (2026-11-05): the dialog kept its text after it closed, because its
+   * field lived in the group the tables share and nothing cleared it. Opening it
+   * again offered the last event, and Save put it a second time.
+   */
+  const box = (dialog: HTMLElement) =>
+    within(dialog).getByLabelText(/Schema Event \(json\)/) as HTMLTextAreaElement;
+
+  async function reopen() {
+    fireEvent.click(button("Put Schema Event"));
+    return screen.findByRole("dialog", { name: "Put Schema Event" });
+  }
+
+  it("opens empty again after a Save, so the same event cannot be put twice by accident", async () => {
+    const { dialog, posts } = await openDialog();
+    fireEvent.change(box(dialog), { target: { value: EVENT } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(putPosts(posts)).toHaveLength(1));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+
+    const second = await reopen();
+    expect(box(second).value).toBe("");
+    // And Save on the empty box is refused by the dialog, not sent.
+    fireEvent.click(within(second).getByRole("button", { name: "Save" }));
+    expect(await within(second).findByText(/Please provide a Schema Event json/)).toBeTruthy();
+    expect(putPosts(posts)).toHaveLength(1);
+  });
+
+  it("opens empty again after a Cancel, and without the previous open's field error", async () => {
+    const { dialog } = await openDialog();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+    expect(await within(dialog).findByText(/Please provide a Schema Event json/)).toBeTruthy();
+    fireEvent.change(box(dialog), { target: { value: EVENT } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+
+    const second = await reopen();
+    expect(box(second).value).toBe("");
+    expect(within(second).queryByText(/Please provide a Schema Event json/)).toBeNull();
+  });
+
+  it("re-reads the pipelines table after a Save", async () => {
+    // The `post` step's refresh now lands on the dialog's own state, so the
+    // screen requests one on `ok`; without it the table would not re-read.
+    const { dialog, posts } = await openDialog();
+    const before = readsOf(posts, "pipeline_execution_status").length;
+    fireEvent.change(box(dialog), { target: { value: EVENT } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await waitFor(() =>
+      expect(readsOf(posts, "pipeline_execution_status").length).toBeGreaterThan(before),
+    );
+  });
+});
+
+/**
+ * *Check Pending* (jetstore_maintenance JM-062, 2026-11-05). A row inserted into
+ * `pipeline_execution_status` as `pending` by SQL waits for the next status update
+ * or the apiserver's hourly sweep; this button posts `start_pending_tasks`, whose arm calls `StartPendingTasks` behind
+ * `run_pipelines` (`jets/apiserver/api_tables.go`). That a pipeline then starts
+ * is the server's, and is not shown here.
+ */
+describe("Check Pending", () => {
+  const startPosts = (posts: Posted[]) =>
+    posts.filter((p) => p.body["action"] === "start_pending_tasks");
+
+  it("sits right of Put Schema Event, on the first row, and needs no selection", async () => {
+    await mount();
+    await openTab("Pipelines Status", "00:01:12");
+    const check = button("Check Pending");
+    const put = button("Put Schema Event");
+    expect(check.closest(".jets-datatable__header-row")).toBe(put.closest(".jets-datatable__header-row"));
+    const row = Array.from(
+      put.closest(".jets-datatable__header-row")!.querySelectorAll("button"),
+    ).map((b) => b.textContent);
+    expect(row.indexOf("Check Pending")).toBe(row.indexOf("Put Schema Event") + 1);
+    expect((check as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("is disabled for a user without run_pipelines, as Put Schema Event is", async () => {
+    loginCapabilities = [];
+    await mount();
+    await openTab("Pipelines Status", "00:01:12");
+    expect((button("Check Pending") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("posts start_pending_tasks to /dataTable, says so, and re-reads the table", async () => {
+    const { posts } = await mount();
+    await openTab("Pipelines Status", "00:01:12");
+    const before = readsOf(posts, "pipeline_execution_status").length;
+    fireEvent.click(button("Check Pending"));
+
+    await waitFor(() => expect(startPosts(posts)).toHaveLength(1));
+    const [post] = startPosts(posts);
+    expect(post!.path).toBe("/dataTable");
+    expect(post!.body).toEqual({ action: "start_pending_tasks", data: [] });
+    expect((await screen.findByRole("status")).textContent).toBe(
+      "Pending pipelines checked: those that can start now have been started",
+    );
+    await waitFor(() =>
+      expect(readsOf(posts, "pipeline_execution_status").length).toBeGreaterThan(before),
+    );
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("reports the server's refusal in the error banner", async () => {
+    startPendingResponse = {
+      status: 403,
+      body: { error: "error: unauthorized, user do not have required capability" },
+    };
+    const { posts } = await mount();
+    await openTab("Pipelines Status", "00:01:12");
+    fireEvent.click(button("Check Pending"));
+    await waitFor(() => expect(startPosts(posts)).toHaveLength(1));
+    expect((await screen.findByRole("alert")).textContent).toContain("required capability");
+    expect(screen.queryByRole("status")).toBeNull();
+  });
 });
 
 /**
@@ -793,8 +1027,8 @@ async function selectRow(text: string) {
  * 11 is structure, not boxes** — jsdom computes none — so these say which line a
  * button is on and in what order, and a browser says where the line lands.
  */
-describe("the third row (D04)", () => {
-  const CEDARGATE = [
+describe("the third row", () => {
+  const ORG1_BUTTONS = [
     {
       type: "fetch_stage_to_clipboard",
       key: "analysis_report_to_clipboard",
@@ -851,7 +1085,7 @@ describe("the third row (D04)", () => {
 
   it("draws three action rows in the report's order, the custom buttons last on the third", async () => {
     // Criterion 11 (the layout half) and 14 (*rendered after the two built-ins*).
-    loginCustomButtons = CEDARGATE;
+    loginCustomButtons = ORG1_BUTTONS;
     await onSelectedRun();
     expect(lineOf("Clear Filters")).toBe(lineOf("Start Pipeline"));
     expect(lineOf("Resubmit")).toBe(lineOf("View Execution Details"));
@@ -896,7 +1130,7 @@ describe("the third row (D04)", () => {
     expect(copied).toEqual([]);
   });
 
-  it("shows the manifest in a dialog when the browser refuses the clipboard (R-2)", async () => {
+  it("shows the manifest in a dialog when the browser refuses the clipboard", async () => {
     stageFiles = { [MANIFEST]: '{"run":"sess-1"}' };
     clipboardRefuses = true;
     await onSelectedRun();
@@ -920,7 +1154,7 @@ describe("the third row (D04)", () => {
   });
 
   it("runs a custom button: substitutes the row, applies its replacement, copies", async () => {
-    loginCustomButtons = CEDARGATE;
+    loginCustomButtons = ORG1_BUTTONS;
     stageFiles = {
       "process_name=loader/session_id=sess-1/step_id=analysis_lookup/jets_partition=analysis_data/part0000-0000001.csv":
         "a|b\nc|d",
@@ -932,7 +1166,7 @@ describe("the third row (D04)", () => {
   });
 
   it("draws the custom buttons on Pipeline Status only", async () => {
-    loginCustomButtons = CEDARGATE;
+    loginCustomButtons = ORG1_BUTTONS;
     await onSelectedRun();
     expect(button("Analysis Report")).toBeTruthy();
     await openTab("Data Registry", "claim_staging");
@@ -944,5 +1178,359 @@ describe("the third row (D04)", () => {
     await onSelectedRun();
     expect(screen.queryByRole("button", { name: "Analysis Report" })).toBeNull();
     expect(labelsOn(lineOf("Get Run Manifest"))).toEqual(["Get Run Manifest", "Get Schema Event"]);
+  });
+});
+
+/**
+ * *Session Registry* and *Archived Pipelines*, Home's third and fourth tabs.
+ * `session_registry` Phase 2 (JM-081), tasks G.2 and G.3, 2026-11-08.
+ *
+ * As above, **the request rather than the rows**: each filter is asserted as the
+ * where clause the tab posted, because a filter that reaches nothing renders a
+ * correct-looking table of every row.
+ */
+describe("Session Registry and Archived Pipelines", () => {
+  const SESSION_MARKER = "2026-11-01 10:00";
+  const ARCHIVE_MARKER = "00:02:00";
+  const whereOf = (posts: Posted[], table: string) =>
+    ((lastRead(posts, table)?.["whereClauses"] ?? []) as Record<string, unknown>[]);
+
+  it("queries each new tab's table only once it is opened", async () => {
+    const { posts } = await mount();
+    expect(readsOf(posts, "session_registry_view")).toHaveLength(0);
+    expect(readsOf(posts, "pipeline_execution_status_archive")).toHaveLength(0);
+    await openTab("Session Registry", SESSION_MARKER);
+    expect(readsOf(posts, "session_registry_view")).toHaveLength(1);
+    expect(readsOf(posts, "pipeline_execution_status_archive")).toHaveLength(0);
+    await openTab("Archived Pipelines", ARCHIVE_MARKER);
+    expect(readsOf(posts, "pipeline_execution_status_archive")).toHaveLength(1);
+    expect(screen.getAllByRole("tabpanel")).toHaveLength(1);
+  });
+
+  it("opens on the tab the address names, which is where a flow returns to", async () => {
+    // `homeFiltersUF` comes back by `returnTo`, and the archive's *Set Filters*
+    // opens it: a tab held in state would come back on Pipelines Status.
+    const { posts } = await mount("/home?tab=pipelineArchiveTable", ARCHIVE_MARKER);
+    expect(tab("Archived Pipelines").getAttribute("aria-selected")).toBe("true");
+    expect(readsOf(posts, "pipeline_execution_status")).toHaveLength(0);
+  });
+
+  it("gives the archive the home filters, on the archive's table, and the client filter", async () => {
+    seedHomeFilters();
+    setSelectedClient("acme");
+    const { posts } = await mount();
+    await openTab("Archived Pipelines", ARCHIVE_MARKER);
+    const where = whereOf(posts, "pipeline_execution_status_archive");
+    expect(where).toContainEqual({
+      table: "pipeline_execution_status_archive",
+      column: "status",
+      values: ["failed"],
+    });
+    expect(where).toContainEqual({
+      table: "pipeline_execution_status_archive",
+      column: "start_time",
+      ge: "now()-interval '3 days'",
+    });
+    expect(where).toContainEqual({
+      table: "pipeline_execution_status_archive",
+      column: "client",
+      values: ["acme"],
+    });
+    // Rewritten, not added to: no clause names the live table the query lacks.
+    expect(where.some((w) => w["table"] === "pipeline_execution_status")).toBe(false);
+  });
+
+  it("gates the archive's Clear Filters on the home filters", async () => {
+    await mount();
+    await openTab("Archived Pipelines", ARCHIVE_MARKER);
+    expect((button("Clear Filters") as HTMLButtonElement).disabled).toBe(true);
+    cleanup();
+    resetHomeFilters();
+    seedStatusFilterOnly();
+    await mount();
+    await openTab("Archived Pipelines", ARCHIVE_MARKER);
+    expect((button("Clear Filters") as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("sends no home filter to Session Registry", async () => {
+    seedHomeFilters();
+    const { posts } = await mount();
+    await openTab("Session Registry", SESSION_MARKER);
+    expect(whereOf(posts, "session_registry_view")).toEqual([]);
+  });
+
+  it("turns a session-id range into two clauses on session_num", async () => {
+    const { posts } = await mount();
+    await openTab("Session Registry", SESSION_MARKER);
+    fireEvent.click(button("Set Session Id"));
+    expect(await answerPrompt(" 1000 .. 2000 ")).toMatch(/range from\.\.to/);
+    await waitFor(() => {
+      const where = whereOf(posts, "session_registry_view");
+      expect(where).toContainEqual({ table: "session_registry_view", column: "session_num", ge: "1000" });
+      expect(where).toContainEqual({ table: "session_registry_view", column: "session_num", le: "2000" });
+    });
+  });
+
+  it("takes a range with one end open", async () => {
+    const { posts } = await mount();
+    await openTab("Session Registry", SESSION_MARKER);
+    fireEvent.click(button("Set Session Id"));
+    await answerPrompt("..2000");
+    await waitFor(() =>
+      expect(whereOf(posts, "session_registry_view")).toEqual([
+        { table: "session_registry_view", column: "session_num", le: "2000" },
+      ]),
+    );
+  });
+
+  it("refuses a bound that is not digits, and queries nothing new", async () => {
+    // The server splices `ge` and `le` as written (`visitWhereClause`), so this
+    // refusal is what keeps the input out of the SQL.
+    const { posts } = await mount();
+    await openTab("Session Registry", SESSION_MARKER);
+    const before = readsOf(posts, "session_registry_view").length;
+    fireEvent.click(button("Set Session Id"));
+    await answerPrompt("1000..2000 OR 1=1");
+    expect((await screen.findByRole("alert")).textContent).toMatch(/digits only/);
+    expect(readsOf(posts, "session_registry_view")).toHaveLength(before);
+    expect((button("Clear Filters") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("filters a comma list on session_id, and Clear Filters clears it", async () => {
+    const { posts } = await mount();
+    await openTab("Session Registry", SESSION_MARKER);
+    expect((button("Clear Filters") as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(button("Set Session Id"));
+    await answerPrompt("1001, 2002");
+    await waitFor(() =>
+      expect(whereOf(posts, "session_registry_view")).toContainEqual({
+        table: "session_registry_view",
+        column: "session_id",
+        values: ["1001", "2002"],
+      }),
+    );
+    await waitFor(() => expect((button("Clear Filters") as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(button("Clear Filters"));
+    await waitFor(() => expect(whereOf(posts, "session_registry_view")).toEqual([]));
+    await waitFor(() => expect((button("Clear Filters") as HTMLButtonElement).disabled).toBe(true));
+  });
+
+  it("compiles the Set Filters dialog into clauses on the view", async () => {
+    const { posts } = await mount();
+    await openTab("Session Registry", SESSION_MARKER);
+    fireEvent.click(button("Set Filters"));
+    const dialog = await screen.findByRole("dialog");
+    // The process list is the dialog's own table, over process_config (JM-185).
+    await within(dialog).findByText("Map_MedicalClaim");
+    await selectRow("Map_MedicalClaim");
+    expect(within(dialog).queryByLabelText(/Month Period/)).toBeNull();
+    fireEvent.change(within(dialog).getByLabelText(/Source Type/), { target: { value: "domain_table" } });
+    fireEvent.change(within(dialog).getByLabelText(/File Key Contains/), { target: { value: "client=CI" } });
+    fireEvent.change(within(dialog).getByLabelText(/File Key Date Before/), { target: { value: "2026-10-31" } });
+    fireEvent.change(within(dialog).getByLabelText(/Registered After/), { target: { value: "3 days" } });
+    fireEvent.change(within(dialog).getByLabelText(/Registered Before/), { target: { value: "2026-11-01" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await waitFor(() =>
+      expect(whereOf(posts, "session_registry_view")).toEqual([
+        { table: "session_registry_view", column: "process_name", values: ["Map_MedicalClaim"] },
+        { table: "session_registry_view", column: "source_type", values: ["domain_table"] },
+        { table: "session_registry_view", column: "file_key", like: "%client=CI%" },
+        { table: "session_registry_view", column: "file_key_date", le: "timestamp '2026-10-31'" },
+        { table: "session_registry_view", column: "last_update", ge: "now()-interval '3 days'" },
+        { table: "session_registry_view", column: "last_update", le: "timestamp '2026-11-01'" },
+      ]),
+    );
+    // Reopened, it holds the answers that set the filters, the process included.
+    fireEvent.click(button("Set Filters"));
+    const again = await screen.findByRole("dialog");
+    expect(within(again).getByLabelText(/Source Type/)).toHaveProperty("value", "domain_table");
+    expect(within(again).getByLabelText(/File Key Contains/)).toHaveProperty("value", "client=CI");
+    const processRow = (await within(again).findByText("Map_MedicalClaim")).closest("tr")!;
+    await waitFor(() =>
+      expect((within(processRow).getByRole("checkbox") as HTMLInputElement).checked).toBe(true),
+    );
+  });
+
+  it("has no Month Period column", async () => {
+    await mount();
+    await openTab("Session Registry", SESSION_MARKER);
+    expect(screen.queryByRole("columnheader", { name: /Month Period/ })).toBeNull();
+  });
+
+  it("keeps the dialog open over a time it cannot read, and filters nothing", async () => {
+    const { posts } = await mount();
+    await openTab("Session Registry", SESSION_MARKER);
+    const before = readsOf(posts, "session_registry_view").length;
+    fireEvent.click(button("Set Filters"));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(within(dialog).getByLabelText(/Registered After/), {
+      target: { value: "yesterday'; drop" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+    await within(dialog).findByText(/Enter a date/);
+    expect(screen.getByRole("dialog")).toBeTruthy();
+    expect(readsOf(posts, "session_registry_view")).toHaveLength(before);
+  });
+
+  it("shows a client of (unknown) as written", async () => {
+    await mount();
+    await openTab("Session Registry", SESSION_MARKER);
+    expect(screen.getByText("(unknown)")).toBeTruthy();
+  });
+});
+
+describe("Session Registry's Delete", () => {
+  const SESSION_MARKER = "2026-11-01 10:00";
+  const deletePosts = (posts: Posted[]) => posts.filter((p) => p.body["action"] === "delete_sessions");
+  const previewPosts = (posts: Posted[]) =>
+    posts.filter((p) => p.body["action"] === "preview_session_deletion");
+
+  async function openRegistry() {
+    loginCapabilities = ["run_pipelines", "jetstore_read", "delete_session"];
+    const mounted = await mount();
+    await openTab("Session Registry", SESSION_MARKER);
+    return mounted;
+  }
+
+  it("is disabled for a user without delete_session", async () => {
+    loginCapabilities = ["run_pipelines", "jetstore_read"];
+    await mount();
+    await openTab("Session Registry", SESSION_MARKER);
+    await selectRow("1001");
+    expect((button("Delete") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("is disabled until a row is selected, and on a row with a deletion", async () => {
+    await openRegistry();
+    expect((button("Delete") as HTMLButtonElement).disabled).toBe(true);
+    await selectRow("1001");
+    expect((button("Delete") as HTMLButtonElement).disabled).toBe(false);
+    // A second row whose deletion is queued. `enableWhen` tests every selected
+    // row, so the button says why in the row's terms; it said "Nothing to clear"
+    // when only the first row was tested and the predicate refused.
+    await selectRow("2002");
+    expect((button("Delete") as HTMLButtonElement).disabled).toBe(true);
+    expect(button("Delete").getAttribute("title")).toBe("Not for a row that is pending, failed or done");
+  });
+
+  it("is disabled on a deleted session's tombstone", async () => {
+    await openRegistry();
+    await selectRow("3003");
+    expect((button("Delete") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("lists every session the deletion reaches, and Cancel posts nothing", async () => {
+    const { posts } = await openRegistry();
+    await selectRow("1001");
+    fireEvent.click(button("Delete"));
+    await screen.findByRole("dialog");
+    expect(previewPosts(posts)).toHaveLength(1);
+    expect(previewPosts(posts)[0]!.body["data"]).toEqual([{ session_id: "1001" }]);
+    expect(screen.getByTestId("prompt-detail").textContent).toBe(
+      [
+        "2 sessions, 1 of them reading a selected one:",
+        "1001: claim, client acme",
+        "2002: map_records, client (unknown), month period 313, reads 1001, waits for its run to end",
+      ].join("\n"),
+    );
+    expect(await answerConfirm("Cancel")).toMatch(/^Delete these sessions\?/);
+    expect(deletePosts(posts)).toHaveLength(0);
+  });
+
+  it("posts the selected ids with the previewed ones as expected, says so, and re-reads", async () => {
+    const { posts } = await openRegistry();
+    await selectRow("1001");
+    const before = readsOf(posts, "session_registry_view").length;
+    fireEvent.click(button("Delete"));
+    await answerConfirm("OK");
+    await waitFor(() => expect(deletePosts(posts)).toHaveLength(1));
+    // One row carrying the selection and the previewed ids, which the server
+    // reads from the rows rather than from the envelope (jetstore#2410).
+    const body = deletePosts(posts)[0]!.body;
+    expect(body["data"]).toEqual([{ session_id: ["1001"], expected: ["1001", "2002"] }]);
+    expect(body["expected"]).toBeUndefined();
+    expect((await screen.findByRole("status")).textContent).toMatch(/^Deletion queued/);
+    await waitFor(() => expect(readsOf(posts, "session_registry_view").length).toBeGreaterThan(before));
+  });
+
+  it("resubmits the selected sessions as pending once confirmed, and starts nothing", async () => {
+    const { posts } = await openRegistry();
+    const resubmits = () => posts.filter((p) => p.body["action"] === "resubmit_sessions_as_pending");
+    expect((button("Resubmit as Pending") as HTMLButtonElement).disabled).toBe(true);
+    await selectRow("2002");
+    expect((button("Resubmit as Pending") as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(button("Resubmit as Pending"));
+    expect(await answerConfirm("OK")).toMatch(/^Resubmit the runs of the selected sessions as pending\?/);
+    await waitFor(() => expect(resubmits()).toHaveLength(1));
+    expect(resubmits()[0]!.body["data"]).toEqual([{ session_id: ["2002"] }]);
+    expect((await screen.findByRole("status")).textContent).toMatch(/^Resubmitted as pending/);
+    expect(posts.filter((p) => p.body["action"] === "start_pending_tasks")).toHaveLength(0);
+  });
+
+  it("keeps the sessions selected after Resubmit as Pending, ready for Delete", async () => {
+    await openRegistry();
+    await selectRow("1001");
+    fireEvent.click(button("Resubmit as Pending"));
+    await answerConfirm("OK");
+    expect((await screen.findByRole("status")).textContent).toMatch(/^Resubmitted as pending/);
+    const box = within(screen.getByText("1001").closest("tr")!).getByRole("checkbox") as HTMLInputElement;
+    // Past the point a refresh would have landed: the selection is still there.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(box.checked).toBe(true);
+    expect((button("Delete") as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("selects every session of the page with the heading's box, and acts on them all", async () => {
+    const { posts } = await openRegistry();
+    const all = screen.getByRole("checkbox", { name: "Select all rows on this page" }) as HTMLInputElement;
+    fireEvent.click(all);
+    await waitFor(() => expect(all.checked).toBe(true));
+    fireEvent.click(button("Resubmit as Pending"));
+    await answerConfirm("OK");
+    const resubmits = () => posts.filter((p) => p.body["action"] === "resubmit_sessions_as_pending");
+    await waitFor(() => expect(resubmits()).toHaveLength(1));
+    const sent = (resubmits()[0]!.body["data"] as { session_id: string[] }[])[0]!.session_id;
+    expect([...sent].sort()).toEqual(["1001", "2002", "3003"]);
+  });
+
+  it("posts nothing when Resubmit as Pending is cancelled", async () => {
+    const { posts } = await openRegistry();
+    await selectRow("2002");
+    fireEvent.click(button("Resubmit as Pending"));
+    await answerConfirm("Cancel");
+    expect(posts.filter((p) => p.body["action"] === "resubmit_sessions_as_pending")).toHaveLength(0);
+  });
+
+  it("does not offer Resubmit as Pending to a user without run_pipelines", async () => {
+    loginCapabilities = ["jetstore_read", "delete_session"];
+    await mount();
+    await openTab("Session Registry", SESSION_MARKER);
+    await selectRow("2002");
+    expect((button("Resubmit as Pending") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("reports a 409 and asks the user to select again", async () => {
+    deleteResponse = { status: 409, body: { error: "the sessions to delete changed; review them again" } };
+    const { posts } = await openRegistry();
+    await selectRow("1001");
+    fireEvent.click(button("Delete"));
+    await answerConfirm("OK");
+    expect((await screen.findByRole("alert")).textContent).toMatch(/changed since they were listed/);
+    expect(deletePosts(posts)).toHaveLength(1);
+  });
+
+  it("reports a refused preview, asks nothing, and posts nothing", async () => {
+    previewResponse = { status: 404, body: { error: "session 1001: not registered in session_registry" } };
+    const { posts } = await openRegistry();
+    await selectRow("1001");
+    fireEvent.click(button("Delete"));
+    // The server's own text, which names the session no longer registered; Home
+    // dropped it and the alert read as a generic refusal.
+    expect((await screen.findByRole("alert")).textContent).toContain(
+      "Could not list the sessions to delete: session 1001: not registered in session_registry",
+    );
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(deletePosts(posts)).toHaveLength(0);
   });
 });

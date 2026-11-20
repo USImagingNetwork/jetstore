@@ -1,7 +1,7 @@
 /**
  * @vitest-environment jsdom
  *
- * The supervision screens (task K.3, criterion 31).
+ * The supervision screens.
  *
  * **What is worth testing here is what the screens refuse to do**, because the
  * refusals are the design and they are the things a later edit would undo
@@ -25,7 +25,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ApiClient } from "../api/client";
 import { ApiProvider } from "../shell/capabilities";
 import { NotificationsProvider } from "../shell/notifications";
-import { ProposalScreen } from "./ProposalScreen";
+import { ProposalScreen, artifactText } from "./ProposalScreen";
 import { ProposalsScreen } from "./ProposalsScreen";
 import { stateLabel } from "./api";
 
@@ -133,7 +133,7 @@ describe("the staging list", () => {
   // The default view is what still wants a human, not everything and not every
   // non-terminal state. `approved` and `deployed` are decided; leaving them in
   // the default meant a queue that never shed anything, because `deployed` is
-  // left only by `superseded` (I-249).
+  // left only by `superseded`.
   it("defaults to the states awaiting a decision, and widens on request", async () => {
     const { api, sent } = await clientWith({ list_proposals: { body: { proposals: [] } } });
     renderAt(api, "/proposals");
@@ -163,7 +163,7 @@ describe("the staging list", () => {
     expect(sent[2]!["states"]).toEqual([]);
   });
 
-  // A draft with no generated tests is the ordinary output of a Phase-1
+  // A draft with no generated tests is the ordinary output of an
   // authoring run, and it is the thing a reviewer most needs to see before
   // opening it. Marked, not hidden.
   it("marks a proposal with no generated tests", async () => {
@@ -282,6 +282,53 @@ describe("the decision screen", () => {
   });
 });
 
+// "What the run produced" was drawn as one clipped line: the block lost its
+// height in the page's flex column (proposalStyles.test.ts), and a run's
+// one-line JSON had no lines to keep. These hold the second half, and that the
+// text stays text.
+describe("what the run produced", () => {
+  it("keeps the lines of a written rationale", async () => {
+    const written = "Map_Claim: give Days_Supply a default of 30.\n\nMapping row:\n  default_value  30";
+    const { api } = await clientWith({
+      get_proposal: { body: { ...awaitingView, proposal: { ...awaitingView.proposal, rationale: written } } },
+      read_transcript: { body: soundTranscript },
+    });
+    renderAt(api, "/proposals/chg_1");
+    const block = await screen.findByLabelText("What the run produced");
+    expect(block.tagName).toBe("PRE");
+    expect(block.textContent).toBe(written);
+  });
+
+  it("shows a run's JSON output indented, one member per line", async () => {
+    const { api } = await clientWith({
+      get_proposal: {
+        body: { ...awaitingView, proposal: { ...awaitingView.proposal, rationale: '{"transformation":"x","columns":["a","b"]}' } },
+      },
+      read_transcript: { body: soundTranscript },
+    });
+    renderAt(api, "/proposals/chg_1");
+    const block = await screen.findByLabelText("What the run produced");
+    expect(block.textContent).toBe('{\n  "transformation": "x",\n  "columns": [\n    "a",\n    "b"\n  ]\n}');
+  });
+
+  it("shows markup as text and never interprets it", async () => {
+    const hostile = '<img src=x onerror="alert(1)"><b>bold</b>';
+    const { api } = await clientWith({
+      get_proposal: { body: { ...awaitingView, proposal: { ...awaitingView.proposal, rationale: hostile } } },
+      read_transcript: { body: soundTranscript },
+    });
+    renderAt(api, "/proposals/chg_1");
+    const block = await screen.findByLabelText("What the run produced");
+    expect(block.textContent).toBe(hostile);
+    expect(block.querySelector("img, b")).toBeNull();
+  });
+
+  it("leaves text that only looks like JSON as written", () => {
+    expect(artifactText("[draft] not json\nsecond line")).toBe("[draft] not json\nsecond line");
+    expect(artifactText("")).toBe("");
+  });
+});
+
 describe("the transcript", () => {
   it("leads with the verdict and says what verified does not mean", async () => {
     const { api } = await clientWith({
@@ -290,7 +337,7 @@ describe("the transcript", () => {
     });
     renderAt(api, "/proposals/chg_1");
     await screen.findByText(/Chain verified/);
-    // I-73: tamper-evident is not complete, and the screen must not let a
+    // Tamper-evident is not complete, and the screen must not let a
     // verified chain be read as a complete one.
     await screen.findByText(/does not mean the run wrote every event it should have/);
   });

@@ -17,12 +17,12 @@ import (
 )
 
 // The incident the supervision screens render, produced by triage rather than
-// typed (task AC.3, criterion 50's fourth clause).
+// typed.
 //
 // **Criterion 50 asks for the screens to show a supervisor an incident and its
 // ranked hypotheses "over an incident triage wrote", and until this file the
 // screen tests rendered a hand-written row.** A hand-written fixture is a fixture
-// its author agreed with by construction, which is I-147's shape at the wire: the
+// its author agreed with by construction, which is the same failure at the wire: the
 // stub is shaped like the caller, so it passes whatever the caller does.
 //
 // So the fixture is generated here — a real execution record, `shadow.Writer`
@@ -116,11 +116,11 @@ func TestTheScreensFixtureIsAnIncidentTriageWrote(t *testing.T) {
 	}
 	if inc["classification"] != "" {
 		t.Errorf("the generated incident claims a cause (%v); triage evidences a locus and never a "+
-			"cause (§9.5)", inc["classification"])
+			"cause", inc["classification"])
 	}
 	if n := len(decoded["transitions"].([]any)); n < 2 {
 		t.Errorf("the payload carries %d transitions; a diagnosed incident has at least two, and "+
-			"the ranking's basis rides the second (criterion 45)", n)
+			"the ranking's basis rides the second", n)
 	}
 }
 
@@ -177,7 +177,7 @@ func goldenDB(t *testing.T, name string) *pgxpool.Pool {
 // goldenRecord writes one failed run.
 //
 // **The worker rows go in through the cpipes node's own two statements** rather
-// than through SQL this test composed, which is F104's point: a payload derived
+// than through SQL this test composed, because a payload derived
 // from rows a test typed agrees with the test that typed them. The run header is
 // composed, because its production writer is the apiserver at submission and is
 // not reachable without a state machine.
@@ -189,7 +189,7 @@ func goldenRecord(t *testing.T, pool *pgxpool.Pool, session string) {
 	if err := pool.QueryRow(ctx, `INSERT INTO jetsapi.pipeline_execution_status
 		(pipeline_config_key, client, process_name, main_object_type, session_id,
 		 source_period_key, status, failure_details, user_email, start_time, last_update)
-		VALUES (1, 'cgt', 'loader', 'claims', $1, 1, 'failed', '', 'test@test', $2, $2) RETURNING key`,
+		VALUES (1, 'client2', 'loader', 'claims', $1, 1, 'failed', '', 'test@test', $2, $2) RETURNING key`,
 		session, start).Scan(&execKey); err != nil {
 		t.Fatalf("inserting the run header: %v", err)
 	}
@@ -209,7 +209,7 @@ func goldenRecord(t *testing.T, pool *pgxpool.Pool, session string) {
 					NodeId: w.shard, PipelineExecKey: execKey,
 				},
 				ComputePipesCommonArgs: compute_pipes.ComputePipesCommonArgs{
-					Client: "cgt", ProcessName: "loader", SessionId: session,
+					Client: "client2", ProcessName: "loader", SessionId: session,
 					InputSessionId: session, SourcePeriodKey: 1, PipelineConfigKey: 1,
 					UserEmail: "test@test", MainInputStepId: "reducing01",
 				},

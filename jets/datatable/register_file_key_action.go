@@ -15,6 +15,7 @@ import (
 	"github.com/artisoft-io/jetstore/jets/schema"
 	"github.com/artisoft-io/jetstore/jets/utils"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -23,6 +24,19 @@ type RegisterFileKeyAction struct {
 	Data            []map[string]any `json:"data"`
 	NoAutomatedLoad bool             `json:"noAutomatedLoad"`
 	IsSchemaEvent   bool             `json:"isSchemaEvent"`
+
+	// ResumeSessionId and OnSessionReserved let the register-key lambda resume a
+	// registration an earlier invocation left unfinished (it timed out, or
+	// failed). Neither is read from a request body, and both need exactly one row.
+	//
+	// OnSessionReserved is called with the input session reserved for the row,
+	// before its input_registry rows are written, so the caller can record it.
+	// ResumeSessionId names the session an earlier invocation recorded: the row is
+	// registered under it rather than a new one, the input_registry rows already
+	// written are reused, and only the pipelines with no run yet for those rows are
+	// started.
+	ResumeSessionId   string                 `json:"-"`
+	OnSessionReserved func(sessionId string) `json:"-"`
 }
 
 // Function to match the case for client, org, and object_type based on jetstore
@@ -96,7 +110,7 @@ var jetsS3SchemaTriggers string = os.Getenv("JETS_s3_SCHEMA_TRIGGERS")
 // SchemaEventFileKeyStem names the objects PutSchemaEventToS3 writes under
 // JETS_s3_SCHEMA_TRIGGERS when a request names no file_key: the stem, the time
 // in milliseconds and a UUID, e.g. jetstore_ui_event_1790905252288_<uuid>.json.
-// jetstore_maintenance_02, D01 (AD.1, 2026-10-01) and Phase 2 (2026-10-02).
+// Added 2026-10-01, made unique 2026-10-02.
 //
 // **Unique per row, and it was one fixed name until 2026-10-02.** Nothing
 // downstream keys on the name -- the register-keys lambda registers what the
@@ -127,8 +141,8 @@ type schemaEventUpload struct {
 // Submit Schema Event to S3 (which will call RegisterFileKEys as side effect)
 //
 // **Until 2026-10-01 a row without both an event and a file_key was skipped and
-// the action returned 200 having written nothing** (jetstore_maintenance_02 F3,
-// I-5). The React *Put Schema Event* dialog sends no file key, by design, so that
+// the action returned 200 having written nothing**. The React *Put Schema Event*
+// dialog sends no file key, by design, so that
 // silence would have been the dialog's normal outcome. Now:
 //
 //   - a missing, null or empty file_key means a new name, newSchemaEventFileKey;
@@ -186,70 +200,214 @@ func (ctx *DataTableContext) PutSchemaEventToS3(action *RegisterFileKeyAction, t
 	return &map[string]any{"file_keys": written}, http.StatusOK, nil
 }
 
-// Register file_key with file_key_staging table and handling schema events as well.
-func (ctx *DataTableContext) RegisterFileKeys(registerFileKeyAction *RegisterFileKeyAction, token string) (*map[string]any, int, error) {
-	var err error
-	sqlStmt, ok := sqlInsertStmts["file_key_staging"]
-	if !ok {
-		return nil, http.StatusInternalServerError, errors.New("error cannot find file_key_staging stmt")
+// registerFileKeyRow is one row of a register_keys request, read and checked.
+type registerFileKeyRow struct {
+	fileKeyObject      map[string]any
+	schemaProviderJson string
+	requestId          any
+	// objectSize is the size of the S3 object the row names, from its "size"
+	// entry, and 0 when it has none. It is what the part-file gate reads.
+	objectSize int64
+}
+
+// sizeOf reads a size as int64. ok is false for a type it does not read, which
+// the caller treats as absent, as the size case always has.
+func sizeOf(v any) (size int64, ok bool, err error) {
+	switch vv := v.(type) {
+	case int:
+		return int64(vv), true, nil
+	case int32:
+		return int64(vv), true, nil
+	case int64:
+		return vv, true, nil
+	case float64:
+		return int64(vv), true, nil
+	case float32:
+		return int64(vv), true, nil
+	case string:
+		size, err = strconv.ParseInt(vv, 10, 64)
+		return size, err == nil, err
 	}
-	sentinelFileName := os.Getenv("JETS_SENTINEL_FILE_NAME")
-	baseSessionId := time.Now().UnixMilli()
-	var sessionId, stmt string
-	var requestId any
-	var allOk bool
-	row := make([]any, len(sqlStmt.ColumnKeys))
-NextKey:
-	for irow := range registerFileKeyAction.Data {
-		var schemaProviderJson string
+	return 0, false, nil
+}
+
+// registerFileKeysReads is every key of a request row that readRegisterFileKeyRow
+// reads; it drops the others without a word. Keep the two in step:
+// TestRegisterFileKeysReadsWhatItSays checks each key here changes what a row
+// reads as.
+var registerFileKeysReads = map[string]bool{
+	"client": true, "vendor": true, "org": true, "object_type": true,
+	"file_key": true, "year": true, "month": true, "day": true,
+	"size": true, "file_size": true, "schema_provider_json": true, "request_id": true,
+}
+
+// RegisterFileKeysReads reports whether RegisterFileKeys reads key from a row of
+// its request. A row's other keys are dropped without a word, so a caller adding
+// a key can check that it will be read (the register-key lambda warns of
+// a key its site hook adds that is not).
+func RegisterFileKeysReads(key string) bool {
+	return registerFileKeysReads[key]
+}
+
+// readRegisterFileKeyRow copies the keys RegisterFileKeys reads from one row of
+// the request, converting them to the types it uses. An error is the request's
+// fault and is a 400. It writes nothing, so that RegisterFileKeys can read every
+// row before it writes any.
+func readRegisterFileKeyRow(irow int, data map[string]any) (*registerFileKeyRow, error) {
+	var err error
+	r := &registerFileKeyRow{
 		// fileKeyObject with defaults
-		fileKeyObject := map[string]any{
+		fileKeyObject: map[string]any{
 			"org":        "",
 			"year":       1970,
 			"month":      1,
 			"day":        1,
 			"request_id": nil,
-		}
-		// Get the value from the incoming obj, convert to correct types
-		for k, v := range registerFileKeyAction.Data[irow] {
-			switch k {
-			case "client", "vendor", "org", "object_type", "file_key":
+		},
+	}
+	fileKeyObject := r.fileKeyObject
+	var specFileSize int64
+	var hasObjectSize, hasSpecFileSize bool
+	// Get the value from the incoming obj, convert to correct types
+	for k, v := range data {
+		switch k {
+		case "client", "vendor", "org", "object_type":
+			// These are read as strings without a check further down, in
+			// updateFileKeyComponentCase and when starting pipelines, so a
+			// non-string is refused here rather than panicking there. Nil is
+			// what an absent value is, and keeps the default.
+			switch v.(type) {
+			case nil, string:
 				fileKeyObject[k] = v
-			case "year", "month", "day":
-				switch vv := v.(type) {
-				case int:
-					fileKeyObject[k] = vv
-				case string:
-					fileKeyObject[k], err = strconv.Atoi(vv)
-					if err != nil {
-						return nil, http.StatusBadRequest, fmt.Errorf("while converting %s (%s) to int: %v", k, vv, err)
-					}
-				}
-			case "size":
-				switch vv := v.(type) {
-				case int:
-					fileKeyObject["file_size"] = int64(vv)
-				case int32:
-					fileKeyObject["file_size"] = int64(vv)
-				case int64:
-					fileKeyObject["file_size"] = vv
-				case float64:
-					fileKeyObject["file_size"] = int64(vv)
-				case float32:
-					fileKeyObject["file_size"] = int64(vv)
-				case string:
-					fileKeyObject["file_size"], err = strconv.ParseInt(vv, 10, 64)
-					if err != nil {
-						return nil, http.StatusBadRequest, fmt.Errorf("while converting %s (%s) to int64: %v", k, vv, err)
-					}
-				}
-			case "schema_provider_json":
-				schemaProviderJson = v.(string)
-			case "request_id":
-				requestId = v
-				fileKeyObject[k] = v
+			default:
+				return nil, fmt.Errorf("register_file_keys: row %d: %s must be a string, got %T", irow, k, v)
 			}
+		case "file_key":
+			fileKeyObject[k] = v
+		case "year", "month", "day":
+			// A request decoded from JSON carries numbers as float64, which had
+			// no case here and was silently replaced by the 1970-01-01 default
+			// before a review. Nil keeps the default; anything ToInt cannot
+			// read is a 400, as a non-numeric string already was.
+			if v == nil {
+				continue
+			}
+			fileKeyObject[k], err = utils.ToInt(v)
+			if err != nil {
+				return nil, fmt.Errorf("while converting %s (%v) to int: %v", k, v, err)
+			}
+		case "size", "file_size":
+			// size is the S3 object's, from the event that named it; file_size is
+			// a schema event's, SchemaProviderSpec.FileSize. file_size had no case
+			// and was dropped until a fix.
+			n, ok, err := sizeOf(v)
+			if err != nil {
+				return nil, fmt.Errorf("while converting %s (%v) to int64: %v", k, v, err)
+			}
+			if k == "size" {
+				r.objectSize, hasObjectSize = n, ok
+			} else {
+				specFileSize, hasSpecFileSize = n, ok
+			}
+		case "schema_provider_json":
+			// Checked: a non-string, which a register-key hook can
+			// write, panicked the lambda here. Nil is an absent value.
+			switch vv := v.(type) {
+			case nil:
+			case string:
+				r.schemaProviderJson = vv
+			default:
+				return nil, fmt.Errorf("register_file_keys: row %d: schema_provider_json must be a string, got %T", irow, v)
+			}
+		case "request_id":
+			// Per row: a row with no request_id must not inherit the previous
+			// row's.
+			r.requestId = v
+			fileKeyObject[k] = v
 		}
+	}
+	// The recorded file_size is the spec's when it gives one, else the object's.
+	// A part-file source's sentinel replaces it with the folder's total further
+	// on, whichever it was.
+	switch {
+	case hasSpecFileSize:
+		fileKeyObject["file_size"] = specFileSize
+	case hasObjectSize:
+		fileKeyObject["file_size"] = r.objectSize
+	}
+	return r, nil
+}
+
+// fileKeySkip is a row of a register_keys request that registered no input, and
+// why. RegisterFileKeys returns them under "skipped".
+type fileKeySkip struct {
+	Row     int    `json:"row"`
+	FileKey string `json:"file_key,omitempty"`
+	Reason  string `json:"reason"`
+}
+
+// The reasons a row registers no input. A row skipped for any of the first four
+// writes nothing. A row with no source_config, or whose source_config has no
+// domain key to register, is staged in file_key_staging, so it is listed among
+// the files that arrived, and nothing else is written for it.
+const (
+	skipNoFileKey      = "no_file_key"            // the row names no file
+	skipPartFile       = "part_file"              // a part file of a part-file source; its sentinel registers the folder
+	skipSentinelName   = "sentinel_name_mismatch" // not the sentinel JETS_SENTINEL_FILE_NAME names
+	skipMissingColumn  = "missing_column"         // a file_key_staging column has no value
+	skipNoSourceConfig = "no_source_config"       // no source_config for its client, org and object_type
+	skipNoDomainKeys   = "no_domain_keys"         // its source_config has no domain key to register
+)
+
+// maxReportedSkips bounds the "skipped" list, since a sync of a bucket skips
+// every part file in it; "skipped_count" is the total.
+const maxReportedSkips = 100
+
+// Register file_key with file_key_staging table and handling schema events as well.
+//
+// Every row is read and checked before any is written: a request whose
+// row N was refused with a 400 had already written rows 0 to N-1, started their
+// pipelines, and left the caller no way to tell which.
+func (ctx *DataTableContext) RegisterFileKeys(registerFileKeyAction *RegisterFileKeyAction, token string) (*map[string]any, int, error) {
+	sqlStmt, ok := sqlInsertStmts["file_key_staging"]
+	if !ok {
+		return nil, http.StatusInternalServerError, errors.New("error cannot find file_key_staging stmt")
+	}
+	resuming := registerFileKeyAction.ResumeSessionId != ""
+	if (resuming || registerFileKeyAction.OnSessionReserved != nil) && len(registerFileKeyAction.Data) != 1 {
+		return nil, http.StatusBadRequest, errors.New("a registration resumed or recorded by session must have exactly one row")
+	}
+	rows := make([]*registerFileKeyRow, 0, len(registerFileKeyAction.Data))
+	for irow := range registerFileKeyAction.Data {
+		r, err := readRegisterFileKeyRow(irow, registerFileKeyAction.Data[irow])
+		if err != nil {
+			return nil, http.StatusBadRequest, err
+		}
+		rows = append(rows, r)
+	}
+	sentinelFileName := os.Getenv("JETS_SENTINEL_FILE_NAME")
+	baseSessionId := time.Now().UnixMilli()
+	var sessionId, stmt string
+	var allOk bool
+	row := make([]any, len(sqlStmt.ColumnKeys))
+	registered := 0
+	skipped := make([]fileKeySkip, 0)
+	skippedCount := 0
+	skip := func(irow int, fileKey any, reason string) {
+		skippedCount++
+		fk, _ := fileKey.(string)
+		if reason != skipPartFile {
+			log.Printf("RegisterFileKeys: row %d (%s) registers no input: %s", irow, fk, reason)
+		}
+		if len(skipped) < maxReportedSkips {
+			skipped = append(skipped, fileKeySkip{Row: irow, FileKey: fk, Reason: reason})
+		}
+	}
+NextKey:
+	for irow, r := range rows {
+		fileKeyObject := r.fileKeyObject
+		schemaProviderJson := r.schemaProviderJson
+		requestId := r.requestId
 		ctx.updateFileKeyComponentCase(&fileKeyObject)
 
 		// Inserting source_period, do retry logic in case of a race condition
@@ -285,32 +443,38 @@ NextKey:
 		// from the map and an empty one would register the bucket root.
 		fileKey, hasFileKey := fileKeyObject["file_key"].(string)
 		if !hasFileKey || len(fileKey) == 0 {
-			log.Println("***while RegisterFileKeys: skipping file key with no file_key:", fileKeyObject)
+			skip(irow, nil, skipNoFileKey)
 			continue NextKey
 		}
 		stmt = "SELECT table_name, is_part_files, domain_keys FROM jetsapi.source_config WHERE client=$1 AND org=$2 AND object_type=$3"
 		allOk = true
 		err = ctx.Dbpool.QueryRow(context.Background(), stmt, client, org, objectType).Scan(&tableName, &isPartFile, &domainKeys)
-		if err == nil {
+		// No row is a file JetStore has no source_config for, which is staged and
+		// registers nothing; any other error is the database's (the
+		// error was not checked once, so it was treated as no row).
+		hasSourceConfig := err == nil
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return nil, http.StatusInternalServerError, fmt.Errorf("while reading source_config: %v", err)
+		}
+		if hasSourceConfig {
 			// process - entry found
+			domainKeys = uniqueDomainKeys(domainKeys, client, org, objectType)
 			// log.Printf("*** source_config found: %v, is part file: %v\n", isPartFile)
 			if isPartFile == 1 {
 				// Multi Part File
-				// Defence in depth: an absent file_size is 0 rather than a panic. The
-				// copying switch above writes file_size from a size entry only, and a
-				// schema event has none: SchemaProviderSpec.FileSize serialises as
-				// file_size, which that switch has no case for. A 0 here takes the
-				// sentinel branch, which is what a schema event wants anyway.
-				size, _ := fileKeyObject["file_size"].(int64)
-				if size > 1 {
-					// log.Println("Register File Key: data source with multiple parts: skipping file key:", fileKeyObject["file_key"],"size",fileKeyObject["size"])
+				// The gate reads the S3 object's size and never the spec's file_size:
+				// a schema event has no size, so it is 0 and takes the
+				// sentinel branch, which is what a schema event wants, whatever
+				// file_size it carries.
+				if r.objectSize > 1 {
+					skip(irow, fileKey, skipPartFile)
 					continue NextKey
 				} else {
 					// Check if we restrict sentinel files by name
 					if len(sentinelFileName) > 0 && !registerFileKeyAction.IsSchemaEvent &&
 						!strings.HasSuffix(fileKey, sentinelFileName) {
 						// case of accepting only sentinel file with specific name, this one does not have it
-						// log.Println("Register File Key: data source with multiple parts: skipping 0-size file key:", fileKeyObject["file_key"],"size",fileKeyObject["size"],"Do not match the sentinel file name:",sentinelFileName)
+						skip(irow, fileKey, skipSentinelName)
 						continue NextKey
 					}
 					// Current key is for sentinel file, remove sentinel file name from file_key
@@ -355,22 +519,57 @@ NextKey:
 				return nil, http.StatusInternalServerError, fmt.Errorf("while inserting file keys in file_key_staging table: %v", err)
 			}
 		} else {
-			// log.Println("***while RegisterFileKeys: skipping file key:", fileKeyObject["file_key"])
+			skip(irow, fileKey, skipMissingColumn)
 			continue NextKey
 		}
-		// Reserve a session_id
-		sessionId, err = reserveSessionId(ctx.Dbpool, &baseSessionId)
+		// A file with nothing to register is staged and goes no further: a
+		// session reserved and registered for it would hold no input.
+		inputKeys := make([]string, 0, len(domainKeys))
+		for _, domainKey := range domainKeys {
+			// skip this special domain key
+			if domainKey != "jets:hashing_override" {
+				inputKeys = append(inputKeys, domainKey)
+			}
+		}
+		switch {
+		case !hasSourceConfig:
+			skip(irow, fileKey, skipNoSourceConfig)
+			continue NextKey
+		case len(inputKeys) == 0:
+			skip(irow, fileKey, skipNoDomainKeys)
+			continue NextKey
+		}
+		// Reserve a session_id, or take the one an unfinished registration of the
+		// same event reserved.
+		if resuming {
+			sessionId = registerFileKeyAction.ResumeSessionId
+			log.Printf("RegisterFileKeys: resuming the registration of %s under session %s", fileKey, sessionId)
+		} else {
+			sessionId, err = reserveSessionId(ctx.Dbpool, &baseSessionId)
+			if err != nil {
+				return nil, http.StatusInternalServerError, err
+			}
+			if registerFileKeyAction.OnSessionReserved != nil {
+				registerFileKeyAction.OnSessionReserved(sessionId)
+			}
+		}
+		// Register the session before writing input_registry and starting
+		// pipelines. Starting a pipeline can wait up to about 17 minutes
+		// on the state machine lock (lockStateMachine), far past the register-key
+		// lambda's timeout, and the registration used to come after that wait, so
+		// a timeout left input_registry rows under a session nothing registered.
+		// Nothing on the start path reads the input session's session_registry
+		// row -- a started pipeline reserves and checks its own session -- so the
+		// order changes no start. The error is still only logged, as it was.
+		err = schema.RegisterSession(ctx.Dbpool, "file", client.(string), sessionId, source_period_key)
 		if err != nil {
-			return nil, http.StatusInternalServerError, err
+			log.Println("WARNING while registering session_id, ignoring err:", err)
+			err = nil
 		}
 		// Insert into input registry
 		// Note: Get the jetsapi.source_config.domain_keys (aka indexes for joining tables) to use as the object_type
 		// of the input_registry table
-		for _, domainKey := range domainKeys {
-			if domainKey == "jets:hashing_override" {
-				// skip this special domain key
-				continue
-			}
+		for _, domainKey := range inputKeys {
 			log.Println(sessionId, "Write to input_registry for cpipes input files object type (aka domain_key):", domainKey, "client:", client, "org:", org)
 			log.Println("Write to input_registry for cpipes with schemaProviderJson:", schemaProviderJson)
 			stmt = `INSERT INTO jetsapi.input_registry 
@@ -381,23 +580,74 @@ NextKey:
 							RETURNING key`
 			err = ctx.Dbpool.QueryRow(context.Background(), stmt,
 				client, org, domainKey, fileKey, source_period_key, tableName, sessionId, schemaProviderJson, requestId).Scan(&inputRegistryKey)
+			if resuming && errors.Is(err, pgx.ErrNoRows) {
+				// Written by the unfinished registration: reuse its row.
+				err = ctx.Dbpool.QueryRow(context.Background(),
+					`SELECT key FROM jetsapi.input_registry
+					 WHERE client = $1 AND org = $2 AND object_type = $3 AND table_name = $4 AND session_id = $5`,
+					client, org, domainKey, tableName, sessionId).Scan(&inputRegistryKey)
+			}
 			if err != nil {
 				return nil, http.StatusInternalServerError, fmt.Errorf("error inserting in jetsapi.input_registry table: %v", err)
 			}
 			if !registerFileKeyAction.NoAutomatedLoad {
 				// Check for any process that are ready to kick off
-				ctx.StartPipelinesForInputRegistryV2(inputRegistryKey, source_period_key, sessionId, client.(string), domainKey, fileKey, token)
+				startPipelinesForInputRegistry(ctx, inputRegistryKey, source_period_key, sessionId, client.(string), domainKey, fileKey, token, resuming)
 			}
 		}
-		// for completness register the session_id
-		err = schema.RegisterSession(ctx.Dbpool, "file", client.(string), sessionId, source_period_key)
-		if err != nil {
-			log.Println("WARNING while registering session_id, ignoring err:", err)
-			err = nil
-		}
+		registered++
 	}
-	return &map[string]any{}, http.StatusOK, nil
+	// Still a 200 when nothing registered: a sync or a request of many keys
+	// skips some by design. RegisterSchemaEvent, whose one row must register,
+	// reads "registered".
+	return &map[string]any{
+		"registered":    registered,
+		"skipped":       skipped,
+		"skipped_count": skippedCount,
+	}, http.StatusOK, nil
 }
+
+// uniqueDomainKeys returns keys without its repeats, keeping the first of each.
+// A source_config naming a domain key twice failed late: the second
+// input_registry insert met the table's unique constraint, ON CONFLICT DO NOTHING
+// returned no row, and the request was a 500 after the first was registered and
+// its pipelines started.
+func uniqueDomainKeys(keys []string, client, org, objectType any) []string {
+	seen := make(map[string]bool, len(keys))
+	unique := make([]string, 0, len(keys))
+	for _, k := range keys {
+		if seen[k] {
+			log.Printf("WARNING source_config for client %v, org %v, object_type %v names domain key %q more than once; registering it once",
+				client, org, objectType, k)
+			continue
+		}
+		seen[k] = true
+		unique = append(unique, k)
+	}
+	return unique
+}
+
+// startPipelinesForInputRegistry is the call RegisterFileKeys makes to start the
+// pipelines a registered file is ready for. skipStarted, when a registration is
+// resumed, leaves out the pipelines that already have a run for the input.
+func startPipelinesForInputRegistry(ctx *DataTableContext, inputRegistryKey, sourcePeriodKey int,
+	inputSessionId, client, objectType, fileKey, token string, skipStarted bool) error {
+	if startPipelinesOverride != nil {
+		return startPipelinesOverride(ctx, inputRegistryKey, sourcePeriodKey, inputSessionId,
+			client, objectType, fileKey, token, skipStarted)
+	}
+	return ctx.startPipelinesForInputRegistryV2(inputRegistryKey, sourcePeriodKey, inputSessionId,
+		client, objectType, fileKey, token, skipStarted)
+}
+
+// startPipelinesOverride, when set, replaces the pipeline start, so a test can
+// observe what is already written when the start begins. It is nil in
+// production and production code must not set it. A hook rather than a variable
+// holding the call, because the call reaches RegisterFileKeys again (through
+// startLoader and RegisterSchemaEvent), which Go refuses as an initialization
+// cycle.
+var startPipelinesOverride func(ctx *DataTableContext, inputRegistryKey, sourcePeriodKey int,
+	inputSessionId, client, objectType, fileKey, token string, skipStarted bool) error
 
 func ReserveSessionId(dbpool *pgxpool.Pool) (string, error) {
 	baseSessionId := time.Now().UnixMilli()

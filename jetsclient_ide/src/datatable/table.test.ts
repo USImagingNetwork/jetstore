@@ -16,7 +16,7 @@
  *    cases both languages run.
  */
 
-import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
@@ -48,13 +48,14 @@ const artifactPath = fileURLToPath(new URL("./table.schema.json", import.meta.ur
 const tablesDir = fileURLToPath(new URL("./tables/", import.meta.url));
 
 /**
- * The other half of the corpus, since the eleven flows moved to workspace assets.
+ * The other half of the corpus, since the eleven flows moved to workspace assets
+ * (X.5, 2026-08-26).
  *
  * A table document a JetStore flow draws is installed into a workspace by
  * `install_workspace_assets` and read from there by `FlowStore.loadTables`; a
  * table a *screen* draws is imported into this bundle and never leaves it. So the
- * 61 documents this emitter owns are committed in two directories, and which one
- * a key belongs to is a property of who reads it rather than of this test.
+ * documents this test checks are committed in two directories, and which one a
+ * key belongs to is a property of who reads it rather than of this test.
  */
 const assetTablesDir = fileURLToPath(
   new URL("../../../jets/workspace_assets/table_configs/", import.meta.url),
@@ -73,9 +74,9 @@ const committedIn = (dir: string): Set<string> =>
  * **Read off disk rather than derived from the key**, because the rule is about
  * the consumer and this file cannot see one: `pipelineExecStatusTable` is drawn by
  * `homeFiltersUF` *and* by the Home screen, so it is committed in both places and
- * a rule that returned one directory would delete the other copy on the next
- * regeneration. A key in neither directory is new, and goes where the screens'
- * documents go — the emitter cannot know it is a flow's until a flow names it.
+ * a rule that returned one directory would have deleted the other copy on the
+ * next regeneration, while this test still wrote the documents. A key in neither
+ * directory is new, and was written where the screens' documents go.
  *
  * **Corrected 2026-10-01 (`jetstore_maintenance_02` `AD.2`): no key is committed
  * in both places any more.** Home stopped keeping its copy at 3dc322d5
@@ -206,9 +207,7 @@ const NON_FLOW_KEYS = [
   "wsDomainClassTable",
   "wsDataPropertyTable",
   "wsDomainTableTable",
-  "wsJetRulesTable",
   "wsRuleTermsTable",
-  "wsMainSupportFilesTable",
   "wsDataModelFilesTable",
   "wsJetRulesFilesTable",
 ] as const;
@@ -267,7 +266,7 @@ const AUTHORED_KEYS = ["wsLookupTableTable", "wsLookupColumnTable"] as const;
  * Documents that **were** translations and are edited by hand from now on.
  * `jetstore_maintenance_02` Phase 1, task `AD.2`, 2026-10-01.
  *
- * Michel's answer to that project's `Q-5` — *we need to move away from the big
+ * The decision — *we need to move away from the big
  * legacy file* — is that a document this repository edits leaves the emitted set
  * the first time it is touched, rather than being changed by editing a fixture
  * headed *do not edit by hand*. `ui_refresh`'s **I-299** asked which way; this is
@@ -308,18 +307,47 @@ const HAND_MAINTAINED_KEYS = [
   "client",
   "scSourceConfigKey",
   "pcPipelineConfigTable",
-  // Its label repeated the screen title above it (Michel, 2026-10-01).
+  // Its label repeated the screen title above it (2026-10-01).
   "workspaceRegistryTable",
-  // A plain Show/Hide Select Row, and org's + Add (Michel, 2026-10-02).
+  // A plain Show/Hide Select Row, and org's + Add (2026-10-02).
   "org",
   "pcViewInjectedProcessInputKeys",
   "pcViewMergedProcessInputKeys",
   // A Refresh, so a save in the Workspace IDE shows without reloading the page
-  // (Michel, 2026-10-11).
+  // (2026-10-11).
   "workspaceChangesTable",
   // 25 rows per page rather than 50, as the flow's first table has, so the
-  // Start Pipeline steps page alike (Michel, 2026-10-15).
+  // Start Pipeline steps page alike (2026-10-15).
   "main_input_registry_key",
+  // Delete User declares user_admin rather than the Dart's user_profile, the
+  // capability delete/users now requires server-side (2026-11-07). Its fixture
+  // entry stays as the Flutter record.
+  "userTable",
+  // 2026-11-11, from defects found while writing the User Guide. Their fixture
+  // entries stay as the Flutter record, as `userTable`'s does.
+  // Its label repeated the screen title above it, and its two `Domain Key`
+  // columns now say which is the run's and which is the row's value.
+  "processErrorsTable",
+  // Year, Month and Day are the source period, not the date a file was received.
+  "inputLoaderStatusTable",
+  "inputRegistryTable",
+  // Details wraps, so the Update User Profile dialog shows Last Updated.
+  "userRolesTable",
+  // The confirmation pages' client list asks for the chosen clients only, the
+  // status filter offers every status the server writes, and the file list's
+  // Year, Month and Day name the source period (2026-11-11, the flows' fixes).
+  "hfStatusTableUF",
+  "wpClientListRO",
+  "lfFileKeyStagingTable",
+  // Load Data carries the source config's key, so Load Files' first page opens
+  // with the source ticked (2026-11-11).
+  "fmInputSourceMappingUF",
+  // A File column, the file each rule is written in (`jet_rules.authored_file_key`,
+  // 2026-11-13); its main-file column is labelled for what it holds.
+  "wsJetRulesTable",
+  // Its label was the Rule Terms tab's, carried over from the Dart; it is the
+  // Files Relationship tab's own, as the view's other tables are (2026-11-14).
+  "wsMainSupportFilesTable",
 ] as const;
 
 /**
@@ -334,7 +362,19 @@ const HAND_MAINTAINED_KEYS = [
  * that can actually drift: the hub and the check table read `jetsapi` tables
  * track `AC` defined in `jets/jets_schema.json`.
  */
-const FEATURE_KEYS = ["rutExecutionTable", "rutTestCaseTable", "rutCheckTable"] as const;
+const FEATURE_KEYS = [
+  "rutExecutionTable",
+  "rutTestCaseTable",
+  "rutCheckTable",
+  // **Five since 2026-11-08**: Home's *Session Registry* and *Archived
+  // Pipelines* tabs (`session_registry` Phase 2, JM-081), over
+  // `jetsapi.session_registry_view` and `pipeline_execution_status_archive`.
+  "sessionRegistryTable",
+  "pipelineArchiveTable",
+  // **Six since 2026-11-12**: the Session Registry filters' process list (JM-185),
+  // a table of the tab's Set Filters dialog over `jetsapi.process_config`.
+  "srProcessTable",
+] as const;
 
 const flowDocuments = toDocuments(tables);
 const translated: Record<string, TableConfigDocument> = {
@@ -388,35 +428,32 @@ describe("the emitted JSON Schema", () => {
   // 2026-10-11**, the three rules unit test tables (`FEATURE_KEYS`).
   // **61 since 2026-10-15 (Release 4.0.4)**: `startPipelineUF` stopped choosing
   // merged and historical sources, and its three tables were retired.
-  it("has the 61 configurations committed beside it, for the Go check", () => {
+  // **63 since 2026-11-08**: Home's two new tabs (`FEATURE_KEYS`). **64 since
+  // 2026-11-12**: the Session Registry filters' process list (`FEATURE_KEYS`).
+  //
+  // **Nothing writes these documents from the corpus any more** (2026-11-14).
+  // This case emitted the translated ones under `UPDATE_SCHEMA=1`, and deleted
+  // any document it did not know, from fixtures the deleted Flutter app generated
+  // and nothing can regenerate. So a run could only rewrite what is committed,
+  // overwrite an edit, or delete a new document not yet listed here — and it ran
+  // with every `npm run emit-schema`, which the JSON Schemas above still need.
+  // The committed document is the source; the comparison below says which ones
+  // are still the Dart's, and a table edited by hand goes on
+  // `HAND_MAINTAINED_KEYS`.
+  it("has the 64 configurations committed beside it, for the Go check", () => {
     // `jets/userflow/table_schema_test.go` reads this directory and the emitted
     // schema and asserts the same documents pass the Go validator that enforces
     // them at save time — two languages against one artifact rather than two
     // readings of it.
-    if (process.env.UPDATE_SCHEMA === "1") {
-      for (const dir of [tablesDir, assetTablesDir]) {
-        mkdirSync(dir, { recursive: true });
-        // **Removing what this emitter no longer owns rather than wiping the
-        // directory, as of C.9.** The wipe was right while every document was
-        // emitted here; two are now hand-authored and committed beside the rest, and
-        // a wipe would delete them on the next regeneration — silently, since the
-        // very next line would rewrite everything else and the suite would go green
-        // with two files gone.
-        for (const file of readdirSync(dir).filter((f) => f.endsWith(".tc.json"))) {
-          if (!(file.slice(0, -".tc.json".length) in documents)) rmSync(`${dir}${file}`);
-        }
-      }
-      // Written to every directory the key is committed in, which is two for the
-      // one table a flow and a screen both draw.
-      for (const key of Object.keys(translated)) {
-        for (const dir of dirsFor(key)) writeFileSync(`${dir}${key}.tc.json`, documentOf(key));
-      }
-    }
     const onDisk = [...committedIn(tablesDir), ...committedIn(assetTablesDir)];
     expect([...new Set(onDisk)].sort()).toEqual(Object.keys(documents).sort());
     for (const key of Object.keys(translated)) {
       for (const dir of dirsFor(key)) {
-        expect(readFileSync(`${dir}${key}.tc.json`, "utf8")).toBe(documentOf(key));
+        expect(
+          readFileSync(`${dir}${key}.tc.json`, "utf8"),
+          `${key}.tc.json differs from its translation from the Flutter corpus: a table edited by ` +
+            "hand is listed in HAND_MAINTAINED_KEYS",
+        ).toBe(documentOf(key));
       }
     }
   });
@@ -450,7 +487,7 @@ describe("the emitted JSON Schema", () => {
 });
 
 describe("the 28 configurations still translated from the flow fixture", () => {
-  it("all translate, and with the authored ones make 61", () => {
+  it("all translate, and with the authored ones make 64", () => {
     // 37 + F.5's one + C.2's one + C.4's one + C.7's two + C.6's three + C.9's
     // five + C.13's two + C.10's one + C.3's six + C.3a's two + C.3b's two + the
     // workspace home's one, of which four are authored rather than translated. The
@@ -474,7 +511,9 @@ describe("the 28 configurations still translated from the flow fixture", () => {
     // `mergeProcessInputTable`, `merged_input_registry_keys` and
     // `spInjectedProcessInput` were retired with their fixture entries.
     expect(Object.keys(flowDocuments).length).toBe(28);
-    expect(Object.keys(translated).length).toBe(48);
+    // **47 on 2026-11-13**, when `wsJetRulesTable` left to gain a File column.
+    // **46 on 2026-11-14**, when `wsMainSupportFilesTable` left to be relabelled.
+    expect(Object.keys(translated).length).toBe(46);
     expect(Object.keys(handAuthored).length).toBe(2);
     // **8 since 2026-10-02**: `org` and the two `pcView*` tables, which keep
     // their fixture entry as the Flutter record other tests use as material —
@@ -482,11 +521,23 @@ describe("the 28 configurations still translated from the flow fixture", () => {
     // stays 61 (Phase 2, a plain Show/Hide Select Row and org's + Add).
     // **9 on 2026-10-11**, with `workspaceChangesTable`; the total is unchanged.
     // **10 on 2026-10-15**, with `main_input_registry_key` (25 rows per page).
-    expect(Object.keys(handMaintained).length).toBe(10);
+    // **11 on 2026-11-07**, with `userTable` (Delete User on `user_admin`).
+    // **15 on 2026-11-11**, with four tables corrected for defects found while
+    // writing the User Guide; the total is unchanged.
+    // **18 the same day**, with `hfStatusTableUF`, `wpClientListRO` and
+    // `lfFileKeyStagingTable` from the flows' fixes, and **19** with
+    // `fmInputSourceMappingUF`; the total is unchanged.
+    // **20 on 2026-11-13**, with `wsJetRulesTable`; the total is unchanged.
+    // **21 on 2026-11-14**, with `wsMainSupportFilesTable`; the total is unchanged.
+    expect(Object.keys(handMaintained).length).toBe(21);
     // **64 since 2026-10-11**: the three rules unit test tables
     // (`rules_unit_test_harness` `AD.4`), written rather than translated.
-    expect(Object.keys(featureDocuments).length).toBe(3);
-    expect(Object.keys(documents).length).toBe(61);
+    // **5 and 63 since 2026-11-08**: *Session Registry* and *Archived
+    // Pipelines*, Home's third and fourth tabs (`session_registry` Phase 2).
+    // **6 and 64 since 2026-11-12**: the Session Registry filters' process list
+    // (JM-185).
+    expect(Object.keys(featureDocuments).length).toBe(6);
+    expect(Object.keys(documents).length).toBe(64);
   });
 
   it("all validate against the schema", () => {
@@ -650,12 +701,14 @@ describe("pipelineExecStatusTable, the table track C and track F share", () => {
     expect(doc.where).toEqual([{ column: "source_period_key", joinWith: "source_period.key" }]);
   });
 
-  it("keeps the seven action-bar buttons in order and the five row buttons apart", () => {
+  it("keeps the eight action-bar buttons in order and the five row buttons apart", () => {
     if (doc.source !== "query") return;
     // **Seven since 2026-10-01**: `putSchemaEvent` is appended after
     // `clearHomeFilters`, which is "right of Clear Filters" in the report's words
     // (`jetstore_maintenance_02` `D01`, task `AD.3`). The document is
     // hand-maintained since `AD.2`, so this is an edit rather than a translation.
+    // **Eight since 2026-11-05**: *Check Pending* follows *Put Schema Event*
+    // (jetstore_maintenance JM-062).
     expect((doc.actions ?? []).map((a) => [a.key, a.action])).toEqual([
       ["startPipeline", "showScreen"],
       ["refreshTable", "refreshTable"],
@@ -664,6 +717,7 @@ describe("pipelineExecStatusTable, the table track C and track F share", () => {
       ["setRequestIdFilters", "setRequestIdFilter"],
       ["clearHomeFilters", "clearHomeFilters"],
       ["putSchemaEvent", "showDialog"],
+      ["checkPendingTasks", "doAction"],
     ]);
     expect((doc.secondRowActions ?? []).map((a) => a.key)).toEqual([
       "viewStatusDetails",
@@ -697,7 +751,10 @@ describe("pipelineExecStatusTable, the table track C and track F share", () => {
     // **Three since 2026-10-01**: the third row's *Get Run Manifest* and *Get
     // Schema Event* (`jetstore_maintenance_02` `D04`, `AE.4`, `AE.5`) run actions
     // too, and `actionNamesOf` reads them through `actionRowsOf` (`AE.1`).
-    expect(actionNamesOf(doc)).toEqual(["getRunManifest", "getSchemaEvent", "resubmitPipeline"]);
+    //
+    // **Four since 2026-11-05**, and the fourth is the first on the *first* row:
+    // *Check Pending* runs `checkPendingTasks` (jetstore_maintenance JM-062).
+    expect(actionNamesOf(doc)).toEqual(["checkPendingTasks", "getRunManifest", "getSchemaEvent", "resubmitPipeline"]);
     if (doc.source !== "query") return;
     expect((doc.secondRowActions ?? []).find((a) => a.action === "showDialog")?.configForm).toBe(
       "showFailureDetailsDialog",
@@ -753,7 +810,7 @@ describe("workspaceRegistryTable, the /workspaces screen's table", () => {
    * The registry's actions wherever they are drawn. **From 2026-10-11 to
    * 2026-10-15 the ten that act on a workspace were the Workspace IDE's toolbar**
    * (`screens/documents/workspaceIdeToolbar.json`), in this table's action format.
-   * **They came back to this table on 2026-10-15**, at Michel's request: a compile
+   * **They came back to this table on 2026-10-15**, on request: a compile
    * started from the IDE showed no progress, because the compile's status is on
    * this table. The toolbar keeps only Refresh. The claims below are still
    * asserted over both documents, so a button that moves again is still counted,
@@ -818,7 +875,7 @@ describe("workspaceRegistryTable, the /workspaces screen's table", () => {
     // `AD.2`) takes `Open`'s gate. The Flutter corpus still has eight, which is
     // why `actionBar.test.tsx`, reading that corpus, still counts eight.
     // **Six since the same evening**: *Commit & Push*, *Push Only* and *Pull*
-    // lost their gates on the IDE's toolbar (Michel: always enabled), and kept
+    // lost their gates on the IDE's toolbar (always enabled), and kept
     // them off when they came back to this table on 2026-10-15. The table's two
     // rows in order, as on the Flutter screen; the toolbar adds none.
     expect(gated.map((a) => a.key)).toEqual([
@@ -906,7 +963,7 @@ describe("workspaceRegistryTable, the /workspaces screen's table", () => {
 
   it("draws the workspace actions in its two rows again, and leaves the IDE only Refresh", () => {
     if (doc.source !== "query") return;
-    // The pre-2026-10-11 layout, restored on 2026-10-15 (Michel). Each table
+    // The pre-2026-10-11 layout, restored on 2026-10-15. Each table
     // button is gated on a selected row; the toolbar's Refresh needs none.
     expect((doc.actions ?? []).map((a) => a.key)).toEqual([
       "addWorkspace",
@@ -1033,9 +1090,23 @@ describe("the two execution-detail tables, which are one screen behind two route
         doc.columns.filter((c) => c.calculatedAs).map((c) => [key, c.name, c.calculatedAs]),
       )
       .sort((a, b) => String(a[0]).localeCompare(String(b[0])));
+    // **Three since 2026-11-08**, and the third is a copy rather than a new
+    // site: *Archived Pipelines* shows *Pipelines Status*'s columns over the
+    // archive, which has the same two columns (`session_registry` Phase 2).
+    // **Four since 2026-11-13**, and the fourth is the first new expression and
+    // the first over `workspace.db`: the Jet Rules tab's *File*, the name of the
+    // file each rule is written in, as a scalar subquery so that a rule with no
+    // `authored_file_key` keeps its row (the case below).
     expect(sites).toEqual([
+      ["pipelineArchiveTable", "run_duration", "AGE(last_update, start_time)"],
       ["pipelineExecDetailsTable", "run_duration", "AGE(last_update, start_time)"],
       ["pipelineExecStatusTable", "run_duration", "AGE(last_update, start_time)"],
+      [
+        "wsJetRulesTable",
+        "authored_file_name",
+        "(SELECT authored_file.source_file_name FROM workspace_control AS authored_file " +
+          "WHERE authored_file.key = jet_rules.authored_file_key)",
+      ],
     ]);
   });
 
@@ -1463,6 +1534,27 @@ describe("the rules unit test tables", () => {
     }
   });
 
+  it("shows each rule's own file on the Jet Rules tab, from the column the compile writes", () => {
+    // `jet_rules.authored_file_key` (2026-11-13): the file a rule is written in,
+    // beside `source_file_key`, the main rule file. Nullable, so the name is a
+    // scalar subquery rather than a third FROM entry, whose join would drop a
+    // rule the compiler had no file name for.
+    const sql = readFileSync(fileURLToPath(new URL("../../../jets/workspace_schema.sql", import.meta.url)), "utf8");
+    const body = /CREATE TABLE IF NOT EXISTS jet_rules \(([\s\S]*?)\n\);/.exec(sql)?.[1] ?? "";
+    expect(body).toMatch(/^\s*authored_file_key\s+INTEGER\b/m);
+    const doc = documents["wsJetRulesTable"]!;
+    if (doc.source !== "query") throw new Error("wsJetRulesTable is not a query table");
+    const names = doc.columns.map((c) => c.name);
+    expect(names.indexOf("authored_file_name")).toBe(names.indexOf("source_file_name") + 1);
+    const file = doc.columns.find((c) => c.name === "authored_file_name")!;
+    expect(file.label).toBe("File");
+    expect(file.table).toBeUndefined();
+    expect(file.calculatedAs).toBe(
+      "(SELECT authored_file.source_file_name FROM workspace_control AS authored_file " +
+        "WHERE authored_file.key = jet_rules.authored_file_key)",
+    );
+  });
+
   it("reads the test cases from the unit_tests table the compile writes", () => {
     // `AD.1` records each `.tst.json` in `workspace.db` at compile, and
     // `jets/workspace_schema.sql` is the only thing that knows its columns.
@@ -1540,7 +1632,10 @@ describe("the rules unit test tables", () => {
     // engineer holds. The flow is protected exactly as well as its reads are
     // (definition F49), so all three take the second path — the two `jetsapi`
     // tables included, which that handler reads from PostgreSQL.
-    for (const key of FEATURE_KEYS) {
+    // The three of `FEATURE_KEYS` that are this harness's: the Home tabs added to
+    // the list on 2026-11-08 read through `read`, gated on `jetstore_read`, as
+    // the two tabs beside them do.
+    for (const key of ["rutExecutionTable", "rutTestCaseTable", "rutCheckTable"]) {
       const doc = documents[key]!;
       expect(doc.source === "query" && doc.apiAction, key).toBe("workspace_read");
     }

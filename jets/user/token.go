@@ -26,7 +26,14 @@ func CreateToken(email string) (string, error) {
 
 // Check if token is valid, if valid returns the associated email
 func TokenValid(r *http.Request) (string, error) {
-	tokenString := ExtractToken(r)
+	return TokenStringValid(ExtractToken(r))
+}
+
+// TokenStringValid checks a token string: HMAC signing method, signature with
+// ApiSecret, expiry, and an email claim. Returns the email when valid.
+// TokenValid applies it to a request's token; the documentation cookie
+// applies it to the cookie's value.
+func TokenStringValid(tokenString string) (string, error) {
 	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (any, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
@@ -41,9 +48,15 @@ func TokenValid(r *http.Request) (string, error) {
 	if !token.Valid {
 		return "", errors.New("invalid token")
 	}
-	claims := token.Claims.(jwt.MapClaims)
-
-	return claims["email"].(string), nil
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		return "", errors.New("invalid token")
+	}
+	email, ok := claims["email"].(string)
+	if !ok {
+		return "", errors.New("invalid token: no email claim")
+	}
+	return email, nil
 }
 
 func TokenClaims(token *jwt.Token) (jwt.MapClaims, error) {
@@ -71,6 +84,9 @@ func ExtractToken(r *http.Request) string {
 	return ""
 }
 
+// ExtractTokenID returns the email claim of a token string, checked as
+// TokenStringValid checks it. A token without a string email claim is an
+// error rather than a panic.
 func ExtractTokenID(token string) (string, error) {
 	jwtToken, err := jwt.Parse(token, func(token *jwt.Token) (any, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
@@ -83,13 +99,16 @@ func ExtractTokenID(token string) (string, error) {
 	}
 	claims, ok := jwtToken.Claims.(jwt.MapClaims)
 	if ok && jwtToken.Valid {
-		email := claims["email"].(string)
+		email, ok := claims["email"].(string)
+		if !ok {
+			return "", errors.New("invalid token: no email claim")
+		}
 		return email, nil
 	}
 	return "", nil
 }
 
-//Pretty display the claims nicely in the terminal
+// Pretty display the claims nicely in the terminal
 func Pretty(data any) {
 	b, err := json.MarshalIndent(data, "", " ")
 	if err != nil {

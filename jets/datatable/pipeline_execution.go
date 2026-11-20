@@ -19,6 +19,7 @@ import (
 	"github.com/artisoft-io/jetstore/jets/compute_pipes"
 	"github.com/artisoft-io/jetstore/jets/jetrules/rdf"
 	"github.com/artisoft-io/jetstore/jets/utils"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -146,6 +147,19 @@ func (ctx *DataTableContext) InsertPipelineExecutionStatus(dataTableAction *Data
 		dataTableAction.Data[irow]["status"] = status
 	}
 
+	// The fields a submitted run's start reads from the request, checked here,
+	// before anything is read or written. Unchecked, a missing file_key let the
+	// row be inserted and then panicked the handler at the start, leaving a
+	// submitted run that nothing would start.
+	var startFields map[string]string
+	if dataTableAction.FromClauses[0].Table == "pipeline_execution_status" && status == "submitted" {
+		startFields, err = requiredStrings(dataTableAction.Data[irow], "file_key", "client", "user_email")
+		if err != nil {
+			httpStatus = http.StatusBadRequest
+			return
+		}
+	}
+
 	switch {
 	case strings.HasSuffix(dataTableAction.FromClauses[0].Table, "pipeline_execution_status"):
 		inputRegistryKey := dataTableAction.Data[irow]["main_input_registry_key"]
@@ -196,13 +210,14 @@ func (ctx *DataTableContext) InsertPipelineExecutionStatus(dataTableAction *Data
 		if !ctx.DevMode && !dataTableAction.SkipThrottling && status == "submitted" {
 
 			// Put a lock on the stateMachineName
-			err = ctx.lockStateMachine(sessionId)
+			var lockToken string
+			lockToken, err = ctx.lockStateMachine(sessionId)
 			if err != nil {
 				httpStatus = http.StatusInternalServerError
 				err = fmt.Errorf("while getting a lock on stateMachineName '%s': %v", stateMachineName, err)
 				return
 			}
-			defer ctx.unlockStateMachine()
+			defer ctx.unlockStateMachine(lockToken)
 			ok, err = ctx.checkThrottling(fileKey)
 			if err != nil {
 				httpStatus = http.StatusInternalServerError
@@ -222,11 +237,18 @@ func (ctx *DataTableContext) InsertPipelineExecutionStatus(dataTableAction *Data
 
 	// fmt.Printf("Insert Row with stmt %s\n", sqlStmt.Stmt)
 	// fmt.Printf("Insert Row on table %s: %v\n", dataTableAction.FromClauses[0].Table, row)
-	// Executing the InserRow Stmt
-	if strings.Contains(sqlStmt.Stmt, "RETURNING key") {
-		err = ctx.Dbpool.QueryRow(context.Background(), sqlStmt.Stmt, row...).Scan(&peKey)
-	} else {
-		_, err = ctx.Dbpool.Exec(context.Background(), sqlStmt.Stmt, row...)
+	// The insert runs in a transaction that, for a run reading an input session,
+	// first takes that session's lock and refuses the run with 409 when the
+	// session is queued for deletion or deleted (GuardInputSession, session_delete.go).
+	// The throttling above and the start below stay outside it.
+	var inputSessionId string
+	if strings.HasSuffix(dataTableAction.FromClauses[0].Table, "pipeline_execution_status") {
+		inputSessionId = sessionIdOf(dataTableAction.Data[irow]["input_session_id"])
+	}
+	peKey, httpStatus, err = ctx.insertStatusRow(sqlStmt.Stmt, row, inputSessionId)
+	if err != nil && httpStatus == http.StatusConflict {
+		log.Printf("While inserting in table %s: %v", dataTableAction.FromClauses[0].Table, err)
+		return
 	}
 	if err != nil {
 		log.Printf("While inserting in table %s: %v", dataTableAction.FromClauses[0].Table, err)
@@ -272,13 +294,13 @@ func (ctx *DataTableContext) InsertPipelineExecutionStatus(dataTableAction *Data
 			task := &PendingTask{
 				Key:                  int64(peKey),
 				MainInputRegistryKey: sql.NullInt64{Int64: mainInputRegistryKey, Valid: true},
-				MainInputFileKey:     sql.NullString{String: dataTableAction.Data[irow]["file_key"].(string), Valid: true},
+				MainInputFileKey:     sql.NullString{String: startFields["file_key"], Valid: true},
 				StateMachineName:     stateMachineName,
-				Client:               dataTableAction.Data[irow]["client"].(string),
-				ProcessName:          dataTableAction.Data[irow]["process_name"].(string),
-				SessionId:            dataTableAction.Data[irow]["session_id"].(string),
+				Client:               startFields["client"],
+				ProcessName:          processName,
+				SessionId:            sessionId,
 				Status:               status,
-				UserEmail:            dataTableAction.Data[irow]["user_email"].(string),
+				UserEmail:            startFields["user_email"],
 				FileSize:             sql.NullInt64{},
 			}
 			err = ctx.startPipeline(devModeCode, task, results)
@@ -288,6 +310,59 @@ func (ctx *DataTableContext) InsertPipelineExecutionStatus(dataTableAction *Data
 			}
 		}
 	}
+	return
+}
+
+// requiredStrings returns the named fields of a request row, refusing the row
+// when one is missing or is not a string.
+func requiredStrings(row map[string]any, keys ...string) (map[string]string, error) {
+	out := make(map[string]string, len(keys))
+	for _, k := range keys {
+		v, ok := row[k].(string)
+		if !ok {
+			return nil, fmt.Errorf("error: missing %s, or not a string, in request to start a pipeline", k)
+		}
+		out[k] = v
+	}
+	return out, nil
+}
+
+// sessionIdOf is a row's session id as text: "" for none.
+func sessionIdOf(v any) string {
+	switch x := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return x
+	default:
+		return fmt.Sprint(x)
+	}
+}
+
+// insertStatusRow executes the insert of InsertPipelineExecutionStatus in a
+// transaction, after GuardInputSession on inputSessionId. It answers 409 with the
+// guard's error when the input session is queued for deletion or deleted, and
+// otherwise returns the insert's error as it comes, for the caller to classify.
+func (ctx *DataTableContext) insertStatusRow(stmt string, row []any, inputSessionId string) (peKey int, httpStatus int, err error) {
+	bg := context.Background()
+	httpStatus = http.StatusOK
+	tx, err := ctx.Dbpool.Begin(bg)
+	if err != nil {
+		return
+	}
+	defer tx.Rollback(context.Background())
+	if httpStatus, err = GuardInputSession(bg, tx, inputSessionId); err != nil {
+		return
+	}
+	if strings.Contains(stmt, "RETURNING key") {
+		err = tx.QueryRow(bg, stmt, row...).Scan(&peKey)
+	} else {
+		_, err = tx.Exec(bg, stmt, row...)
+	}
+	if err != nil {
+		return
+	}
+	err = tx.Commit(bg)
 	return
 }
 
@@ -326,13 +401,22 @@ func (ctx *DataTableContext) StartPendingTasks() (err error) {
 		log.Println("StartPendingTasks: No pending tasks found")
 		return
 	}
+	// Dev mode starts no state machine (startStateMachine), so it leaves the
+	// pending tasks as they are rather than failing them: a workstation may be
+	// reading a deployment's database, whose pending tasks are the deployment's
+	// to start.
+	if ctx.DevMode {
+		log.Printf("StartPendingTasks: dev mode starts no state machine; %d pending task(s) left pending", pendCount.Int64)
+		return
+	}
 
 	// Lock the state machine tasks
-	err = ctx.lockStateMachine("0")
+	var lockToken string
+	lockToken, err = ctx.lockStateMachine("0")
 	if err != nil {
 		return
 	}
-	defer ctx.unlockStateMachine()
+	defer ctx.unlockStateMachine(lockToken)
 
 	// Get the count of running pipelines and the size of their main input file
 	var submittedPipelinesCount, submittedTier1Count int64
@@ -400,32 +484,78 @@ func (ctx *DataTableContext) StartPendingTasks() (err error) {
 	return rows.Err()
 }
 
-func (ctx *DataTableContext) lockStateMachine(sessionId string) error {
-	stateMachineName := "all" // all or nothing - not per state machine anymore
-	stmt := "INSERT INTO jetsapi.pipeline_lock (state_machine_name, session_id) VALUES ($1, $2)"
-	retry := 0
-	var t time.Duration = 1 * time.Second
-do_retry:
-	// Try to insert the lock
-	_, err := ctx.Dbpool.Exec(context.Background(), stmt, stateMachineName, sessionId)
-	if err != nil {
-		if retry < 10 {
-			time.Sleep(t)
-			retry++
-			t *= 2
-			goto do_retry
-		}
-		return fmt.Errorf("failed to lock the pipeline %s: %v", stateMachineName, err)
+// staleLockAfter is the age past which the state machine lock is taken over.
+// Every holder keeps the lock for a few statements and a few state machine
+// starts, so a lock this old belongs to a process that died holding it: a
+// lambda that timed out, or a task that was stopped. Before it was taken over,
+// such a lock stayed until the session purge removed it, and every pipeline
+// start waited about 17 minutes for it and failed.
+const staleLockAfter = 5 * time.Minute
+
+// tryLockStateMachine takes the lock named name for sessionId under token when it
+// is free or older than staleAfter, in one statement. It reports whether the lock
+// was taken, and whether it was taken over from a holder that left it.
+func tryLockStateMachine(ctx context.Context, db *pgxpool.Pool, name, sessionId, token string,
+	staleAfter time.Duration) (acquired, tookOver bool, err error) {
+
+	stmt := `INSERT INTO jetsapi.pipeline_lock (state_machine_name, session_id, locked_at, lock_token)
+		VALUES ($1, $2, now(), $3)
+		ON CONFLICT (state_machine_name) DO UPDATE
+			SET session_id = EXCLUDED.session_id, locked_at = now(), lock_token = EXCLUDED.lock_token
+			WHERE pipeline_lock.locked_at < now() - make_interval(secs => $4)
+		RETURNING xmax <> 0`
+	err = db.QueryRow(ctx, stmt, name, sessionId, token, staleAfter.Seconds()).Scan(&tookOver)
+	switch {
+	case err == nil:
+		return true, tookOver, nil
+	case errors.Is(err, pgx.ErrNoRows):
+		return false, false, nil
+	default:
+		return false, false, err
 	}
-	return nil
 }
 
-func (ctx *DataTableContext) unlockStateMachine() {
+// lockStateMachine takes the state machine lock, retrying with a doubling wait
+// for about 17 minutes, and returns the token unlockStateMachine needs.
+func (ctx *DataTableContext) lockStateMachine(sessionId string) (string, error) {
 	stateMachineName := "all" // all or nothing - not per state machine anymore
-	stmt := "DELETE FROM jetsapi.pipeline_lock WHERE state_machine_name = $1"
-	_, err := ctx.Dbpool.Exec(context.Background(), stmt, stateMachineName)
-	if err != nil {
+	token := uuid.NewString()
+	var t time.Duration = 1 * time.Second
+	var err error
+	for retry := 0; ; retry++ {
+		var acquired, tookOver bool
+		acquired, tookOver, err = tryLockStateMachine(context.Background(), ctx.Dbpool,
+			stateMachineName, sessionId, token, staleLockAfter)
+		if acquired {
+			if tookOver {
+				log.Printf("WARNING session %s took over the pipeline lock '%s', held for more than %v by a process that did not release it",
+					sessionId, stateMachineName, staleLockAfter)
+			}
+			return token, nil
+		}
+		if retry >= 10 {
+			break
+		}
+		time.Sleep(t)
+		t *= 2
+	}
+	if err == nil {
+		err = errors.New("the lock is held")
+	}
+	return "", fmt.Errorf("failed to lock the pipeline %s: %v", stateMachineName, err)
+}
+
+// unlockStateMachine releases the lock if it still holds token: a lock taken over
+// since, from a holder slower than staleLockAfter, is the new holder's.
+func (ctx *DataTableContext) unlockStateMachine(token string) {
+	stateMachineName := "all" // all or nothing - not per state machine anymore
+	stmt := "DELETE FROM jetsapi.pipeline_lock WHERE state_machine_name = $1 AND lock_token = $2"
+	res, err := ctx.Dbpool.Exec(context.Background(), stmt, stateMachineName, token)
+	switch {
+	case err != nil:
 		log.Printf("failed to unlock pipeline '%s': %v", stateMachineName, err)
+	case res.RowsAffected() == 0:
+		log.Printf("WARNING pipeline lock '%s' was not released: it had been taken over after %v", stateMachineName, staleLockAfter)
 	}
 }
 
@@ -502,9 +632,25 @@ func (ctx *DataTableContext) startPipeline(devModeCode string, task *PendingTask
 	return ctx.startStateMachine(task)
 }
 
+// errDevModeNoStateMachine is startStateMachine's refusal in dev mode.
+var errDevModeNoStateMachine = errors.New("error: dev mode starts no state machine; run the pipeline from the Start Pipeline dialog, which runs it locally")
+
+// startExecution starts a state machine; a variable so that a test can see
+// whether it is called.
+var startExecution = awsi.StartExecution
+
+// startStateMachine starts the task's state machine. **Never in dev mode**: a
+// workstation has no state machine of its own, and one with AWS credentials
+// would start a deployment's. Dev mode runs a pipeline locally instead
+// (startPipeline, runPipelineLocally), and StartPendingTasks leaves pending
+// tasks pending; this refusal keeps any other caller from reaching AWS.
 func (ctx *DataTableContext) startStateMachine(task *PendingTask) error {
 	var err error
 	var name string
+
+	if ctx.DevMode {
+		return errDevModeNoStateMachine
+	}
 
 	// Guard against option-style argument injection before building command args.
 	if err = task.validateForCommand(); err != nil {
@@ -577,7 +723,7 @@ func (ctx *DataTableContext) startStateMachine(task *PendingTask) error {
 	// StartExecution execute rule
 	log.Printf("calling StartExecution on processArn: %s", processArn)
 	log.Printf("calling StartExecution with: %v", smInput)
-	name, err = awsi.StartExecution(processArn, smInput, task.SessionId)
+	name, err = startExecution(processArn, smInput, task.SessionId)
 	if err != nil {
 		log.Printf("while calling StartExecution on processUrn '%s': %v", processArn, err)
 		err = errors.New("error while calling StartExecution")
@@ -637,7 +783,7 @@ func (ctx *DataTableContext) runPipelineLocally(devModeCode string, task *Pendin
 			cpipesArgs = utils.SanitizeArgs(cpipesArgs)
 			log.Printf("Run local cpipes driver: %s", cpipesArgs)
 			lable = "CPIPES"
-			cmd = exec.Command("/usr/local/bin/local_test_driver", cpipesArgs...)
+			cmd = exec.Command(utils.JetsBinPath("local_test_driver"), cpipesArgs...)
 			cmd.Env = append(os.Environ(),
 				fmt.Sprintf("WORKSPACE=%s", workspaceName),
 				"JETSTORE_DEV_MODE=1", "USING_SSH_TUNNEL=1",
@@ -679,7 +825,7 @@ func (ctx *DataTableContext) runPipelineLocally(devModeCode string, task *Pendin
 		}
 		// Sanitize the arguments to prevent injection of options/flags
 		runReportsCommand = utils.SanitizeArgs(runReportsCommand)
-		cmd := exec.Command("/usr/local/bin/run_reports", runReportsCommand...)
+		cmd := exec.Command(utils.JetsBinPath("run_reports"), runReportsCommand...)
 		cmd.Env = append(os.Environ(),
 			fmt.Sprintf("WORKSPACE=%s", workspaceName),
 			"JETSTORE_DEV_MODE=1",
@@ -887,6 +1033,14 @@ func (ctx *DataTableContext) startLoader(dataTableAction *DataTableAction, irow 
 // This is also used by the register key v2 lambda once the event is downloaded from s3.
 func (ctx *DataTableContext) RegisterSchemaEvent(dbpool *pgxpool.Pool, schemaEvent *compute_pipes.SchemaProviderSpec, token string) error {
 
+	// A nil event is an error rather than a panic. The
+	// register-key lambda decodes a schema-event file holding a list into
+	// []*SchemaProviderSpec, where a JSON null element is a nil pointer, and a
+	// coordinator map's steps are the same type.
+	if schemaEvent == nil {
+		return errors.New("RegisterSchemaEvent: the schema event is null")
+	}
+
 	// Check if this is a pipeline_coordinator schema event
 	if schemaEvent.Type == "pipeline_coordinator_map" {
 		return ctx.ProcessCoordinatorMapRegisterSchemaEvent(dbpool, schemaEvent, token)
@@ -943,8 +1097,23 @@ func (ctx *DataTableContext) RegisterSchemaEvent(dbpool *pgxpool.Pool, schemaEve
 		IsSchemaEvent: true,
 		Data:          []map[string]any{schemaInfo},
 	}
-	_, _, err = ctx.RegisterFileKeys(&registerFileKeyAction, token)
-	return err
+	result, _, err := ctx.RegisterFileKeys(&registerFileKeyAction, token)
+	if err != nil {
+		return err
+	}
+	// The event's one row must register input. RegisterFileKeys skips
+	// such a row with a 200, by design for a request of many keys, so a schema
+	// event for an unknown source config, or with no file_key, was reported as
+	// handled when nothing would ever run.
+	if n, _ := (*result)["registered"].(int); n == 0 {
+		reason := "unknown reason"
+		if skipped, _ := (*result)["skipped"].([]fileKeySkip); len(skipped) > 0 {
+			reason = skipped[0].Reason
+		}
+		return fmt.Errorf("RegisterSchemaEvent: the schema event for client %v, vendor %v, object_type %v, file_key %v registered no input: %s",
+			schemaInfo["client"], schemaInfo["vendor"], schemaInfo["object_type"], schemaInfo["file_key"], reason)
+	}
+	return nil
 }
 
 // NewPipelineCoordinatorMapSchemaInfo creates the schema info for a pipeline coordinator map register schema event,
@@ -1000,6 +1169,16 @@ func (ctx *DataTableContext) ProcessCoordinatorMapRegisterSchemaEvent(dbpool *pg
 		// schemaInfo["request_id"] = requestId
 		return fmt.Errorf("request_id is missing in schemaInfo, it must be provided for pipeline coordinator map register schema event")
 	}
+	// Check every step before writing anything: a step that cannot
+	// register left the map in_progress for ever, with the steps before it
+	// running.
+	for i, step := range coordinatedPipesMap {
+		if err := ctx.checkCoordinatedStep(step); err != nil {
+			return fmt.Errorf("coordinator map %s: step %d: %v", requestId, i+1, err)
+		}
+	}
+	// The schema's default for status is 'in-progress'; this has always written
+	// 'in_progress', and only 'failed' is ever compared.
 	stmt := `INSERT INTO jetsapi.pipeline_coordinator_map (request_id, status, nbr_tasks, schema_provider_json) VALUES ($1, 'in_progress', $2, $3)`
 	_, err := dbpool.Exec(context.Background(), stmt, requestId, len(coordinatedPipesMap), postMapEventJson)
 	if err != nil {
@@ -1007,12 +1186,54 @@ func (ctx *DataTableContext) ProcessCoordinatorMapRegisterSchemaEvent(dbpool *pg
 	}
 
 	// For each step in coordinatedPipesMap, unmarshal the schema_event_json and call RegisterSchemaEvent
-	for _, step := range coordinatedPipesMap {
+	for i, step := range coordinatedPipesMap {
 		err = ctx.RegisterSchemaEvent(dbpool, step, token)
 		if err != nil {
-			return fmt.Errorf("while registering schema event in ProcessCoordinatorMapRegisterSchemaEvent: %v", err)
+			err = fmt.Errorf("coordinator map %s: step %d of %d failed to register: %v", requestId, i+1, len(coordinatedPipesMap), err)
+			log.Println(err)
+			// Fail the map and announce it once, as a failed task of the map
+			// does; the steps before this one are already running.
+			notice := &StatusUpdate{
+				Dbpool:                   dbpool,
+				SessionId:                fmt.Sprintf("register_step_%d", i+1),
+				Status:                   "failed",
+				FileKey:                  step.FileKey,
+				FailureDetails:           err.Error(),
+				CpipesEnv:                step.Env,
+				NotifyApiGatewayOverride: step.NotifyApiGatewayOverride,
+			}
+			if ferr := failPipelineCoordinatorMap(dbpool, requestId, notice.SessionId, "in_progress",
+				postMapEventJson, notice); ferr != nil {
+				log.Printf("while failing coordinator map %s: %v", requestId, ferr)
+			}
+			return err
 		}
 	}
 
+	return nil
+}
+
+// checkCoordinatedStep is what a coordinator map's step needs to register, checked
+// before the map is written: a step, a file_key, and a source_config for its
+// client, vendor and object_type, resolved as RegisterFileKeys resolves them.
+func (ctx *DataTableContext) checkCoordinatedStep(step *compute_pipes.SchemaProviderSpec) error {
+	if step == nil {
+		return errors.New("the step is null")
+	}
+	if len(step.FileKey) == 0 {
+		return errors.New("the step has no file_key")
+	}
+	components := map[string]any{"client": step.Client, "vendor": step.Vendor, "object_type": step.ObjectType}
+	ctx.updateFileKeyComponentCase(&components)
+	var n int
+	err := ctx.Dbpool.QueryRow(context.Background(),
+		`SELECT count(*) FROM jetsapi.source_config WHERE client=$1 AND org=$2 AND object_type=$3`,
+		components["client"], components["org"], components["object_type"]).Scan(&n)
+	if err != nil {
+		return fmt.Errorf("while reading source_config: %v", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("no source_config for client %q, vendor %q, object_type %q", step.Client, step.Vendor, step.ObjectType)
+	}
 	return nil
 }

@@ -12,11 +12,11 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// The autonomy tier transition (task AJ.2, gap 7b, criterion 51) — what raises a
+// The autonomy tier transition — what raises a
 // run's tier, who may, and what the audit record shows.
 //
 // **The refusals are in the committed suite rather than in a throwaway script**,
-// which is §11.5's rule and P4 §12.6's practice: a negative control that lives in
+// on purpose: a negative control that lives in
 // a script runs once, on the day it was written.
 
 func startTierRun(t *testing.T, pool *pgxpool.Pool, tier string) string {
@@ -52,7 +52,7 @@ func TestATierRaiseMovesTheRunAndIsChained(t *testing.T) {
 
 	tt := &TierTransition{
 		RunId: runId, FromTier: string(TierT1), ToTier: string(TierT3),
-		Actor: "michel@artisoft.io", ActorKind: ActorHuman,
+		Actor: "user@example.com", ActorKind: ActorHuman,
 		Rationale: "the remediation was reviewed and the run may act on it",
 	}
 	seq, err := RecordTierTransition(ctx, pool, tt)
@@ -84,7 +84,7 @@ func TestATierRaiseMovesTheRunAndIsChained(t *testing.T) {
 	if eventTier != string(TierT1) {
 		t.Errorf("the grant event is stamped %q; it records the authority in force, which was T1", eventTier)
 	}
-	if actor != "michel@artisoft.io" {
+	if actor != "user@example.com" {
 		t.Errorf("the chain event's actor is %q", actor)
 	}
 	var p map[string]any
@@ -164,7 +164,7 @@ func TestAnAgentMayLowerItsOwnTier(t *testing.T) {
 func TestARaiseWithNoReasonIsRefused(t *testing.T) {
 	err := (&TierTransition{
 		RunId: "run_x", FromTier: string(TierT1), ToTier: string(TierT2),
-		Actor: "michel@artisoft.io", ActorKind: ActorHuman,
+		Actor: "user@example.com", ActorKind: ActorHuman,
 	}).validate()
 	if err == nil || !strings.Contains(err.Error(), "states no reason") {
 		t.Fatalf("want a refusal naming the missing reason; got %v", err)
@@ -173,7 +173,7 @@ func TestARaiseWithNoReasonIsRefused(t *testing.T) {
 	// pair rather than as two tests a reader has to join up.
 	if err := (&TierTransition{
 		RunId: "run_x", FromTier: string(TierT2), ToTier: string(TierT1),
-		Actor: "michel@artisoft.io", ActorKind: ActorHuman,
+		Actor: "user@example.com", ActorKind: ActorHuman,
 	}).validate(); err != nil {
 		t.Fatalf("a lowering needs no stated reason: %v", err)
 	}
@@ -188,7 +188,7 @@ func TestATierTransitionAgainstAStaleTierIsAConflict(t *testing.T) {
 
 	_, err := RecordTierTransition(ctx, pool, &TierTransition{
 		RunId: runId, FromTier: string(TierT1), ToTier: string(TierT3),
-		Actor: "michel@artisoft.io", ActorKind: ActorHuman, Rationale: "reviewed",
+		Actor: "user@example.com", ActorKind: ActorHuman, Rationale: "reviewed",
 	})
 	var conflict *ErrTierStateConflict
 	if !errors.As(err, &conflict) {
@@ -208,7 +208,7 @@ func TestATierTransitionOnAnUnrecordedRunIsRefused(t *testing.T) {
 	pool := testPool(t)
 	_, err := RecordTierTransition(context.Background(), pool, &TierTransition{
 		RunId: "run_that_never_was", FromTier: string(TierT1), ToTier: string(TierT2),
-		Actor: "michel@artisoft.io", ActorKind: ActorHuman, Rationale: "reviewed",
+		Actor: "user@example.com", ActorKind: ActorHuman, Rationale: "reviewed",
 	})
 	var missing *ErrNoRun
 	if !errors.As(err, &missing) {
@@ -216,7 +216,7 @@ func TestATierTransitionOnAnUnrecordedRunIsRefused(t *testing.T) {
 	}
 }
 
-// The vocabulary is asserted at the boundary, which is Q-56's answer in
+// The vocabulary is asserted at the boundary, which is the settled answer in
 // practice: ParseTier is what catches an unknown value, and a named string type
 // would not have.
 func TestATierTransitionOutsideTheVocabularyIsRefused(t *testing.T) {
@@ -229,7 +229,7 @@ func TestATierTransitionOutsideTheVocabularyIsRefused(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			err := (&TierTransition{
 				RunId: "run_v", FromTier: tc.from, ToTier: tc.to,
-				Actor: "michel@artisoft.io", ActorKind: ActorHuman, Rationale: "reviewed",
+				Actor: "user@example.com", ActorKind: ActorHuman, Rationale: "reviewed",
 			}).validate()
 			if err == nil || !strings.Contains(err.Error(), "is not an autonomy tier") {
 				t.Fatalf("want a vocabulary refusal; got %v", err)
@@ -243,14 +243,14 @@ func TestATierTransitionOutsideTheVocabularyIsRefused(t *testing.T) {
 func TestATierTransitionThatChangesNothingIsRefused(t *testing.T) {
 	err := (&TierTransition{
 		RunId: "run_n", FromTier: string(TierT2), ToTier: string(TierT2),
-		Actor: "michel@artisoft.io", ActorKind: ActorHuman, Rationale: "reviewed",
+		Actor: "user@example.com", ActorKind: ActorHuman, Rationale: "reviewed",
 	}).validate()
 	if err == nil || !strings.Contains(err.Error(), "changes no authority") {
 		t.Fatalf("want a refusal of the no-op; got %v", err)
 	}
 }
 
-// K.2's rule: a write path with no read path is a store nobody can check. There
+// The transcript's rule: a write path with no read path is a store nobody can check. There
 // is no tier_event table — the chain is the record, its key being the subject —
 // so the read path reads the chain.
 func TestTierTransitionsForReadsTheChainBack(t *testing.T) {
@@ -260,7 +260,7 @@ func TestTierTransitionsForReadsTheChainBack(t *testing.T) {
 
 	if _, err := RecordTierTransition(ctx, pool, &TierTransition{
 		RunId: runId, FromTier: string(TierT1), ToTier: string(TierT3),
-		Actor: "michel@artisoft.io", ActorKind: ActorHuman, Rationale: "reviewed the diagnosis",
+		Actor: "user@example.com", ActorKind: ActorHuman, Rationale: "reviewed the diagnosis",
 	}); err != nil {
 		t.Fatalf("raising: %v", err)
 	}
@@ -293,8 +293,8 @@ func TestTierTransitionsForReadsTheChainBack(t *testing.T) {
 	}
 }
 
-// recordedActs is the two writers behind one shape. See state_change.go: Q-52
-// was answered on the argument that a human verdict on an incident and a tier
+// recordedActs is the two writers behind one shape. See state_change.go: the design
+// question was answered on the argument that a human verdict on an incident and a tier
 // transition are the same shape of act, and this is that claim as a test rather
 // than as a sentence.
 //

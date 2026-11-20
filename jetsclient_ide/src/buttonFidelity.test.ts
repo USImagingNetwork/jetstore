@@ -1,20 +1,21 @@
 /**
- * Every button the eleven ported flows draw, against the Dart it was transcribed
- * from. Task **C.18**, from **I-155**.
+ * Every button the ported flows draw, against the Dart it was transcribed
+ * from (eleven flows at first; the six in `FLOW_DOCUMENTS` since 2026-10-01).
  *
  * **What was unverified was fidelity, not function.** The flows are ported, they run
- * under test, and nothing here suggested they were broken. What I-155 recorded is
+ * under test, and nothing here suggested they were broken. What was recorded is
  * narrower and exact: **the one artefact that could have checked button fidelity did
  * not contain buttons.** `allFields` walked the three *field* containers a
  * `FormConfig` may use and `FormConfig.actions` is a fourth, so `form_fields.json`
- * reported **zero** of the flows' 143 action-bar buttons until C.0b (jetstore#2022) —
- * and `form_fields.json` is what track F's form work was sized against. Track F
+ * reported **zero** of the flows' 143 action-bar buttons until jetstore#2022 —
+ * and `form_fields.json` is what the flow port's form work was sized against. The port
  * transcribed from the Dart rather than from the corpus, which is why it worked, and
  * which is also why nothing checked it.
  *
  * **This file is the check that was infeasible before that commit and is a file
  * comparison after it.** It makes no causal claim and asserts no history; it reads
- * two generated corpora and eleven authored documents and compares them button by
+ * two generated corpora and the authored documents in `FLOW_DOCUMENTS` (eleven at
+ * first) and compares them button by
  * button.
  *
  * ## The result, stated as a measurement
@@ -28,7 +29,7 @@
  * Three things the comparison had to get right, and each is encoded rather than
  * assumed:
  *
- * 1. **Two corpora, not one.** I-155 names `form_fields.json`, and one of the eleven
+ * 1. **Two corpora, not one.** The obvious corpus is `form_fields.json`, and one of the
  *    flow documents carries a form that is not in it: `homeFiltersUF` holds
  *    `showFailureDetailsDialog`, which lives in `screen_configs.json` because it is a
  *    non-flow screen's dialog. A check reading only the flows' corpus would have
@@ -45,12 +46,12 @@
  *
  * It compares **declarations**. A button that is present, correctly named, correctly
  * styled and correctly gated can still run the wrong action — that is failures 2
- * through 5 of `src/actions/README.md`, and none of them is visible from here.
+ * through 5 of `docs/src/content/docs/developer/testing/web-app/action-documents.md`, and none of them is visible from here.
  * `checkActions` (`userflow/documentSet.ts`) already refuses a button naming an
  * action the document does not define, so the two checks are complementary and
  * neither subsumes the other.
  *
- * It also dies with the Flutter app, for `corpusFixtures.test.ts`'s reason: track X
+ * It also dies with the Flutter app, for `corpusFixtures.test.ts`'s reason: retiring it
  * deletes `jetsclient/`, and these fixtures stop being a mirror of a running app.
  */
 
@@ -121,9 +122,9 @@ function dartForms(): Record<string, DartForm> {
 }
 
 /**
- * **Ten since 2026-10-01**: `registerFileKeyUF` was retired by
- * `jetstore_maintenance_02` (`Q-6`, task `AD.4`), its schema event now submitted
- * from the Pipeline Status table's *Put Schema Event* dialog (`D01`). Its one form,
+ * **Ten since 2026-10-01**: `registerFileKeyUF` was retired,
+ * its schema event now submitted
+ * from the Pipeline Status table's *Put Schema Event* dialog. Its one form,
  * `rfkSubmitSchemaEvent`, carried two buttons, which is the whole of the drop from
  * 147 to 145 and from 51 forms to 50 below. Its Dart record stays in
  * `form_fields.json`, which is a measurement of the deleted app and not a list of
@@ -131,8 +132,8 @@ function dartForms(): Record<string, DartForm> {
  */
 /**
  * **Seven the same day**: `clientRegistryUF`, `pipelineConfigUF` and
- * `sourceConfigUF` left this comparison when `D06` made them open on their table
- * (`jetstore_maintenance_02` `AF.2`–`AF.4`). Their add-or-edit forms are gone, the
+ * `sourceConfigUF` left this comparison when they were made to open on their table.
+ * Their add-or-edit forms are gone, the
  * table pages offer *Close* and *Edit* rather than *Previous*, *Cancel* and *Next*,
  * *Cancel* in their wizards returns to the table, and the last page saves with
  * `ufNext` — so they are no longer a measurement of the Dart, and keeping them here
@@ -140,8 +141,8 @@ function dartForms(): Record<string, DartForm> {
  * hand-authored now (`userflow/schema.test.ts`, `HAND_AUTHORED`). Their Dart forms
  * stay in `form_fields.json`, for the reason given above.
  *
- * **Six the same day again**: `fileMappingUF` left on the same terms
- * (`jetstore_maintenance_02` Phase 2), when the Dart's *Done* (`ufCompleted`) was
+ * **Six the same day again**: `fileMappingUF` left on the same terms,
+ * when the Dart's *Done* (`ufCompleted`) was
  * removed from its mapping page, leaving *Previous* back to the source table. Its
  * three forms and seven buttons as compared until then are the whole of the drop
  * from 21 and 60 below.
@@ -161,8 +162,8 @@ const FLOW_DOCUMENTS = [
  * below, because there is nothing to compare them with — and listed rather than
  * inferred, so that a transcription which lost its Dart counterpart still fails.
  *
- * `homeFiltersUF/putSchemaEventDialog`: `jetstore_maintenance_02` `D01`, task
- * `AD.3`, 2026-10-01. `pipelineExecStatusTable`'s first row opens it, and every
+ * `homeFiltersUF/putSchemaEventDialog`: added
+ * 2026-10-01. `pipelineExecStatusTable`'s first row opens it, and every
  * flow that draws that table must carry the forms its buttons open
  * (`validateTableActions`). The Flutter app's nearest relative is
  * `rfkSubmitSchemaEvent`, which had a file-key field and a different capability;
@@ -197,7 +198,7 @@ function documentForms(): Array<{ document: string; form: string; config: DocFor
  *    a transcription of anything — a document has to spell it the host's way for the
  *    dialog to close.
  *  - `mapper.ok` → `mapperOk`, `mapper.draft` → `mapperDraft`: a naming choice, made
- *    at F.1 when these three moved into `mapFileUF.ua.json`
+ *    when these three moved into `mapFileUF.ua.json`
  *    (`actions/flowActions.test.ts`). Both are defined there and both are referenced
  *    from the form document, and `checkActions` refuses a button naming an action the
  *    document does not define — so the pair cannot drift apart even though the rename
@@ -207,6 +208,24 @@ const RENAMED_BY_THE_RUNTIME: Record<string, string> = {
   "dialog.cancelAction": "dialogCancel",
   "mapper.ok": "mapperOk",
   "mapper.draft": "mapperDraft",
+};
+
+/**
+ * The labels the documents correct rather than copy, keyed
+ * `<document>/<form>/<Dart button key>`, each with the Dart's label and the
+ * document's.
+ *
+ * **The Dart fixture keeps the Dart's spelling**: `datatable/fixtures/form_fields.json`
+ * records what Flutter shipped, and a correction made there would hide that a
+ * document differs from it. So a correction is a named exception here, and the
+ * test below fails if an entry stops describing both sides.
+ *
+ *  - *Comfirm* → *Confirm*, on the confirmation step of the two flows that end
+ *    in one: 2026-10-27.
+ */
+const CORRECTED_FROM_THE_DART: Record<string, { dart: string; document: string }> = {
+  "loadConfigUF/wpConfirmLoadConfigUF/ufCompleted": { dart: "Comfirm", document: "Confirm" },
+  "workspacePullUF/wpConfirmPullWorkspaceUF/ufCompleted": { dart: "Comfirm", document: "Confirm" },
 };
 
 /**
@@ -252,8 +271,9 @@ function renamed(key: string): string {
   return RENAMED_BY_THE_RUNTIME[key] ?? key;
 }
 
-describe("the eleven flows' buttons against the Dart", () => {
-  it("has a Dart form for every form the eleven documents declare", () => {
+// The titles said "the eleven flows" and "the eleven documents" until 2026-10-27.
+describe("the ported flows' buttons against the Dart", () => {
+  it("has a Dart form for every form the compared documents declare", () => {
     const dart = dartForms();
     const missing = documentForms()
       .filter(({ form }) => !(form in dart))
@@ -275,6 +295,30 @@ describe("the eleven flows' buttons against the Dart", () => {
         entry,
         inDocument: true,
         inDart: false,
+      });
+    }
+  });
+
+  it("corrects only labels that still differ as CORRECTED_FROM_THE_DART says", () => {
+    // Like the exclusion list above, the corrections cannot go stale silently: an
+    // entry whose Dart label changed, or whose document label no longer carries
+    // the correction, fails here rather than excusing a difference nobody made.
+    const dart = dartForms();
+    const docs = new Map(documentForms().map((x) => [`${x.document}/${x.form}`, x.config]));
+    for (const [entry, { dart: dartLabel, document: docLabel }] of Object.entries(
+      CORRECTED_FROM_THE_DART,
+    )) {
+      const [document, form, key] = entry.split("/") as [string, string, string];
+      const d = dart[form] ?? {};
+      const config = docs.get(`${document}/${form}`) ?? {};
+      const pair = [
+        ...zip(dartBar(d), docBar(config)),
+        ...zip(dartInField(d), docInField(config)),
+      ].find(([a]) => a.key === key);
+      expect({ entry, dart: pair?.[0].label, document: pair?.[1].label }).toEqual({
+        entry,
+        dart: dartLabel,
+        document: docLabel,
       });
     }
   });
@@ -305,9 +349,9 @@ describe("the eleven flows' buttons against the Dart", () => {
       );
     }
     // 51 and 147 until `registerFileKeyUF` was retired, 2026-10-01; 50 and 145
-    // until the same day's `AF.2`–`AF.4` took the three `D06` flows out of the
+    // until the same day's changes took three flows out of the
     // comparison (see `FLOW_DOCUMENTS`); 21 and 60 until `fileMappingUF` followed
-    // them (`jetstore_maintenance_02` Phase 2); 18 and 53 until Release 4.0.4
+    // them; 18 and 53 until Release 4.0.4
     // removed `startPipelineUF`'s merged-sources form and its three buttons
     // (2026-10-15).
     expect(forms).toBe(17);
@@ -343,9 +387,11 @@ describe("the eleven flows' buttons against the Dart", () => {
         ...zip(dartInField(d), docInField(config)),
       ]) {
         const at = `${document}/${form}/${a.key}`;
-        if (a.label !== b.label) differences.push(`${at} label: ${a.label} vs ${b.label}`);
+        const corrected = CORRECTED_FROM_THE_DART[at];
+        const label = corrected && corrected.dart === a.label ? corrected.document : a.label;
+        if (label !== b.label) differences.push(`${at} label: ${a.label} vs ${b.label}`);
         // **The capability is the field to check hardest.** 20 capability claims on a
-        // button were invisible to every corpus until C.0b (F88), 7 of them the flows'.
+        // button were invisible to every corpus until jetstore#2022, 7 of them the flows'.
         // A button that lost its capability in transcription is a control offered to
         // someone the Dart hides it from — and the server refuses either way, so the
         // failure is a user pressing a button that cannot work, **not** a privilege
@@ -384,7 +430,7 @@ describe("the eleven flows' buttons against the Dart", () => {
     const asTable = Object.fromEntries([...observed].map(([k, v]) => [k, [...v][0]]));
     // **`predominentInForm` is no longer observed, since 2026-10-01**: its only
     // buttons were `pipelineConfigUF`'s two inline *Add Data Source* buttons, and
-    // that flow left this comparison (`AF.4`). The mapping is kept in `STYLE`
+    // that flow left this comparison. The mapping is kept in `STYLE`
     // because it is still what the Dart meant; what changed is that nothing here
     // measures it.
     const { predominentInForm, ...measured } = STYLE;

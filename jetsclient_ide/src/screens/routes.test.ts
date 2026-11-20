@@ -92,7 +92,7 @@ describe("the served-screen map", () => {
     ).toEqual([]);
   });
 
-  it("covers the four ScreenOne routes, which is F68's whole set", () => {
+  it("covers the four ScreenOne routes", () => {
     // C.7, C.8, C.11 and C.12. Named as a set rather than counted, because the
     // claim is that this app now serves all four rather than that it serves four.
     for (const template of [
@@ -196,8 +196,8 @@ describe("the served-screen map", () => {
   });
 
   it("carries a flow's parameters as a query string, and refuses a partial one", () => {
-    expect(reactFlowRoute("/workspaces/loadConfigUF/:workspace_name", { workspace_name: "cgt" })).toBe(
-      "/flow/loadConfigUF?workspace_name=cgt",
+    expect(reactFlowRoute("/workspaces/loadConfigUF/:workspace_name", { workspace_name: "org1" })).toBe(
+      "/flow/loadConfigUF?workspace_name=org1",
     );
     // F.10's decision, kept: a flow whose arguments are absent is not opened with
     // an empty worksheet.
@@ -209,6 +209,64 @@ describe("the served-screen map", () => {
       reactFlowRoute("/workspaces/rulesUnitTestUF/:workspace_name", { workspace_name: "jets_ws" }),
     ).toBe("/flow/rulesUnitTestUF?workspace_name=jets_ws");
     expect(reactFlowRoute("/workspaces/rulesUnitTestUF/:workspace_name", {})).toBeNull();
+  });
+
+  it("opens Pull Workspace for a workspace with no feature branch, and still refuses a missing required one", () => {
+    const pull = "/pullWorkspaceUF/:key/:workspace_name/:workspace_branch/:feature_branch/:workspace_uri";
+    const row = {
+      key: "1592",
+      workspace_name: "jets_ws",
+      workspace_branch: "jets_ai",
+      workspace_uri: "https://github.com/artisoft-io/jets_ws",
+    };
+    for (const feature_branch of [undefined, ""]) {
+      const params: Record<string, string> = { ...row };
+      if (feature_branch !== undefined) params.feature_branch = feature_branch;
+      const to = reactFlowRoute(pull, params);
+      expect(to).not.toBeNull();
+      const query = new URLSearchParams(to!.split("?")[1]);
+      expect(to!.startsWith("/flow/workspacePullUF?")).toBe(true);
+      expect(query.get("feature_branch")).toBe("");
+      expect(query.get("workspace_uri")).toBe(row.workspace_uri);
+    }
+    expect(reactFlowRoute(pull, { ...row, feature_branch: "f1" })).toContain("feature_branch=f1");
+    expect(reactFlowRoute(pull, { ...row, workspace_branch: "" })).toBeNull();
+  });
+
+  it("opens Pull Workspace for a workspace registered with no repository URI", () => {
+    // The row's URI is empty (or NULL, which `resolveParams` leaves absent), and
+    // the button used to report "/pullWorkspaceUF/1/jets_ws/main//, which this app
+    // does not serve". The flow opens with the URI field empty: the server pulls
+    // without one when git is off, and takes the deployment's own when it is on.
+    const pull = "/pullWorkspaceUF/:key/:workspace_name/:workspace_branch/:feature_branch/:workspace_uri";
+    const row = { key: "1", workspace_name: "jets_ws", workspace_branch: "main", feature_branch: "" };
+    for (const workspace_uri of [undefined, ""]) {
+      const params: Record<string, string> = { ...row };
+      if (workspace_uri !== undefined) params.workspace_uri = workspace_uri;
+      const to = inAppPath(pull, params);
+      expect(to).not.toBeNull();
+      expect(to!.startsWith("/flow/workspacePullUF?")).toBe(true);
+      const query = new URLSearchParams(to!.split("?")[1]);
+      expect(query.get("workspace_uri")).toBe("");
+      expect(query.get("workspace_name")).toBe("jets_ws");
+    }
+    // The workspace itself is still required.
+    expect(reactFlowRoute(pull, { ...row, workspace_name: "" })).toBeNull();
+  });
+
+  it("encodes a parameter into its one path segment, so a key holding / still matches", () => {
+    // A file key is an object path. Inserted raw, its slashes made extra segments
+    // and `/filePreviewPath/:file_key` did not match: the preview was a 404.
+    const key = "in/acme/claims 2026#1?.csv";
+    const to = reactScreenPath("/filePreviewPath/:file_key", { file_key: key });
+    expect(to).toBe(`/filePreviewPath/${encodeURIComponent(key)}`);
+    expect(to!.split("/")).toHaveLength(3);
+    expect(
+      reactScreenPath("/domainTableViewer/:table_name/:session_id", {
+        table_name: "a/b",
+        session_id: "s%1",
+      }),
+    ).toBe("/domainTableViewer/a%2Fb/s%251");
   });
 
   it("returns null for a template neither app routes, and for none at all", () => {
@@ -232,8 +290,8 @@ describe("the origin a flow url carries", () => {
   });
 
   it("keeps the flow's own arguments, which travel in the same query string", () => {
-    const to = withReturnTo("/flow/loadConfigUF?workspace_name=cgt", "/workspaces");
-    expect(new URLSearchParams(to.split("?")[1]).get("workspace_name")).toBe("cgt");
+    const to = withReturnTo("/flow/loadConfigUF?workspace_name=org1", "/workspaces");
+    expect(new URLSearchParams(to.split("?")[1]).get("workspace_name")).toBe("org1");
     expect(returnToPath(new URLSearchParams(to.split("?")[1]))).toBe("/workspaces");
   });
 
@@ -327,7 +385,18 @@ describe("the flow entry points", () => {
     expect(startAtState(search)).toBe("select_file_keys");
   });
 
-  it("refuses a partial argument list, which F.10 decided for the flow routes", () => {
+  it("carries the first page's selection when the button supplies it, and opens without it", () => {
+    // `lfSourceConfigTable` is the source config's key, the first page's table
+    // selection: *Previous* reaches that page, and it opens with the source
+    // ticked. The second page does not read it, so it is not required.
+    const args = { client: "acme", org: "vendorA", object_type: "claims", table_name: "staging_claims" };
+    const withKey = reactFlowEntry("/loadFilesUF/select_file_keys", { ...args, lfSourceConfigTable: "1" })!;
+    expect(new URLSearchParams(withKey.split("?")[1]).get("lfSourceConfigTable")).toBe("1");
+    const without = reactFlowEntry("/loadFilesUF/select_file_keys", args)!;
+    expect(new URLSearchParams(without.split("?")[1]).has("lfSourceConfigTable")).toBe(false);
+  });
+
+  it("refuses a partial argument list, as the flow routes do", () => {
     // Harder here than there: a `loadFilesUF` opened on its second page without
     // `table_name` draws an empty file list, having skipped the page that would
     // have set it.

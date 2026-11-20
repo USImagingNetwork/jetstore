@@ -8,9 +8,13 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 
+	"github.com/artisoft-io/jetstore/jets/schema"
 	"github.com/artisoft-io/jetstore/jets/user"
+	"github.com/artisoft-io/jetstore/jets/utils"
 	"github.com/artisoft-io/jetstore/jets/workspace"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // Register Domain Table with input_registry
@@ -145,9 +149,10 @@ func (ca *StatusUpdate) RegisterFileInputSource() error {
 		user_email, schema_provider_json) 
 		VALUES ($1, $2, $3, $4, $5, $6, 'file', $7, 'system', $8) 
 		RETURNING key`
-	domainKeys, ok := originDomainKeys.([]string)
-	if !ok {
-		domainKeys = []string{objType.(string)}
+	domainKeys, err := originDomainKeysOf(originDomainKeys, objType)
+	if err != nil {
+		log.Println(err)
+		return err
 	}
 	for _, domainKey := range domainKeys {
 		var inputRegistryKey int
@@ -173,7 +178,89 @@ func (ca *StatusUpdate) RegisterFileInputSource() error {
 		// 	return err
 		// }
 	}
+
+	// Register the origin session in session_registry. The rows above, the
+	// input_loader_status row and the loaded staging rows all carry it, and the
+	// loader run registers only a session of its own, so without this the origin
+	// session is seen by no retention purge. RegisterFileKeys does the
+	// same for an automated file, but its error is not ignored here: a load whose
+	// session cannot be registered fails the status update, as a failed
+	// input_registry insert does.
+	err = registerOriginSession(ca.Dbpool, client, originSessionId, sourcePeriodKey)
+	if err != nil {
+		err = fmt.Errorf("while registering origin session %v in jetsapi.session_registry: %v", originSessionId, err)
+		log.Println(err)
+		return err
+	}
 	return nil
+}
+
+// originDomainKeysOf returns the domain keys a loaded file is registered under:
+// $ORIGIN_DOMAIN_KEYS, the source_config.domain_keys startLoader read, or the
+// file's object type when there are none.
+//
+// In process (dev mode) the value is the []string startLoader put in the env.
+// Through the state machine the status-update lambda receives the env decoded
+// from JSON, so it is a []any of strings. Only []string was accepted,
+// so on the cluster every load fell back to the object type alone and a source
+// with several domain keys was registered under one of them. A nil, empty or
+// otherwise typed value falls back as before; a list holding a non-string is an
+// error, as is a fallback with no string object type, rather than a panic.
+func originDomainKeysOf(originDomainKeys, objType any) ([]string, error) {
+	var domainKeys []string
+	switch v := originDomainKeys.(type) {
+	case nil:
+	case []string:
+		domainKeys = v
+	case []any:
+		domainKeys = make([]string, 0, len(v))
+		for i, e := range v {
+			s, ok := e.(string)
+			if !ok {
+				return nil, fmt.Errorf("$ORIGIN_DOMAIN_KEYS[%d] is a %T, expecting a string", i, e)
+			}
+			domainKeys = append(domainKeys, s)
+		}
+	default:
+		// Any other type fell back to the object type before the domain keys fix, and still
+		// does: only the JSON-decoded list was a known producer's value.
+		log.Printf("Warning: $ORIGIN_DOMAIN_KEYS is a %T, expecting a list of strings; using $OBJECT_TYPE", originDomainKeys)
+	}
+	if len(domainKeys) > 0 {
+		return domainKeys, nil
+	}
+	s, ok := objType.(string)
+	if !ok {
+		return nil, fmt.Errorf("$OBJECT_TYPE is a %T, expecting a string", objType)
+	}
+	return []string{s}, nil
+}
+
+// registerOriginSession registers a loaded file's origin session with source
+// type file. The cpipes env values arrive as any: in-process they carry their Go
+// types, and through the state machine they are decoded from JSON, so the source
+// period key is then a float64.
+func registerOriginSession(dbpool *pgxpool.Pool, client, originSessionId, sourcePeriodKey any) error {
+	clientStr, ok := client.(string)
+	if !ok {
+		return fmt.Errorf("$CLIENT is a %T, expecting a string", client)
+	}
+	var sessionId string
+	switch v := originSessionId.(type) {
+	case string:
+		sessionId = v
+	default:
+		n, err := utils.ToInt(v)
+		if err != nil {
+			return fmt.Errorf("$ORIGIN_SESSIONID: %v", err)
+		}
+		sessionId = strconv.Itoa(n)
+	}
+	periodKey, err := utils.ToInt(sourcePeriodKey)
+	if err != nil {
+		return fmt.Errorf("$ORIGIN_SOURCE_PERIOD_KEY: %v", err)
+	}
+	return schema.RegisterSession(dbpool, "file", clientStr, sessionId, periodKey)
 }
 
 // Register db_table Input Source in input_registry table.

@@ -15,8 +15,8 @@
  * an author writing a flow does not produce four complete files atomically. So
  * "the set is consistent" is only answerable at *load*, which is where this runs.
  *
- * That gap is not theoretical. It was found from the outside, twice in one day
- * (I-50, I-51), by the agentic_ai project generating document sets and asking
+ * That gap is not theoretical. It was found from the outside, twice in one day,
+ * by the agentic layer generating document sets and asking
  * what would consume them: four validation layers passed a set whose flow named
  * an action no document defined. **Every layer validates a document alone, and
  * nothing asked whether the set was complete.**
@@ -32,7 +32,7 @@
 import { isStandardAction } from "./engine";
 import type { ActionDocument } from "../actions/schema";
 import { actionRowsOf, type TableAction, type TableConfigDocument } from "../datatable/table";
-import { buttonsOf, itemSourcesOf, type FormDocument, type Form } from "./form";
+import { buttonsOf, fieldsOf, itemSourcesOf, type FormDocument, type Form } from "./form";
 import type { UserFlow } from "./schema";
 
 export type SetFindingCode =
@@ -43,7 +43,9 @@ export type SetFindingCode =
   /** An end state's form offers a button that tries to advance. */
   | "advanceFromEndState"
   /** A field's `itemsFrom` names a query its own form does not declare. */
-  | "missingItemSource";
+  | "missingItemSource"
+  /** A table's *+ Add* clears state and leaves a key the add path would start with. */
+  | "addKeepsState";
 
 export interface SetFinding {
   severity: "error";
@@ -74,7 +76,7 @@ const ADVANCING_ACTIONS = new Set(["ufNext", "ufStartFlow"]);
  * `fmMappingFormUF` offers no `uf*` action at all. Requiring `ufCompleted` would
  * reject two shipping forms. **All eleven satisfy "no `ufNext`".** (Ten end
  * states and one custom finisher, `fmMappingFormUF`, since `registerFileKeyUF`
- * was retired on 2026-10-01 by `jetstore_maintenance_02` `AD.4`; the argument
+ * was retired on 2026-10-01; the argument
  * stands on the one.)
  *
  * **The hazard is inherited, not introduced.** The Dart's `standardActions` —
@@ -87,7 +89,7 @@ const ADVANCING_ACTIONS = new Set(["ufNext", "ufStartFlow"]);
  * it. What is new is that a schema *could* now be asked, and cannot: `isEnd` is in
  * the flow document and the button set is in the form document.
  *
- * Found by the agentic_ai project on a generated flow, 2026-08-23, by walking the
+ * Found by the agentic layer on a generated flow, 2026-08-23, by walking the
  * graph rather than by validating anything.
  */
 function checkEndStateButtons(flow: UserFlow, forms: FormDocument): SetFinding[] {
@@ -96,7 +98,7 @@ function checkEndStateButtons(flow: UserFlow, forms: FormDocument): SetFinding[]
     if (!state.isEnd) continue;
     const form = forms.forms[state.formConfig];
     if (form === undefined) continue; // reported by checkForms
-    // **Every button, not only the action bar's** — F.2 added a `button` field
+    // **Every button, not only the action bar's** — the form has a `button` field
     // and an inline one advances exactly as an action-bar one does.
     for (const action of buttonsOf(form)) {
       if (!ADVANCING_ACTIONS.has(action.action)) continue;
@@ -174,7 +176,7 @@ function checkActions(flow: UserFlow, actions: ActionDocument, forms: FormDocume
 }
 
 /**
- * Every `itemsFrom` names a query the same form declares. Task I.2b.
+ * Every `itemsFrom` names a query the same form declares.
  *
  * **This one is inside a single document, and it is here anyway.** The file's
  * header says these checks span the set, so the widening is stated rather than
@@ -183,13 +185,13 @@ function checkActions(flow: UserFlow, actions: ActionDocument, forms: FormDocume
  * `Identifier` and whether it is a key of the sibling `queries` object is a
  * relation between two properties of one form — sayable in Zod with `.refine()`,
  * which `z.toJSONSchema` drops, so Go would not enforce it. That is the split
- * I.2a called the worst of the three options.
+ * `defaultItemPos` calls the worst of the three options.
  *
  * **The Go save path could check it and does not.** Unlike the escape names and
  * the action names, nothing here needs the browser bundle or a second document —
  * `ValidateFormDocument` has the whole form in front of it. What it lacks is a Go
  * parser for the form document, which is a second implementation of this rule to
- * keep in step with this one, and I-16's copied-schema arrangement exists
+ * keep in step with this one, and the copied-schema arrangement exists
  * precisely because one artifact with a drift test beats two readings of it. So
  * the check lives once, here, where the load path and a generator both reach it.
  */
@@ -218,9 +220,9 @@ function checkItemSources(forms: FormDocument): SetFinding[] {
 }
 
 /**
- * A table action's `actionName` and `configForm` resolve. Task F.3.
+ * A table action's `actionName` and `configForm` resolve.
  *
- * **The third source of action names, and the first flow to have one is F.3's.**
+ * **The third source of action names, and the first flow to have one is the client registry.**
  * `checkActions` above reads a state's `stateAction` and a form's buttons,
  * because when it was written those were the only two places a name could
  * appear. A table's `doAction` and `doActionShowDialog` name an entry in the
@@ -229,7 +231,7 @@ function checkItemSources(forms: FormDocument): SetFinding[] {
  * the first migrated flow whose tables carry actions — `client.tc.json` names
  * `deleteClientAction`, `org.tc.json` names `deleteOrgAction` and opens
  * `ufVendor` — so the gap had no way to show before now. `loadFilesUF`, the one
- * earlier set with table actions, happens to define both of its (I-88).
+ * earlier set with table actions, happens to define both of its.
  *
  * **And `configForm` is the same gap on the form side.** `showDialog` and
  * `doActionShowDialog` name a form, and the four forms the corpus calls
@@ -237,16 +239,16 @@ function checkItemSources(forms: FormDocument): SetFinding[] {
  * four a table names this way — `ufVendor`, `loadRawRowsDialog`,
  * `pcNewProcessInputDialog` and `pcNewProcessInputDialog4MI`. Unreferenced there
  * means *named by no state*, which is what the corpus measures; it does not mean
- * unreachable, and F23 read it as though it did (I-89).
+ * unreachable, and it was once read as though it did.
  *
- * **Both action rows, since F.5, and that widening found the only two references
+ * **Both action rows, and that widening found the only two references
  * `pipelineExecStatusTable` has.** A second row is presentation — the Dart draws
  * `secondRowActions` under `actions` and the two lists hold the same class
  * (`components/data_table.dart`) — so a check that read the first row alone would
  * have reported that table as naming nothing, while its `resubmitPipeline`
  * `doAction` and its `showFailureDetailsDialog` `showDialog` are both below the
- * fold. The 37 flow tables have no second row at all, which is why F.3 could not
- * have seen this.
+ * fold. The 37 flow tables have no second row at all, which is why the first
+ * version could not have seen this.
  *
  * **This runs where the tables are, not inside `validateDocumentSet`.** That
  * function takes three parsed documents and nothing else, which is what lets a
@@ -273,8 +275,8 @@ export function validateTableActions(
     // The pointer keeps the rows apart — `/actions/3` and
     // `/secondRowActions/3` are different buttons — so the finding names the
     // property an author would edit rather than an index into a flattened list.
-    // **Every row through `actionRowsOf` as of `AE.1`** (jetstore_maintenance_02,
-    // 2026-10-01): this listed two rows by name, so a third would have been drawn
+    // **Every row through `actionRowsOf` since
+    // 2026-10-01**: this listed two rows by name, so a third would have been drawn
     // and never checked.
     for (const [row, list] of actionRowsOf(table)) {
       list.forEach((action: TableAction, index: number) => {
@@ -312,6 +314,92 @@ export function validateTableActions(
           });
         }
       });
+    }
+  }
+  return findings;
+}
+
+/**
+ * A table's *+ Add* that clears state must clear every key the add would start
+ * with.
+ *
+ * **Why.** A wizard that opens on a table and returns to it after *Save* holds
+ * one form state for the whole run, and decides insert or update from what is in
+ * it. So *edit, back to the table, + Add, Save* updates the record just edited
+ * unless the *+ Add* removes what the edit left (the two lists and the
+ * reason for each key are in `docs/src/content/docs/developer/workspace/assets/flow-actions.md`).
+ * A test first pinned the two committed lists. This is the same check for
+ * any flow, including one a model writes.
+ *
+ * **What it applies to.** A table on a state's form whose `style: "add"` button
+ * runs a `doAction` that removes keys (an unguarded `remove` step) and then goes
+ * to another state (an unguarded `goToState`), which is the add step. A *+ Add*
+ * that removes nothing does not reset state and is not checked.
+ *
+ * **What the clear list must hold**, from the documents alone:
+ *
+ * 1. every key the add step's form binds, so the add step opens empty; and
+ * 2. when the list removes any key the table's own selection publishes (the
+ *    field's `key` and the table's `formStateBinding`), all of them. The key
+ *    that decides insert or update is one of these: `key` in both committed
+ *    wizards. Whether a key decides is in code (`saveSourceConfigForFileType`
+ *    reads `key`) and not in any document, so the rule cannot name that key. It
+ *    names the set the key comes from instead.
+ *
+ * The condition on (2) is there for a *+ Add* that does not reset an edit at
+ * all. `rulesUnitTestUF`'s runs table publishes the run selected for *View
+ * Result*, its *+ Add* clears the previous test selection and none of the run's
+ * keys, and its start posts named fields rather than the whole state. Requiring
+ * the run's keys there would refuse a correct document.
+ */
+export function validateAddClearsState(
+  set: DocumentSet,
+  tables: Record<string, TableConfigDocument>,
+): SetFinding[] {
+  const findings: SetFinding[] = [];
+  const reported = new Set<string>();
+  for (const state of Object.values(set.flow.states)) {
+    const form = set.forms.forms[state.formConfig];
+    if (form === undefined) continue; // `checkForms` reports it
+    for (const field of fieldsOf(form)) {
+      if (field.field !== "dataTable") continue;
+      const table = tables[field.table];
+      if (table === undefined || table.source !== "query") continue;
+      const selection = [field.key, ...(table.formStateBinding?.otherColumns ?? []).map((c) => c.stateKey)];
+      for (const [, list] of actionRowsOf(table)) {
+        for (const button of list) {
+          if (button.style !== "add" || button.action !== "doAction" || button.actionName === undefined) continue;
+          const action = set.actions.actions[button.actionName];
+          if (action === undefined) continue; // `validateTableActions` reports it
+          const removeAt = action.steps.findIndex((step) => step.do === "remove" && step.when === undefined);
+          const goTo = action.steps.find((step) => step.do === "goToState" && step.when === undefined);
+          if (removeAt < 0 || goTo === undefined || goTo.do !== "goToState") continue;
+          const cleared = new Set(
+            action.steps.flatMap((step) => (step.do === "remove" && step.when === undefined ? step.keys : [])),
+          );
+          const addForm = set.forms.forms[set.flow.states[goTo.state]?.formConfig ?? ""];
+          const required = new Set<string>();
+          for (const f of addForm === undefined ? [] : fieldsOf(addForm)) {
+            if ("key" in f && typeof f.key === "string") required.add(f.key);
+          }
+          if (selection.some((key) => cleared.has(key))) for (const key of selection) required.add(key);
+          const missing = [...required].filter((key) => !cleared.has(key));
+          if (missing.length === 0) continue;
+          const message =
+            `"${button.actionName}", the + Add on table "${field.table}", clears state before step ` +
+            `"${goTo.state}" and leaves ${missing.map((k) => `"${k}"`).join(", ")}, so an add after an ` +
+            `edit would start from the edited record`;
+          if (reported.has(message)) continue;
+          reported.add(message);
+          findings.push({
+            severity: "error",
+            code: "addKeepsState",
+            message,
+            path: `/actions/${button.actionName}/steps/${removeAt}`,
+            document: "actions",
+          });
+        }
+      }
     }
   }
   return findings;

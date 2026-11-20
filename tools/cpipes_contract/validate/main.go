@@ -1,9 +1,9 @@
-// The B.15 gate: every live corpus config validates against the emitted
+// The corpus gate: every live corpus config validates against the emitted
 // cpipes schema under santhosh-tekuri/jsonschema/v6 - the same library the
 // engine's Go side will use, so the schema is proven in the language that
 // consumes it. A real config that fails means the schema is wrong, not the
-// config (criterion 6); live means workspaces/*/pipes_config/** and excludes
-// the retired documents under */data/ (I-13).
+// config; live means workspaces/*/pipes_config/** and excludes
+// the retired documents under */data/.
 //
 // Run from the JetStore repo root:
 //
@@ -31,7 +31,7 @@ func main() {
 	schemaPath := flag.String("schema", "tools/cpipes_contract/cpipes_schema.json", "the emitted cpipes schema")
 	corpusRoot := flag.String("corpus", "../..", "root holding workspaces/")
 	negatives := flag.String("negatives", "tools/cpipes_contract/negative_suite.json",
-		"the B.16 negative suite; empty to skip")
+		"the negative suite; empty to skip")
 	flag.Parse()
 
 	fh, err := os.Open(*schemaPath)
@@ -101,7 +101,7 @@ func main() {
 	}
 	fmt.Printf("%d/%d validate under santhosh-tekuri/jsonschema/v6\n", len(files)-fails, len(files))
 
-	// The B.16 negative suite: every case marked invalid must fail, and a
+	// The negative suite: every case marked invalid must fail, and a
 	// negative that validates is a schema hole worth failing the build for.
 	if *negatives != "" {
 		nfh, err := os.Open(*negatives)

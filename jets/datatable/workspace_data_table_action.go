@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 
@@ -76,9 +77,6 @@ func (ctx *DataTableContext) WorkspaceInsertRows(dataTableAction *DataTableActio
 		// -----------------------------------------------------------------------
 		var gitLog, status string
 		switch {
-		case strings.HasPrefix(dataTableAction.FromClauses[0].Table, "WORKSPACE/"):
-			sqlStmt.Stmt = strings.ReplaceAll(sqlStmt.Stmt, "$SCHEMA", dataTableAction.FromClauses[0].Schema)
-
 		case strings.HasSuffix(dataTableAction.FromClauses[0].Table, "workspace_registry"):
 			// Insert or update workspace entry in workspace_registry table:
 			//	- If folder workspace_name in workspaces root does not exists,
@@ -420,18 +418,18 @@ func (ctx *DataTableContext) WorkspaceInsertRows(dataTableAction *DataTableActio
 			}
 			// The compile option compiles the active workspace once the pull is done,
 			// whichever row was pulled, so it is refused for a row that is not the
-			// active workspace (I-16, as compile_workspace is for I-4) and while rules
-			// unit tests of it are queued or executing (AC.5) -- before the pull
-			// rather than after it, so a refused request pulls nothing.
+			// active workspace (as compile_workspace is) and while rules unit tests
+			// of it are queued or executing -- before the pull rather than after it,
+			// so a refused request pulls nothing. And it is claimed before the pull
+			// (claimPullCompile), so a test requested while the pull runs is refused
+			// rather than racing the compile; the row update below releases the
+			// claim, writing "error" if the pull fails.
 			if hasWorkspaceActionOption(dataTableAction.Data[irow], "wpCompileWorkspaceOption") {
 				rowKey := dataTableAction.Data[irow]["key"]
 				if rowKey == nil {
 					return nil, http.StatusBadRequest, fmt.Errorf("invalid request for pull_workspace, missing key")
 				}
-				if httpStatus, err = refusePullCompileOfAnotherWorkspace(ctx.Dbpool, dataTableAction.WorkspaceName, rowKey); err != nil {
-					return nil, httpStatus, err
-				}
-				if httpStatus, err = refuseCompileWhileTestsRun(ctx.Dbpool); err != nil {
+				if httpStatus, err = claimPullCompile(ctx.Dbpool, dataTableAction.WorkspaceName, rowKey); err != nil {
 					return nil, httpStatus, err
 				}
 			}
@@ -469,7 +467,7 @@ func (ctx *DataTableContext) WorkspaceInsertRows(dataTableAction *DataTableActio
 
 		case strings.HasPrefix(dataTableAction.FromClauses[0].Table, "compile_workspace"):
 			if dataTableAction.WorkspaceName == "" {
-				return nil, http.StatusBadRequest, fmt.Errorf("invaid request for compile_workspace, missing workspace_name")
+				return nil, http.StatusBadRequest, fmt.Errorf("invalid request for compile_workspace, missing workspace_name")
 			}
 			// Refuse a row that is not the active workspace (I-4), and a compile while
 			// rules unit tests of the workspace are queued or executing (AC.5); the
@@ -490,13 +488,13 @@ func (ctx *DataTableContext) WorkspaceInsertRows(dataTableAction *DataTableActio
 
 		case strings.HasPrefix(dataTableAction.FromClauses[0].Table, "load_workspace_config"):
 			if dataTableAction.WorkspaceName == "" {
-				return nil, http.StatusBadRequest, fmt.Errorf("invaid request for load_workspace_config, missing workspace_name")
+				return nil, http.StatusBadRequest, fmt.Errorf("invalid request for load_workspace_config, missing workspace_name")
 			}
 			dataTableAction.Data[irow]["status"] = ""
 
 		case dataTableAction.FromClauses[0].Table == "delete_workspace":
 			if dataTableAction.WorkspaceName == "" {
-				return nil, http.StatusBadRequest, fmt.Errorf("invaid request for delete/workspace_registry, missing workspace_name")
+				return nil, http.StatusBadRequest, fmt.Errorf("invalid request for delete/workspace_registry, missing workspace_name")
 			}
 			// Delete entry in workspace_registry table:
 			//	- It is an error to delete the active workspace
@@ -603,7 +601,7 @@ func (ctx *DataTableContext) DoWorkspaceReadAction(dataTableAction *DataTableAct
 		// None for now
 	default:
 		if dataTableAction.WorkspaceName == "" {
-			return nil, http.StatusBadRequest, fmt.Errorf("invaid request, missing workspace_name")
+			return nil, http.StatusBadRequest, fmt.Errorf("invalid request, missing workspace_name")
 		}
 		// The rules unit test cases of a workspace that is not the active one are
 		// refused with the sentence the test run itself is refused with
@@ -630,7 +628,13 @@ func (ctx *DataTableContext) DoWorkspaceReadAction(dataTableAction *DataTableAct
 	var resultRows *[][]any
 	var totalRowCount int
 	if dataTableAction.FromClauses[0].Schema == "jetsapi" {
-		resultRows, _, err = execQuery(ctx.Dbpool, dataTableAction, &query)
+		// The query and the count below run read only (readOnlyTx)
+		tx, txErr := readOnlyTx()
+		if txErr != nil {
+			return nil, http.StatusInternalServerError, txErr
+		}
+		defer tx.Rollback(context.Background())
+		resultRows, _, err = execQuery(tx, dataTableAction, &query)
 		if err != nil {
 			return nil, http.StatusInternalServerError,
 				fmt.Errorf("while executing query from tables %s: %v", dataTableAction.FromClauses[0].Table, err)
@@ -700,7 +704,7 @@ func (ctx *DataTableContext) DoWorkspaceReadAction(dataTableAction *DataTableAct
 		}
 
 		// get the total nbr of row
-		err = ctx.Dbpool.QueryRow(context.Background(), nbrRowsQuery).Scan(&totalRowCount)
+		err = tx.QueryRow(context.Background(), nbrRowsQuery).Scan(&totalRowCount)
 		if err != nil {
 			return nil, http.StatusInternalServerError,
 				fmt.Errorf("while getting total row count from tables %s: %v", dataTableAction.FromClauses[0].Table, err)
@@ -928,7 +932,7 @@ func (ctx *DataTableContext) AddWorkspaceFile(dataTableAction *DataTableAction, 
 
 // DeleteWorkspaceFile
 func (ctx *DataTableContext) DeleteWorkspaceFile(dataTableAction *DataTableAction, token string) (rb *[]byte, httpStatus int, err error) {
-	_, err2 := ctx.VerifyUserPermission(&SqlInsertDefinition{Capability: "workspace_ide"}, token)
+	signedIn, err2 := ctx.VerifyUserPermission(&SqlInsertDefinition{Capability: "workspace_ide"}, token)
 	if err2 != nil {
 		httpStatus, err = RefusalFor(err2)
 		return
@@ -964,7 +968,7 @@ func (ctx *DataTableContext) DeleteWorkspaceFile(dataTableAction *DataTableActio
 			return
 		}
 		// Write empty file to local workspace & db
-		if err = wsfile.SaveContent(ctx.Dbpool, workspaceName, fileName, ""); err != nil {
+		if err = wsfile.SaveContent(ctx.Dbpool, workspaceName, fileName, "", signedIn.Email); err != nil {
 			log.Println(err)
 			httpStatus = http.StatusBadRequest
 			return
@@ -1034,11 +1038,11 @@ func documentPathOK(fileName string) bool {
 // **Why this exists beside GetWorkspaceFileContent, which reads any workspace
 // file.** That one gates on `workspace_ide`, and `jets_init_db.sql` grants
 // `workspace_ide` to `knowledge_engineer` alone. Since the eleven flows became
-// workspace assets (ui_refresh's X.5) the React app reads its flow documents at
-// run time, so the IDE's capability had become the capability required to *use a
-// flow* — and `ops_user` and `client_advocate`, who hold `jetstore_read` and
-// `run_pipelines`, could no longer open one. They are the roles the flows are
-// for.
+// workspace assets (ui_refresh's X.5, 2026-08-26) the React app reads its flow
+// documents at run time, so the IDE's capability had become the capability
+// required to *use a flow* — and `ops_user` and `client_advocate`, who hold
+// `jetstore_read` and `run_pipelines`, could no longer open one. They are the
+// roles the flows are for.
 //
 // The alternative was granting them `workspace_ide`, which also carries the free
 // SQL query tool, git push, file save and delete, and purge data. Widening a
@@ -1118,7 +1122,7 @@ func (ctx *DataTableContext) GetWorkspaceFileContent(dataTableAction *DataTableA
 // SaveWorkspaceFileContent --------------------------------------------------------------------------
 // Function to save the workspace file content in local workspace file system and in database
 func (ctx *DataTableContext) SaveWorkspaceFileContent(dataTableAction *DataTableAction, token string) (results *map[string]any, httpStatus int, err error) {
-	_, err2 := ctx.VerifyUserPermission(&SqlInsertDefinition{Capability: "workspace_ide"}, token)
+	signedIn, err2 := ctx.VerifyUserPermission(&SqlInsertDefinition{Capability: "workspace_ide"}, token)
 	if err2 != nil {
 		status, refusal := RefusalFor(err2)
 		return nil, status, refusal
@@ -1152,27 +1156,29 @@ func (ctx *DataTableContext) SaveWorkspaceFileContent(dataTableAction *DataTable
 	//  2. **At most one specific validator**, on the most specific suffix match —
 	//     see validatorFor. Absent for a plain .json, which keeps the behaviour
 	//     every existing file type has today.
-	// Warnings travel with the findings and do not block; only errors do. Which
-	// of the two an unreachable state is, is the deployment's call through
-	// JETS_USERFLOW_STRICT_REACHABILITY.
+	// Warnings do not block, only errors do, and the response carries them to
+	// the editor (saveCheckedWorkspaceFile). Which of the two an unreachable
+	// state is, is the deployment's call through JETS_USERFLOW_STRICT_REACHABILITY.
+	//
+	// The rows that check a file against the rest of the workspace read the
+	// workspace's tree as it is on disk, the database's overrides applied. A
+	// workspace whose root does not resolve is checked file by file, and the
+	// write below refuses it.
 	content := wsFileContent.(string)
-	if err = checkWorkspaceFile(fileName, content); err != nil {
-		log.Println(err)
-		httpStatus = http.StatusBadRequest
-		return
+	var workspace fs.FS
+	if root, err := wsfile.ResolveWorkspacePath(workspaceName, "."); err == nil {
+		workspace = os.DirFS(root)
 	}
-	// Write file to local workspace
-	err = wsfile.SaveContent(ctx.Dbpool, workspaceName, fileName, content)
-	results = &map[string]any{
-		"file_name": wsFileName,
-	}
-	return
+	return saveCheckedWorkspaceFile(wsFileName, fileName, content, workspace, func() error {
+		// Write file to local workspace
+		return wsfile.SaveContent(ctx.Dbpool, workspaceName, fileName, content, signedIn.Email)
+	})
 }
 
 // SaveWorkspaceClientConfig --------------------------------------------------------------------------
 // Function to save the workspace file content in local workspace file system and in database
 func (ctx *DataTableContext) SaveWorkspaceClientConfig(dataTableAction *DataTableAction, token string) (results *map[string]any, httpStatus int, err error) {
-	_, err2 := ctx.VerifyUserPermission(&SqlInsertDefinition{Capability: "workspace_ide"}, token)
+	signedIn, err2 := ctx.VerifyUserPermission(&SqlInsertDefinition{Capability: "workspace_ide"}, token)
 	if err2 != nil {
 		status, refusal := RefusalFor(err2)
 		return nil, status, refusal
@@ -1189,7 +1195,7 @@ func (ctx *DataTableContext) SaveWorkspaceClientConfig(dataTableAction *DataTabl
 	}
 
 	// Save client config to local workspace
-	err = wsfile.SaveClientConfig(ctx.Dbpool, workspaceName, clientName.(string))
+	err = wsfile.SaveClientConfig(ctx.Dbpool, workspaceName, clientName.(string), signedIn.Email)
 	results = &map[string]any{}
 	return
 }
@@ -1275,8 +1281,12 @@ func (ctx *DataTableContext) DeleteAllWorkspaceChanges(dataTableAction *DataTabl
 	// restored, so it is a deletion with no counterpart -- which is a different
 	// act from the revert here, and the reason one is gated and the other is not.
 	//
-	// Delete all workspace changes and restaure from stash
-	err = wsfile.DeleteAllFileChanges(ctx.Dbpool, workspaceName, true, false)
+	// Delete all workspace changes and restaure from stash. **The compiled
+	// assets are kept** (wsfile.CompiledAssets), their rows and their files: a
+	// revert is of what a person changed, and until 2026-11-11 this also
+	// deleted the last compile's rows and put the start-up .tgz files back,
+	// which is why the button fell out of use. Compile after reverting.
+	err = wsfile.DeleteAllFileChanges(ctx.Dbpool, workspaceName, true, true)
 	if err != nil {
 		httpStatus = http.StatusBadRequest
 		return

@@ -23,7 +23,6 @@ import {
   type FormField,
 } from "./binding";
 import type { FormState } from "./formState";
-import { keepSelectedRows } from "./model";
 import { refreshTable, useTableModes, type TableModes } from "./modes";
 import { useDataTable, type DataTableFetcher, type DataTableState } from "./useDataTable";
 import { selectedClient, subscribeToClient } from "../shell/selectedClient";
@@ -202,7 +201,7 @@ export function useTableBinding(options: UseTableBindingOptions): TableBinding {
     fetcher,
     blocked,
     refreshToken,
-    onSelectionChange: ({ rows, deselected, changedIndex, selected }) => {
+    onSelectionChange: ({ rows, deselected, changedIndex, selected, changed }) => {
       const fsc = config.formStateConfig;
       if (!fsc) return;
       // Single-select clears the previous rows first, and each has to be
@@ -212,8 +211,12 @@ export function useTableBinding(options: UseTableBindingOptions): TableBinding {
         const row = rows[index];
         if (row) publishSelection(formState, field, fsc, row, false);
       }
-      const row = rows[changedIndex];
-      if (row) publishSelection(formState, field, fsc, row, selected);
+      // The select-all box changes many rows at once; they are published one by
+      // one, and the listeners told once.
+      for (const index of changed ?? [changedIndex]) {
+        const row = rows[index];
+        if (row) publishSelection(formState, field, fsc, row, selected);
+      }
       formState.notifyListeners();
     },
   });
@@ -227,11 +230,9 @@ export function useTableBinding(options: UseTableBindingOptions): TableBinding {
     refreshTable(
       {
         setPage: state.setPage,
-        setRowsPerPage: state.setRowsPerPage,
         clearSelection: state.clearSelection,
         refresh: () => setRefreshToken((t) => t + 1),
       },
-      config,
       formState,
       field,
       config.formStateConfig,
@@ -266,6 +267,12 @@ export function useTableBinding(options: UseTableBindingOptions): TableBinding {
   //
   // Identity is the right key because it changes exactly once per fetch and is
   // stable across every re-render in between, which is what the guard is for.
+  //
+  // **A tick no longer refetches** (November 2026): `useDataTable` fetches only
+  // when the request's value changes, and the one table whose request read back
+  // a key its own selection writes, the workspace registry's `workspace_name`,
+  // no longer reads it (`makeQuery`). The restore still runs after every real
+  // fetch: a refresh, a page, a sort, a watched key.
   const restoredFor = useRef<JetsRow[] | null>(null);
   useEffect(() => {
     const fsc = config.formStateConfig;
@@ -274,13 +281,18 @@ export function useTableBinding(options: UseTableBindingOptions): TableBinding {
     restoredFor.current = state.rows;
 
     const restored = restoreSelection(formState, field, fsc, state.rows);
-    restored.forEach((isSelected, index) => {
-      if (isSelected) state.setRowSelected(index, true);
-    });
-    if (config.showSelectedOnly) {
-      // `filterSelectedRows` runs after the restore, not after the fetch — the
-      // ordering A.4b left to this file.
-      keepSelectedRows(state.rows, restored);
+    if (config.isReadOnly || config.showSelectedOnly) {
+      // A read-only table cannot take the user's tick, so the restored selection
+      // is applied as it stands; and `filterSelectedRows` runs after the restore,
+      // not after the fetch — the ordering A.4b left to this file. Both of the
+      // `showSelectedOnly` tables are read-only confirmation copies of a choice,
+      // which until 2026-11-11 showed every row, unticked: the tick was refused
+      // and the narrowed rows were computed and thrown away.
+      state.restoreSelected(restored, config.showSelectedOnly === true);
+    } else {
+      restored.forEach((isSelected, index) => {
+        if (isSelected) state.setRowSelected(index, true);
+      });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.rows]);
@@ -323,7 +335,9 @@ export function useTableBinding(options: UseTableBindingOptions): TableBinding {
       if (!changed) return;
 
       // `_refreshTable`, shared with the action button rather than open-coded
-      // here — which is how this path came to omit the page-size reset (A.5).
+      // here, so the two cannot drift. A.5 found this path omitting the Dart's
+      // page-size reset and added it; JM-060 (2026-11-05) removed the reset from
+      // both, because the page size is the user's choice (see `refreshTable`).
       restoredFor.current = null;
       doRefresh();
     });

@@ -322,14 +322,31 @@ export const FLOW_EXIT_FALLBACK = "/home";
  * with nothing positional after it; `FlowRunner` seeds every query parameter into
  * form-state group 0 by name before the flow loads.
  */
-export const FLOW_ROUTES: Readonly<Record<string, { flowKey: string; parameters: string[] }>> = {
+export const FLOW_ROUTES: Readonly<
+  Record<string, { flowKey: string; parameters: string[]; optional?: string[] }>
+> = {
   "/clientRegistryUF/:startAtKey": { flowKey: "clientRegistryUF", parameters: ["startAtKey"] },
   "/configureHomeFiltersUF": { flowKey: "homeFiltersUF", parameters: [] },
   "/fileMappingUF": { flowKey: "fileMappingUF", parameters: [] },
   "/fileMappingUF/mapping/:table_name/:object_type": { flowKey: "mapFileUF", parameters: ["table_name", "object_type"] },
   "/loadFilesUF": { flowKey: "loadFilesUF", parameters: [] },
   "/pipelineConfigUF": { flowKey: "pipelineConfigUF", parameters: [] },
-  "/pullWorkspaceUF/:key/:workspace_name/:workspace_branch/:feature_branch/:workspace_uri": { flowKey: "workspacePullUF", parameters: ["key", "workspace_name", "workspace_branch", "feature_branch", "workspace_uri"] },
+  /**
+   * `feature_branch` is optional: a workspace that works on its branch directly has
+   * none, and the registry row then holds an empty value. Required, it made
+   * *Pull Workspace* refuse to open for every such workspace with "which this app
+   * does not serve" (found 2026-11-07 on a deployed `jets_ws`). The flow posts it
+   * as `featureBranch`, and the server reads an empty one as no feature branch.
+   *
+   * `workspace_uri` is optional for the same reason (2026-11-11): a workspace
+   * registered with no repository has an empty URI, and the button refused to
+   * open. The flow only shows the URI, read only, and the pull does not need it
+   * from the row: with git off the server skips the git step and still re-applies
+   * the database overrides and runs the compile and load options chosen, and with
+   * git on it takes the deployment's `WORKSPACE_URI` first and refuses with
+   * "missing git information" only when neither names a repository.
+   */
+  "/pullWorkspaceUF/:key/:workspace_name/:workspace_branch/:feature_branch/:workspace_uri": { flowKey: "workspacePullUF", parameters: ["key", "workspace_name", "workspace_branch", "feature_branch", "workspace_uri"], optional: ["feature_branch", "workspace_uri"] },
   "/sourceConfigUF/:startAtKey": { flowKey: "sourceConfigUF", parameters: ["startAtKey"] },
   "/startPipelineUF": { flowKey: "startPipelineUF", parameters: [] },
   "/workspaces/loadConfigUF/:workspace_name": { flowKey: "loadConfigUF", parameters: ["workspace_name"] },
@@ -371,7 +388,15 @@ export function reactFlowRoute(
   const query = new URLSearchParams();
   for (const name of route.parameters) {
     const value = params[name];
-    if (value === undefined || value === "") return null;
+    if (value === undefined || value === "") {
+      // An optional parameter travels empty, so the flow's form state still has the
+      // key; a required one refuses the route, as F.10 decided.
+      if (route.optional?.includes(name)) {
+        query.set(name, "");
+        continue;
+      }
+      return null;
+    }
     query.set(name, value);
   }
   const suffix = query.toString();
@@ -400,9 +425,11 @@ export function reactFlowRoute(
  *
  * ## Why a second map rather than a row in `FLOW_ROUTES`
  *
- * `FLOW_ROUTES` is the port of `userFlowRoutes` and its rows are **the eleven
- * Flutter route templates** (ten since one was retired on 2026-10-01) —
- * `routes.test.ts` asserts the count for that reason.
+ * `FLOW_ROUTES` is the port of `userFlowRoutes` and its rows are **the
+ * Flutter route templates** (eleven, ten since one was retired on 2026-10-01)
+ * plus `rulesUnitTestUF`'s since 2026-10-11, which has no Flutter template —
+ * `routes.test.ts` asserts the count for that reason. (This said *the eleven
+ * Flutter route templates* until 2026-10-27.)
  * A row here is not one of those: Flutter had no way to enter a flow partway, so
  * `/loadFilesUF/select_file_keys` is a template this app invents. Putting it in
  * the legacy map would make that map's own header false, and the header is the
@@ -422,6 +449,14 @@ export interface FlowEntryPoint {
   startAt: string;
   /** Names that must all resolve, or the button reports rather than opening. */
   parameters: string[];
+  /**
+   * Names carried when they resolve and omitted when they do not. 2026-11-11.
+   *
+   * For a value that only a skipped page reads: the opened state does not need
+   * it, so its absence must not refuse the entry, but the page behind it is
+   * drawn better with it.
+   */
+  optional?: string[];
 }
 
 /**
@@ -471,12 +506,19 @@ export function startAtState(search: URLSearchParams): string | null {
  * what consumes it rather than off what the first state's `formStateBinding`
  * happens to publish is what keeps the two from drifting silently — they agree
  * today, and only one of them is a requirement.
+ *
+ * **`lfSourceConfigTable` is optional, and is the first page's.** Since
+ * 2026-11-11 *Previous* on the second page reaches the first (`startAtPosition`),
+ * where *Drop Staging Table* is. The source config's key is that page's table
+ * selection, so carrying it opens the page with the source already ticked.
+ * The second page does not read it, so an entry without it still opens.
  */
 export const FLOW_ENTRY_POINTS: Readonly<Record<string, FlowEntryPoint>> = {
   "/loadFilesUF/select_file_keys": {
     flowKey: "loadFilesUF",
     startAt: "select_file_keys",
     parameters: ["client", "org", "object_type", "table_name"],
+    optional: ["lfSourceConfigTable"],
   },
 };
 
@@ -499,6 +541,10 @@ export function reactFlowEntry(
     const value = params[name];
     if (value === undefined || value === "") return null;
     query.set(name, value);
+  }
+  for (const name of entry.optional ?? []) {
+    const value = params[name];
+    if (value !== undefined && value !== "") query.set(name, value);
   }
   return withStartAt(`/flow/${entry.flowKey}?${query.toString()}`, entry.startAt);
 }

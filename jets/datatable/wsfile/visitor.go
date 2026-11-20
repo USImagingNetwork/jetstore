@@ -34,10 +34,13 @@ type WorkspaceNode struct {
 	// name.** Composing one was the defect: an unregistered key threw inside an
 	// async menu delegate, so a section with no view built, a section that can
 	// never have one, and a genuine registry failure were the same event.
-	CompiledView string            `json:"compiled_view,omitempty"`
-	RoutePath    string            `json:"route_path"`
-	RouteParams  map[string]string `json:"route_params"`
-	Children     *[]*WorkspaceNode `json:"children"`
+	CompiledView string `json:"compiled_view,omitempty"`
+	// ReadOnly is set on file nodes the IDE shows and does not save (IsReadOnly,
+	// sections.go), and omitted everywhere else. 2026-10-27.
+	ReadOnly    bool              `json:"read_only,omitempty"`
+	RoutePath   string            `json:"route_path"`
+	RouteParams map[string]string `json:"route_params"`
+	Children    *[]*WorkspaceNode `json:"children"`
 }
 
 func VisitDirWrapper(root, dir, dirLabel string, filters *[]string, workspaceName string) (*WorkspaceNode, error) {
@@ -113,8 +116,8 @@ func visitChildren(root, relativeRoot, dir string, filters *[]string, workspaceN
 // blast radius, and its comment says so.
 //
 // It was not hypothetical by then: S.3 added the `user_flows` section, and no
-// workspace in the corpus has a `user_flows/` directory — cedargate_ws, jets_ws,
-// usi_ws and walrus_ws all lack one at the commits this branch pins. The tree was
+// workspace in the corpus has a `user_flows/` directory — all four lack one at
+// the commits this branch pins. The tree was
 // failing for every workspace, and it read as a server error rather than as a
 // missing folder.
 //
@@ -177,13 +180,15 @@ func visitDir(root, relativeRoot, dir string, filters *[]string, workspaceName s
 				} else {
 					size = fileInfo.Size()
 				}
-				relativeFileName := url.QueryEscape(fmt.Sprintf("%s/%s", relativeRoot, filename))
+				workspacePath := fmt.Sprintf("%s/%s", relativeRoot, filename)
+				relativeFileName := url.QueryEscape(workspacePath)
 				children = append(children, &WorkspaceNode{
 					Key:          path,
 					Type:         "file",
 					PageMatchKey: relativeFileName,
 					Label:        filename,
 					Size:         size,
+					ReadOnly:     IsReadOnly(workspacePath),
 					RoutePath:    "/workspace/:workspace_name/home",
 					RouteParams: map[string]string{
 						"workspace_name": workspaceName,

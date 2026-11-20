@@ -180,7 +180,7 @@ func HeadCommit(workspacesHome, workspaceName string) (string, error) {
 	//
 	// This returns no sha and does not consult the environment for one. A build
 	// argument carrying the commit is a separate decision with a separate
-	// validator, and it lives at the caller (`AR.1`) where the null it replaces is
+	// validator, and it lives at the caller where the null it replaces is
 	// written.
 	if NoGitAccess() {
 		return "", fmt.Errorf(
@@ -219,7 +219,7 @@ func (wg *WorkspaceGit) DeleteWorkspace() error {
 		return err
 	}
 	if wg.WorkspaceName == wg.ActiveWorkspace {
-		return fmt.Errorf("invaid request, cannot delete the active workspace")
+		return fmt.Errorf("invalid request, cannot delete the active workspace")
 	}
 	log.Printf("Deleting local workspace '%s' directory", wg.WorkspaceName)
 	if err := os.RemoveAll(filepath.Join(wg.WorkspacesHome, wg.WorkspaceName)); err != nil {

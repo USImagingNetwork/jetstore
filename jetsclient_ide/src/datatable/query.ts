@@ -137,7 +137,59 @@ export const KEYS = {
   inputRegistryTable: "inputRegistryTable", // DTKeys
   mainInputRegistryKey: "main_input_registry_key", // FSK
   mergedInputRegistryKeys: "merged_input_registry_keys", // FSK
+  // No Dart original: the Home tabs `session_registry` Phase 2 added (2026-11-08).
+  pipelineArchiveTable: "pipelineArchiveTable",
+  sessionRegistryTable: "sessionRegistryTable",
 } as const;
+
+/**
+ * Which filter list a table receives, by its field key, and the table name its
+ * clauses are rewritten to. `session_registry` Phase 2, 2026-11-08.
+ *
+ * **One table where `makeQuery` had a branch per list.** It said
+ * `if (field.key === pipelineExecStatusTable)` for the home filters and an
+ * `if` over three keys for the data-registry filters — the Dart's two blocks,
+ * ported as written. Phase 2 adds two tables: *Archived Pipelines*, which takes
+ * the home filters, and *Session Registry*, which takes a list of its own. Two
+ * more branches would have made four places that know a table key; this is one.
+ *
+ * **`rewrite` is the archive's, and it is why the archive does not alias its
+ * `FROM`.** The home filters name `pipeline_execution_status` as their table
+ * (`homeFilters.ts`, `EXEC_STATUS`), and the server qualifies the column with it
+ * (`visitWhereClause`). Aliasing the archive as `pipeline_execution_status` in
+ * its document would have made those clauses resolve, and would also have made
+ * the client filter — which names the real first table — refer to a name the
+ * query no longer has. So the clauses are rewritten to the archive's real name
+ * here, and the document names its table as it is.
+ */
+interface FilterSource {
+  filters: (ctx: QueryContext) => WhereClause[] | null | undefined;
+  rewrite?: { from: string; to: string };
+}
+
+const homeFiltersOf = (ctx: QueryContext) => ctx.homeFilters;
+const dataRegistryFiltersOf = (ctx: QueryContext) => ctx.dataRegistryFilters;
+
+export const FILTERS_BY_FIELD: Readonly<Record<string, FilterSource>> = {
+  [KEYS.pipelineExecStatusTable]: { filters: homeFiltersOf },
+  [KEYS.pipelineArchiveTable]: {
+    filters: homeFiltersOf,
+    rewrite: { from: "pipeline_execution_status", to: "pipeline_execution_status_archive" },
+  },
+  [KEYS.inputRegistryTable]: { filters: dataRegistryFiltersOf },
+  [KEYS.mainInputRegistryKey]: { filters: dataRegistryFiltersOf },
+  [KEYS.mergedInputRegistryKeys]: { filters: dataRegistryFiltersOf },
+  [KEYS.sessionRegistryTable]: { filters: (ctx) => ctx.sessionRegistryFilters },
+};
+
+/** A clause, and its `orWith` chain, with one table name replaced. */
+function rewriteTable(wc: WhereClause, rewrite: { from: string; to: string }): WhereClause {
+  return {
+    ...wc,
+    ...(wc.table === rewrite.from ? { table: rewrite.to } : {}),
+    ...(wc.orWith ? { orWith: rewriteTable(wc.orWith, rewrite) } : {}),
+  };
+}
 
 /** Mutable bookkeeping that `_makeQuery` and `_makeWhereClause` share. */
 interface BuildState {
@@ -268,6 +320,19 @@ function addOrWith(
 }
 
 /**
+ * Whether a table's own selection writes `key` into form state: the key it is
+ * bound under, or one of the row's other columns (`publishSelection`).
+ */
+export function publishesKey(
+  config: TableConfig,
+  field: { group: number; key: string },
+  key: string,
+): boolean {
+  if (field.key === key) return true;
+  return config.formStateConfig?.otherColumns.some((c) => c.stateKey === key) ?? false;
+}
+
+/**
  * `_makeQuery` (`data_table_source.dart:428`).
  *
  * Key insertion order follows the Dart, so a serialised payload compares equal
@@ -356,24 +421,15 @@ export function makeQuery(ctx: QueryContext): DataTableAction {
     if (value != null) whereClauses.push(value);
   }
 
-  // Two blocks of filters that apply to named tables only. See KEYS above: this
-  // is generic code that knows four table keys by name.
-  if (field && field.key === KEYS.pipelineExecStatusTable && ctx.homeFilters) {
-    for (const wc of ctx.homeFilters) {
+  // The filter lists that apply to named tables only, by field key — see
+  // `FILTERS_BY_FIELD` above, which is the one place generic code knows them.
+  const source = field && Object.hasOwn(FILTERS_BY_FIELD, field.key) ? FILTERS_BY_FIELD[field.key] : undefined;
+  const filters = source?.filters(ctx);
+  if (source && filters) {
+    for (const original of filters) {
+      const wc = source.rewrite ? rewriteTable(original, source.rewrite) : original;
       const value = addOrWith(wc, makeWhereClause(wc, ctx, state), ctx, state);
       if (value != null) whereClauses.push(value);
-    }
-  }
-  if (field && ctx.dataRegistryFilters) {
-    if (
-      field.key === KEYS.inputRegistryTable ||
-      field.key === KEYS.mainInputRegistryKey ||
-      field.key === KEYS.mergedInputRegistryKeys
-    ) {
-      for (const wc of ctx.dataRegistryFilters) {
-        const value = addOrWith(wc, makeWhereClause(wc, ctx, state), ctx, state);
-        if (value != null) whereClauses.push(value);
-      }
     }
   }
 
@@ -417,16 +473,29 @@ export function makeQuery(ctx: QueryContext): DataTableAction {
     msg.sortColumn = ctx.sortColumnName;
     msg.sortColumnTable = ctx.sortColumnTableName;
   } else {
+    // A table that declares no columns learns them from the reply's `columnDef`,
+    // and a heading press then names one of those. It is sent, so the server can
+    // order by it; before the first reply the name is empty, which asks the
+    // server for its default (the table's first column).
     msg.columns = [];
-    msg.sortColumn = "";
-    msg.sortColumnTable = "";
+    msg.sortColumn = ctx.sortColumnName;
+    msg.sortColumnTable = ctx.sortColumnTableName;
   }
 
   msg.sortAscending = ctx.sortAscending;
 
-  const fromState = field
-    ? ctx.formState?.getValue(field.group, KEYS.workspaceName)
-    : undefined;
+  // **Not from form state when this table's own selection writes the key.** The
+  // workspace registry publishes its selected row's `workspace_name`, so reading
+  // it back here made a tick change the table's own request: `useDataTable`
+  // fetches whenever the request changes, the reply cleared the selection, and
+  // the restore put it back a moment later, so the box flickered off and on.
+  // The name of a selected row is not a parameter of the query that lists the
+  // rows (the server ignores it for the registry, a `jetsapi` table), and no
+  // other table publishes the key. The route still supplies it.
+  const fromState =
+    field && !publishesKey(config, field, KEYS.workspaceName)
+      ? ctx.formState?.getValue(field.group, KEYS.workspaceName)
+      : undefined;
   const workspaceName =
     fromState != null ? fromState : ctx.routeParams?.[KEYS.workspaceName];
   if (workspaceName != null) {

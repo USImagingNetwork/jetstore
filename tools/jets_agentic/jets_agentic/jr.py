@@ -1,11 +1,11 @@
-"""The .jr emitter (A1.5) — deliberately the least clever component (R-3).
+"""The .jr emitter — deliberately the least clever component.
 
-Two constructs, per the corpus idiom (§4): `class` declarations for the
+Two constructs, per the corpus idiom: `class` declarations for the
 entities, and named `text` literals for the vocabularies — a named literal
 lands in `resources` with `type='text'`, `id` set and `inline` null, so rules
 reference the constant by name and a mistyped value is a compile error.
 Rule-visible metadata (`data_classification`) is emitted as `triple(...)`
-facts (§3.5); everything emitter-only goes to the sidecar instead.
+facts; everything emitter-only goes to the sidecar instead.
 """
 
 from __future__ import annotations
@@ -59,7 +59,7 @@ def qname(name: str) -> str:
 
 def collect_vocabularies() -> list[type[StrEnum]]:
     """Every StrEnum reachable from an entity, in first-reached order — the
-    rule Q-6 settled, since EvidenceSource is not in the proposal's §A.4."""
+    rule that was settled, since EvidenceSource is not in the proposal's list."""
     seen: dict[type[StrEnum], list[str]] = {}
     for entity in M.ENTITIES:
         for fname, field in entity.model_fields.items():
@@ -78,14 +78,14 @@ def emit() -> str:
             f"tools/jets_agentic/jets_agentic/model.py (model version {M.MODEL_VERSION}).",
         )
     )
-    out.append("# The schema-first authoring surface of decision 7: new agentic entities are")
+    out.append("# The schema-first authoring surface: new agentic entities are")
     out.append("# authored in the Python source; existing data models and all rules stay in .jr.")
     out.append("")
     # Every entity derives from jets:Entity, which the platform base model
     # declares — and both files are installed into data_model/ by the same step
-    # (A21.2), so this file can import it and be self-contained. Without it, a
+    # so this file can import it and be self-contained. Without it, a
     # rule set importing only this file fails with "base class jets:Entity not
-    # found", which is where criterion 13's first run ended.
+    # found", which is where the first install run ended.
     out.append('import "data_model/jets_model.jr"')
     out.append("")
 
@@ -131,7 +131,7 @@ def emit() -> str:
         out.append("")
 
     if triples:
-        out.append("# Rule-visible property metadata (§3.5): data_classification markers as")
+        out.append("# Rule-visible property metadata: data_classification markers as")
         out.append("# triples, readable in working memory and at build time (workspace.db triples).")
         out.append(f'resource {M.PREFIX}:data_classification = "{M.PREFIX}:data_classification";')
         out.extend(triples)

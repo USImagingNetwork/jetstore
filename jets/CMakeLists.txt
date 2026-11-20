@@ -14,6 +14,75 @@ set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O3 -fPIC -fmessage-length=0
 
 set(C_LIBRARY_NAME jets)
 
+# The sanitizer build, off by default:
+#   -DJETS_SANITIZE=ON  compiles and links everything here, abseil included when
+#                       it is built here, with AddressSanitizer (leak detection on)
+#                       and UndefinedBehaviorSanitizer, every report fatal. Three
+#                       UBSan checks are left out, null, nonnull-attribute and
+#                       returns-nonnull-attribute: under them GCC 13 rejects a
+#                       constexpr comparison in abseil's hash_policy_traits.h.
+# abseil must be built with the same flags: under AddressSanitizer its headers
+# change the flat tables' layout, so an uninstrumented library does not match.
+#   -DJETS_ABSEIL_SOURCE=<abseil-cpp source tree>  builds that abseil here, with
+#                       these flags, instead of the installed one; otherwise point
+#                       CMAKE_PREFIX_PATH at an abseil installed with them.
+# The gate is one command, from the repository root (docs/src/content/docs/developer/engine/rule-engine/):
+#   cmake -S . -B build-san -DCMAKE_BUILD_TYPE=Release -DJETS_SANITIZE=ON \
+#     -DJETS_ABSEIL_SOURCE=/path/to/abseil-cpp-20260107.1 \
+#     && make -C build-san -j8 jets_test && (cd build-san/jets && ctest)
+option(JETS_SANITIZE "AddressSanitizer and UndefinedBehaviorSanitizer on the jets libraries and tests" OFF)
+set(JETS_ABSEIL_SOURCE "" CACHE PATH "An abseil-cpp source tree to build here instead of find_package(absl)")
+if(JETS_SANITIZE)
+  message(STATUS "jets: AddressSanitizer and UndefinedBehaviorSanitizer on")
+  set(JETS_SANITIZE_FLAGS
+    -fsanitize=address,undefined
+    -fno-sanitize=null,nonnull-attribute,returns-nonnull-attribute
+    -fno-sanitize-recover=all
+    -fno-omit-frame-pointer)
+  add_compile_options(${JETS_SANITIZE_FLAGS})
+  add_link_options(-fsanitize=address,undefined)
+endif()
+
+# Abseil through its CMake package, so that each library brings the abseil
+# libraries it needs (absl::raw_hash_set needs hashtablez_sampler and
+# raw_logging_internal, among others). Naming archives such as absl_hash by hand
+# links them without those.
+if(JETS_ABSEIL_SOURCE)
+  message(STATUS "jets: abseil built from ${JETS_ABSEIL_SOURCE}")
+  set(ABSL_PROPAGATE_CXX_STD ON)
+  set(ABSL_BUILD_TESTING OFF)
+  set(JETS_SAVED_BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS})
+  set(BUILD_SHARED_LIBS OFF)
+  set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+  add_subdirectory(${JETS_ABSEIL_SOURCE} ${CMAKE_BINARY_DIR}/abseil EXCLUDE_FROM_ALL)
+  set(BUILD_SHARED_LIBS ${JETS_SAVED_BUILD_SHARED_LIBS})
+else()
+  find_package(absl CONFIG REQUIRED)
+endif()
+
+# Build variants, for measuring the engine. Both
+# are off by default, and a build that does not set them compiles and links with
+# exactly the flags above.
+#   -DJETS_MARCH=x86-64-v3  adds -march=x86-64-v3 to every C and C++ compile here
+#   -DJETS_LTO=ON           link-time optimisation of objlib, jets, jets_static
+#                           and jets_test (CMake's INTERPROCEDURAL_OPTIMIZATION)
+# A build with either runs only on what it was built for: -march on a CPU with
+# that instruction set, and an LTO jets_static only through an LTO-aware link.
+set(JETS_MARCH "" CACHE STRING "Target instruction set, passed as -march=<value>; empty passes none")
+option(JETS_LTO "Link-time optimisation of the jets libraries and tests" OFF)
+if(JETS_MARCH)
+  message(STATUS "jets: -march=${JETS_MARCH}")
+  add_compile_options(-march=${JETS_MARCH})
+endif()
+if(JETS_LTO)
+  include(CheckIPOSupported)
+  check_ipo_supported(RESULT JETS_IPO_SUPPORTED OUTPUT JETS_IPO_ERROR LANGUAGES C CXX)
+  if(NOT JETS_IPO_SUPPORTED)
+    message(FATAL_ERROR "JETS_LTO=ON, and the toolchain does not support it: ${JETS_IPO_ERROR}")
+  endif()
+  message(STATUS "jets: link-time optimisation on")
+endif()
+
 # configure a header file to pass some of the CMake settings to the source code
 configure_file (
   "./version.h.in"
@@ -57,9 +126,8 @@ add_library(${C_LIBRARY_NAME}_static STATIC $<TARGET_OBJECTS:objlib>)
 target_link_libraries(${C_LIBRARY_NAME}
   gflags
   glog
-  absl_hash
-  absl_city
-  absl_raw_hash_set
+  absl::raw_hash_set
+  absl::hash
   boost_date_time
   pthread
   sqlite3
@@ -78,27 +146,33 @@ add_executable(jets_test
   # rete/lookup_sql_helper_test.cc
   rete/lookup_rand_test.cc
   rete/lookup_row_id_test.cc
+  rete/lookup_sql_ident_test.cc
   rete/truth_test.cc
   rete/node_vertex_test.cc
   rete/rete_meta_store_test.cc
   rete/rete_session_test.cc
   rete/rete_meta_store_factory_test0.cc
-  rete/rete_meta_store_factory_test1.cc
-  rete/rete_meta_store_factory_test2.cc
   rete/expr_op_test.cc
   rete/expr_op_specialty_test.cc
   rete/expr_operator_factory_test.cc
+  rete/operator_list_test.cc
+  rete/cwrapper_test.cc
+  rete/lookup_db_open_test.cc
+  rete/meta_store_sharing_test.cc
+  rete/operator_writes_graph_test.cc
   rete/no_truth_main_on_exist_test.cc
   rete/retract_recorded_consequents_test.cc
   rete/loop_through_negation_test.cc
+  rete/regex_cache_test.cc
+  rete/vertex_observations_test.cc
+  rete/row_supports_test.cc
 )
 
 target_link_libraries(jets_test
   gflags
   glog
-  absl_hash
-  absl_city
-  absl_raw_hash_set
+  absl::raw_hash_set
+  absl::hash
   boost_date_time
   gtest
   gtest_main
@@ -112,13 +186,75 @@ target_include_directories(jets_test PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/..
 )
 
+# operator_list_test.cc reads jets/compilerv2/compiler/operators.txt and
+# jets/rete/expr_operator_factory.h from the source tree
+target_compile_definitions(jets_test PRIVATE JETS_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+
 # copy test files
 add_custom_command(TARGET jets_test POST_BUILD
   COMMAND cp -r  ${CMAKE_SOURCE_DIR}/jets/rete/test_data $<TARGET_FILE_DIR:jets_test>
 )
 
+if(JETS_LTO)
+  set_property(TARGET objlib ${C_LIBRARY_NAME} ${C_LIBRARY_NAME}_static jets_test
+    PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+endif()
+
 include(GoogleTest)
-gtest_discover_tests(jets_test)
+if(JETS_SANITIZE)
+  # Leak detection is LeakSanitizer's default on Linux; it is named so that the
+  # gate does not depend on an ASAN_OPTIONS left in the environment
+  set(JETS_SANITIZE_ENV "ASAN_OPTIONS=detect_leaks=1:abort_on_error=0" "UBSAN_OPTIONS=print_stacktrace=1")
+  gtest_discover_tests(jets_test PROPERTIES ENVIRONMENT "${JETS_SANITIZE_ENV}")
+else()
+  gtest_discover_tests(jets_test)
+endif()
+
+# Go tests that need this build's libjets.so, and so run in no plain `go test`:
+# they are behind a build tag to keep their packages free of cgo. ctest runs
+# them from the source tree against the libjets.so built here, so build `jets`
+# before running ctest. Their label is `go`: `ctest -L go` runs them alone and
+# `ctest -LE go` leaves them out. They are registered when `go` is on the PATH
+# (or JETS_GO_EXECUTABLE names it) and JETS_GO_ENGINE_TESTS is on, and not in
+# the sanitizer build, whose libjets.so needs the sanitizer runtime preloaded.
+#   go_statistics_key_engine    jets/compilerv2/compiler/statistics_key_engine_test.go
+#                               (tag engine_keys): the compiler's statistics key of
+#                               each rule constant is the engine's key for it
+#   go_beta_row_pruning_engine  jets/compilerv2/compiler/beta_row_pruning_engine_test.go
+#                               (tag engine_rules): a row whose vertex leaves out
+#                               a variable of its parent's row keeps the supports
+#                               of its derivations, and goes with the last; and a
+#                               deleted triple that is both a parent row's and its
+#                               join withdraws the derivation
+option(JETS_GO_ENGINE_TESTS "Register with ctest the Go tests that link libjets.so" ON)
+find_program(JETS_GO_EXECUTABLE go)
+if(JETS_GO_ENGINE_TESTS AND JETS_GO_EXECUTABLE AND NOT JETS_SANITIZE)
+  set(JETS_GO_TEST_ENV
+    "CGO_CFLAGS=-I${CMAKE_SOURCE_DIR}/jets"
+    "CGO_LDFLAGS=-L${CMAKE_CURRENT_BINARY_DIR}"
+    "LD_LIBRARY_PATH=${CMAKE_CURRENT_BINARY_DIR}")
+  # name, build tag, test name pattern, package
+  foreach(go_test IN ITEMS
+      "go_statistics_key_engine|engine_keys|TestStatisticsKeyAgreesWithTheEngine|./jets/compilerv2/compiler/"
+      "go_beta_row_pruning_engine|engine_rules|TruthMaintenance$|./jets/compilerv2/compiler/")
+    string(REPLACE "|" ";" go_test "${go_test}")
+    list(GET go_test 0 go_test_name)
+    list(GET go_test 1 go_test_tag)
+    list(GET go_test 2 go_test_run)
+    list(GET go_test 3 go_test_package)
+    add_test(NAME ${go_test_name}
+      COMMAND ${JETS_GO_EXECUTABLE} test -count=1 -tags ${go_test_tag} -run ${go_test_run} ${go_test_package}
+      WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    set_tests_properties(${go_test_name} PROPERTIES
+      ENVIRONMENT "${JETS_GO_TEST_ENV}"
+      # a renamed test would otherwise pass as `ok ... [no tests to run]`
+      FAIL_REGULAR_EXPRESSION "no tests to run"
+      LABELS go
+      TIMEOUT 900)
+  endforeach()
+elseif(JETS_GO_ENGINE_TESTS AND NOT JETS_SANITIZE)
+  message(STATUS "jets: go not found, the Go tests that link libjets.so are not registered with ctest")
+endif()
 
 
 

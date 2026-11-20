@@ -1,6 +1,13 @@
 package wsfile
 
-import "net/url"
+import (
+	"log"
+	"net/url"
+	"os"
+	"path"
+	"path/filepath"
+	"strings"
+)
 
 // The Workspace IDE's section list, and the one fact about a section that the
 // client cannot work out for itself.
@@ -37,7 +44,7 @@ import "net/url"
 // directories are `data_model` (31 files), `jet_rules` (149) and `lookups` (15).
 // `pipes_config`, `process_config` and `reports` are reached zero times in every
 // one of the four. **`lookups` is reached by import in three workspaces and by
-// `$csv_file` in the fourth** — usi_ws declares its lookup tables inside
+// `$csv_file` in the fourth** — that workspace declares its lookup tables inside
 // `jet_rules/` and keeps only the CSV data under `lookups/` — which is a fact
 // about where a workspace puts a declaration rather than about the section, and
 // is why this is a property of the section rather than a per-workspace query.
@@ -76,10 +83,12 @@ type Section struct {
 
 // WorkspaceSections is the section list the apiserver emits, in display order.
 //
-// **Eight sections, and it has been eight throughout** — `process_sequence` was
-// removed and `table_configs` added on the same day, 2026-08-23, so a count
-// carried forward from before that day is right by coincidence and its
-// membership is wrong.
+// **Eleven sections since 2026-11-13, when `docs` was added; ten from
+// 2026-11-06, when `runbooks` was added; nine from
+// 2026-10-27, when `provenance` was added.** It had been
+// eight from 2026-08-23, when `process_sequence` was removed and `table_configs`
+// added on the same day, so a count carried forward from before that day was
+// right by coincidence and its membership wrong.
 var WorkspaceSections = []Section{
 	{
 		// **`.meta.json` and `.schema.json` are the agentic model's two emitted
@@ -114,11 +123,20 @@ var WorkspaceSections = []Section{
 		// with their CSV inputs beside them, and were invisible here from the day
 		// they shipped, the same missing-suffix defect as `.apply.json` below.
 		// `.csv` matches anywhere under jet_rules/, not only under unit_tests/; on
-		// that day every CSV there was a test input (5 in jets_ws, 7 in usi_ws,
-		// none in walrus_ws or cedargate_ws), so a path-aware filter would guard
+		// that day every CSV there was a test input (5 in jets_ws, 7 in another
+		// workspace, none in the other two), so a path-aware filter would guard
 		// against nothing.
+		//
+		// **`optimizer_statistics.json` since 2026-10-26**: the statistics the
+		// compiler orders antecedents by (optstats.FileName), committed or synced
+		// by a pipeline as an override, and invisible here, so a workspace without
+		// git integration could not copy it back to its repository. It is named
+		// whole rather than as `.json`, which would also list the compiled
+		// `.jr.json` files beside the rules. As a suffix it lists each statistics
+		// process's own file too, `<process>.optimizer_statistics.json`
+		// (optstats.ProcessFileName).
 		Dir: "jet_rules", Label: "Jets Rules",
-		Filters: []string{".jr", ".tst.json", ".csv"}, CompiledView: JetRulesView,
+		Filters: []string{".jr", ".tst.json", ".csv", "optimizer_statistics.json"}, CompiledView: JetRulesView,
 	},
 	{
 		// Declared here, and not built in the Flutter client. That is the state
@@ -136,8 +154,27 @@ var WorkspaceSections = []Section{
 		Filters: []string{".jr", ".csv"}, CompiledView: LookupsView,
 	},
 	{
+		// **`.md` since 2026-10-27** (jetstore_maintenance_02 `AL.1`): the one
+		// section directory where a workspace keeps a README, measured that day
+		// over the four workspaces' tracked files. The other sections hold none,
+		// so they do not list `.md`; adding it to one is one filter. A README is
+		// shown read-only (ReadOnlySuffixes below).
 		Dir: "pipes_config", Label: "Pipes Config",
-		Filters: []string{".pc.json"}, CompiledView: NoCompiledView,
+		Filters: []string{".pc.json", ".md"}, CompiledView: NoCompiledView,
+	},
+	{
+		// **Added 2026-10-27** (jetstore_maintenance_02 `AL.2`): the briefing
+		// provenance schemas, `provenance/<key>.pv.json` by the convention
+		// briefing.DocumentSuffix describes. The save path has validated them
+		// since 2026-09-05 and no section listed them, so they could be saved
+		// and not opened: the miss this table and the validator table keep
+		// having, found by the test that ties the two
+		// (TestEveryValidatedFileTypeIsShownInTheIde, in package datatable).
+		// The suffix is written out rather than imported, so that this package
+		// does not import the agentic briefing package; that test is what keeps
+		// the two equal.
+		Dir: "provenance", Label: "Provenance",
+		Filters: []string{".pv.json"}, CompiledView: NoCompiledView,
 	},
 	{
 		// **This entry is the whole of making a new file type visible**, which is
@@ -176,8 +213,51 @@ var WorkspaceSections = []Section{
 		Filters: []string{"workspace_init_db.sql"}, CompiledView: NoCompiledView,
 	},
 	{
+		// `config.json` is listed by `.json` already; it is named as well
+		// (2026-11-14) because it is the report directives, a file type the
+		// save path checks (workspace_file_validators.go), and a validated
+		// type is listed by name.
 		Dir: "reports", Label: "Reports",
-		Filters: []string{".sql", ".json"}, CompiledView: NoCompiledView,
+		Filters: []string{".sql", ".json", "config.json"}, CompiledView: NoCompiledView,
+	},
+	{
+		// **Added 2026-11-06** (runbooks Phase 1, `AA.4`): a runbook,
+		// `runbooks/<name>.rb.json`, and its steps' SQL, one file per step under
+		// `runbooks/<name>/` by default (jets/runbook). Both suffixes are
+		// listed because a runbook and its SQL are edited together, as a flow
+		// and its form are. Last, so the sections before it keep their order.
+		// Nothing compiles it: the executor reads the files when a run starts,
+		// and the directory stays out of workspace.tgz.
+		Dir: "runbooks", Label: "Runbooks",
+		Filters: []string{".rb.json", ".sql"}, CompiledView: NoCompiledView,
+	},
+	{
+		// **Added 2026-11-13**: the workspace's written documentation pages,
+		// Markdown with front matter in `docs/` and its subfolders, and the
+		// guide's settings file, `docs/workspace_docs.json`. They are merged
+		// into the installation's documentation site as the workspace guide at
+		// the UI image's build (docs/scripts/workspace_docs.mjs), and until
+		// this row a workspace's pages could not be opened in the IDE at all.
+		//
+		// **A page here is saved, where a `.md` anywhere else is shown
+		// read-only**: this is the directory the workspace writes Markdown in
+		// on purpose, so IsReadOnly exempts it (WritableMarkdownDir). The
+		// settings file is checked on save
+		// (jets/datatable/workspace_file_validators.go). A save is an
+		// override, as any other file's is: the guide shows it once it is
+		// committed to the workspace's repository and the UI image rebuilt.
+		// Nothing compiles it. Last, so the sections before it keep their
+		// order.
+		//
+		// **`.mdx` since 2026-11-13, the same day**: the documentation build
+		// copies every file under `docs/` into the site, and its loader
+		// (Starlight's docsLoader) takes `.mdx` pages as it takes `.md` ones;
+		// the generator gives an `index.mdx` the landing page's place as it
+		// does an `index.md`. A page in either is checked on save for the
+		// front matter the build requires (validateDocsPage,
+		// jets/datatable/workspace_docs_page.go).
+		Dir: "docs", Label: "Documentation",
+		Filters: []string{".md", ".mdx", "workspace_docs.json"}, CompiledView: NoCompiledView,
 	},
 }
 
@@ -191,6 +271,170 @@ var workspaceRootFiles = []struct {
 }{
 	{"compile_workspace", "compile_workspace.sh", "Compile Workspace Script"},
 	{"workspace_control", "workspace_control.json", "Workspace Control"},
+}
+
+// RootNoteSuffix is the suffix of the notes listed at the tree's root, after the
+// two root files: the workspace's own README, which every one of the four
+// workspaces has (2026-10-27, jetstore_maintenance_02 `AL.1`). Unlike the two
+// root files they are found by listing the root rather than named, because a
+// workspace may have none or several. Only the root itself is listed; its
+// subdirectories are sections or are not shown.
+const RootNoteSuffix = ".md"
+
+// ReadOnlySuffixes are the file types the IDE shows and does not save, and
+// IsReadOnly is the test for one. A node for such a file carries `read_only`,
+// the editor opens it read-only, and the save path refuses it
+// (checkWorkspaceFile, jets/datatable/workspace_file_validators.go).
+//
+// **`.md` is read-only because nothing checks it and a save would make it an
+// override.** The plan that added it (jetstore_maintenance_02 `AL.1`,
+// 2026-10-27) made a README read-only unless the validator table has a row for
+// it, and a test in package datatable fails if a read-only suffix gains one,
+// since the two would then contradict each other. A root README could not be
+// saved anyway until 2026-11-14: SaveContent took the database content type
+// from the first path segment, and a root file has none. It records a root
+// file's override under RootContentType now, so that is no longer a reason.
+//
+// **Except the workspace's root README, since 2026-11-14**
+// (IsRootReadme), as that plan's answer said once a root file saved. It is
+// the workspace's own notes, which a Knowledge Engineer keeps up to date in
+// the IDE. A save makes it an override, which every start writes back
+// (SyncWorkspaceFiles, jets/workspace) and which makes no start-up compile
+// (overrideRequiresCompile there): nothing compiles or runs it. A README
+// anywhere else, and any other root `.md`, stay read-only.
+//
+// **Except under WritableMarkdownDir, since 2026-11-13.** A README beside a
+// workspace's pipelines is notes kept in its repository; a page under `docs/`
+// is the workspace guide's content, written to be edited, and the IDE is where
+// a Knowledge Engineer edits the workspace.
+//
+// **`.mdx` since 2026-11-13**, with the `docs` section's `.mdx` pages: no other
+// section lists it, so this only makes the save path refuse one written outside
+// `docs/` by a direct request, as it refuses a `.md`. The validator rows for the
+// two suffixes are scoped to WritableMarkdownDir, which is how both rules hold.
+var ReadOnlySuffixes = []string{".md", ".mdx"}
+
+// WritableMarkdownDir is the workspace directory whose files are saved
+// whatever ReadOnlySuffixes says: the `docs` section's pages.
+const WritableMarkdownDir = "docs"
+
+// IsReadOnly reports whether the IDE shows the file at filePath without saving
+// it. filePath is the workspace-relative path, `pipes_config/README.md`, with
+// forward slashes and not escaped; a bare name is a file at the root. The
+// match is by suffix, without case, and a file under WritableMarkdownDir is
+// never read-only.
+//
+// **Without case since 2026-11-14**: it matched as Section.Filters do, case
+// and all, so `pipes_config/README.MD` was not read-only and a direct request
+// could save it, where `README.md` was refused. The save path's other suffix
+// tests (validatorFor and the JSON check, workspace_file_validators.go) already
+// ignored case. Section.Filters still match with case: they decide what the IDE
+// lists, and the compiler and the documentation build read their files by
+// their exact suffixes.
+//
+// The path is cleaned first, so that `docs/../pipes_config/README.md` is
+// judged as the README it names rather than as a page.
+func IsReadOnly(filePath string) bool {
+	if InDir(filePath, WritableMarkdownDir) || IsRootReadme(filePath) {
+		return false
+	}
+	cleaned := strings.ToLower(cleanWorkspacePath(filePath))
+	for _, suffix := range ReadOnlySuffixes {
+		if strings.HasSuffix(cleaned, strings.ToLower(suffix)) {
+			return true
+		}
+	}
+	return false
+}
+
+// RootReadme is the name of the workspace's root README, matched without
+// case.
+const RootReadme = "README.md"
+
+// IsRootReadme reports whether the workspace-relative filePath is the
+// workspace's root README, `README.md` at the root, without case and after
+// cleaning the path as IsReadOnly does: `docs/../README.md` is the root
+// README, and `pipes_config/README.md` is not.
+func IsRootReadme(filePath string) bool {
+	return strings.EqualFold(cleanWorkspacePath(filePath), RootReadme)
+}
+
+// GeneratedDocsNames are the names, directly under WritableMarkdownDir, where
+// the documentation build writes the workspace guide's generated pages: the
+// `reference/` folder, and the two pages that would take its address. The build
+// fails when the workspace's `docs/` holds one (generateWorkspaceGuide,
+// docs/scripts/workspace_docs.mjs), rather than let a generated page replace a
+// written one. Lower case: a name is matched without case, as the site's
+// addresses are lower case.
+var GeneratedDocsNames = []string{"reference", "reference.md", "reference.mdx"}
+
+// IsGeneratedDocsPath reports whether the file at the workspace-relative
+// filePath is in a place of the workspace guide's generated pages
+// (GeneratedDocsNames): `docs/reference/rules/x.md`, `docs/reference.md`, or
+// `docs/Reference/x.md`. The save path refuses such a file, since the next UI
+// image build would fail on it. Added 2026-11-14.
+func IsGeneratedDocsPath(filePath string) bool {
+	if !InDir(filePath, WritableMarkdownDir) {
+		return false
+	}
+	rel := strings.TrimPrefix(cleanWorkspacePath(filePath), WritableMarkdownDir+"/")
+	first := strings.ToLower(strings.SplitN(rel, "/", 2)[0])
+	for _, name := range GeneratedDocsNames {
+		if first == name {
+			return true
+		}
+	}
+	return false
+}
+
+// InDir reports whether the file at the workspace-relative filePath is in the
+// workspace directory dir or a subfolder of it, after cleaning the path as
+// IsReadOnly does: `docs/../jet_rules/a.jr` is not in `docs`.
+func InDir(filePath, dir string) bool {
+	return strings.HasPrefix(cleanWorkspacePath(filePath), dir+"/")
+}
+
+// cleanWorkspacePath is filePath with forward slashes, cleaned.
+func cleanWorkspacePath(filePath string) string {
+	return path.Clean(strings.ReplaceAll(filePath, "\\", "/"))
+}
+
+// visitRootNotes returns a file node for each RootNoteSuffix file directly in
+// root, in name order. A root that cannot be read yields none, as an absent
+// section directory yields an empty section (visitDir).
+func visitRootNotes(root, workspaceName string) []*WorkspaceNode {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		log.Printf("workspace root %q cannot be listed, reporting no notes: %v", root, err)
+		return nil
+	}
+	var notes []*WorkspaceNode
+	for _, e := range entries {
+		name := e.Name()
+		// Without case, as IsReadOnly matches it: a `README.MD` is a note too.
+		if e.IsDir() || !strings.HasSuffix(strings.ToLower(name), RootNoteSuffix) {
+			continue
+		}
+		var size int64
+		if info, err := e.Info(); err == nil {
+			size = info.Size()
+		}
+		notes = append(notes, &WorkspaceNode{
+			Key:          name,
+			Type:         "file",
+			PageMatchKey: name,
+			Label:        name,
+			Size:         size,
+			ReadOnly:     IsReadOnly(name),
+			RoutePath:    "/workspace/:workspace_name/home",
+			RouteParams: map[string]string{
+				"workspace_name": workspaceName,
+				"file_name":      url.QueryEscape(name),
+				"label":          name,
+			},
+		})
+	}
+	return notes
 }
 
 // Visit walks one section's directory and returns its node, stamped with the
@@ -210,7 +454,7 @@ func (s Section) Visit(root, workspaceName string) (*WorkspaceNode, error) {
 
 // BuildWorkspaceFileStructure returns the whole `workspace_file_structure`
 // payload for one workspace: every section of WorkspaceSections in order, then
-// the two root files.
+// the two root files, then the root's notes (visitRootNotes).
 //
 // It is a free function over a filesystem path rather than a method on the HTTP
 // context so that it can be tested against a workspace built in t.TempDir() —
@@ -227,11 +471,18 @@ func BuildWorkspaceFileStructure(root, workspaceName string) ([]*WorkspaceNode, 
 	}
 
 	for _, f := range workspaceRootFiles {
+		// Sized as every other file node is (visitDir, visitRootNotes); a root
+		// file that is absent keeps its node, with no size.
+		var size int64
+		if info, err := os.Stat(filepath.Join(root, f.FileName)); err == nil {
+			size = info.Size()
+		}
 		resultData = append(resultData, &WorkspaceNode{
 			Key:          f.Key,
 			Type:         "file",
 			PageMatchKey: f.FileName,
 			Label:        f.Label,
+			Size:         size,
 			RoutePath:    "/workspace/:workspace_name/home",
 			RouteParams: map[string]string{
 				"workspace_name": workspaceName,
@@ -240,6 +491,8 @@ func BuildWorkspaceFileStructure(root, workspaceName string) ([]*WorkspaceNode, 
 			},
 		})
 	}
+
+	resultData = append(resultData, visitRootNotes(root, workspaceName)...)
 
 	return resultData, nil
 }

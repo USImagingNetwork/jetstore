@@ -9,6 +9,7 @@ import (
 
 	"github.com/artisoft-io/jetstore/jets/utils"
 	"github.com/artisoft-io/jetstore/jets/utils/jcsv"
+	"github.com/artisoft-io/jetstore/jets/workspace"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -68,6 +69,17 @@ func (ctx *JetrulesTransformationPipe) Finally() {
 			ctx.jrPoolManager.WaitForDone.Wait()
 		}
 	}
+	// The workers are done with the engine, release it: it holds the sqlite
+	// connections to workspace.db and lookup.db, which nothing else closes. A
+	// lambda node serves many invocations in one process, so an engine left to
+	// the process keeps its file descriptors until the execution environment is
+	// retired, and a burst of runs reaches the descriptor limit.
+	if ctx.ruleEngine != nil {
+		if err := ctx.ruleEngine.Release(); err != nil {
+			log.Printf("WARNING while releasing the jetrules engine: %v", err)
+		}
+		ctx.ruleEngine = nil
+	}
 	// Note - closing the error channel is moved with closing all the output channels in
 	// the pipe_executor_fan_out.go and pipe_executor_fsplitter.go
 }
@@ -95,19 +107,20 @@ func (ctx *BuilderContext) NewJetrulesTransformationPipe(source *InputChannel, _
 		config.MaxErrorCount = 20
 	}
 
-	// Prepare JetRules engine
+	// Prepare JetRules engine: there is one, C++. A request for the Go engine is
+	// refused at start (validateNoGoEngine) and again here, for a configuration that
+	// reached the node another way; use_jet_rules_native is the only engine and is
+	// accepted, set or not. A node with no engine fails rather than fall back.
+	if config.UseJetRulesGo {
+		return nil, fmt.Errorf("error: jetrules_config sets use_jet_rules_go: %s; remove it or set it to false",
+			GoEngineRetired)
+	}
 	var jrFactory JetRulesFactory
-	if config.UseJetRulesNative {
+	if ctx.jetRules != nil {
 		jrFactory = ctx.jetRules.GetNativeFactory()
 	}
-	if config.UseJetRulesGo {
-		jrFactory = ctx.jetRules.GetGoFactory()
-	}
 	if jrFactory == nil {
-		jrFactory = ctx.jetRules.GetDefaultFactory()
-		if jrFactory == nil {
-			log.Println("WARNING: no JetRulesFactory available in CoordinateComputePipes")
-		}
+		return nil, fmt.Errorf("error: %s", NoRuleEngineOnNode)
 	}
 	log.Printf("%s node %d %s - Using Jetrule engine: %s",
 		ctx.cpConfig.CommonRuntimeArgs.SessionId,
@@ -137,6 +150,16 @@ func (ctx *BuilderContext) NewJetrulesTransformationPipe(source *InputChannel, _
 	if err != nil {
 		return nil, err
 	}
+	// From here the pipe owns the engine and Finally releases it; on an error
+	// before the pipe is returned, nobody else would.
+	pipeBuilt := false
+	defer func() {
+		if !pipeBuilt {
+			if err := ruleEngine.Release(); err != nil {
+				log.Printf("WARNING while releasing the jetrules engine: %v", err)
+			}
+		}
+	}()
 
 	// Create the output channels for each of the exported rdf type
 	jetrulesOutputChan := make([]*JetrulesOutputChan, 0, len(config.OutputChannels))
@@ -267,13 +290,23 @@ func (ctx *BuilderContext) NewJetrulesTransformationPipe(source *InputChannel, _
 	}
 
 	// Setup a worker pool
+	// The optimizer's statistics, counted only when the step asks for them.
+	var stats *OptimizerStats
+	if config.OptimizerStatistics {
+		stats, err = LoadOptimizerStats(workspace.WorkspaceDbPath())
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	var jrPoolManager *JrPoolManager
 	workerResultCh := make(chan JetrulesWorkerResult, 10)
 	ctx.chResults.JetrulesWorkerResultCh <- workerResultCh
 	jrPoolManager = ctx.NewJrPoolManager(config, source, rdfType2Columns, ruleEngine,
-		errorOutputCh, jetrulesOutputChan, workerResultCh)
+		errorOutputCh, jetrulesOutputChan, workerResultCh, stats)
 
 	// All good!
+	pipeBuilt = true
 	log.Printf("*** NewJetrulesTransformationPipe: exiting SUCCESS")
 	return &JetrulesTransformationPipe{
 		cpConfig:       ctx.cpConfig,
@@ -325,8 +358,8 @@ func parseRuleConfigCsv(config []map[string]any, ruleConfig *string) ([]map[stri
 				// Into json struct:
 				// [
 				//   {
-				//   "usi_sm:clientName": {
-				//     "value": "Local 138",
+				//   "acme:clientName": {
+				//     "value": "Example Client",
 				//     "type": "text"
 				//   }
 				// ]

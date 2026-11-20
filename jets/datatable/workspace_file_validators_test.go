@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/artisoft-io/jetstore/jets/datatable/wsfile"
+	"github.com/artisoft-io/jetstore/jets/optstats"
 	"github.com/artisoft-io/jetstore/jets/wsvalidate"
 )
 
@@ -21,7 +23,7 @@ func TestValidatorForPicksTheMostSpecificSuffix(t *testing.T) {
 		// their existing behaviour: well-formedness only, no specific validator.
 		"workspace_control.json":    false,
 		"reports/something.json":    false,
-		"pipes_config/x.pc.json":    false, // agentic_ai's row, not yet added
+		"pipes_config/x.pc.json":    true, // the twelfth row
 		"user_flows/notes.md":       false,
 		"looks_like.uf.json.backup": false,
 		"provenance/notes.json":     false,
@@ -31,10 +33,36 @@ func TestValidatorForPicksTheMostSpecificSuffix(t *testing.T) {
 		// checkWorkspaceFile. TestSaveCheckValidatesSqlFiles is what asserts it
 		// is reached; this only asserts the dispatch.
 		"process_config/base__workspace_init_db.sql": true,
-		"reports/CM.sql":        true,
-		"reports/CM.SQL":        true,
-		"jet_rules/mapping.jr":  false,
-		"reports/CM.sql.backup": false,
+		"reports/claims.sql":                         true,
+		"reports/claims.SQL":                         true,
+		"jet_rules/mapping.jr":                       false,
+		"reports/claims.sql.backup":                  false,
+		// The seventh row, named whole: no other jet_rules .json is validated.
+		"jet_rules/optimizer_statistics.json":   true,
+		"jet_rules/A.optimizer_statistics.json": true, // a statistics process's own file
+		"jet_rules/main.jr.json":                false,
+		// The eighth row (runbooks AA.4). A runbook's SQL goes through `.sql`.
+		"runbooks/health_check.rb.json":     true,
+		"runbooks/health_check/recent.sql":  true,
+		"runbooks/health_check.rbr.json":    false, // a run's result is never a workspace file
+		"runbooks/health_check.rb.json.bak": false,
+		// The ninth row: the workspace guide's settings.
+		"docs/workspace_docs.json": true,
+		"docs/other.json":          false,
+		// The tenth and eleventh: the guide's pages, under docs/ only, and not
+		// a file Starlight's loader skips.
+		"docs/customisation/observe.md":  true,
+		"docs/index.mdx":                 true,
+		"docs/_partial.md":               false,
+		"pipes_config/README.md":         false,
+		"README.md":                      false,
+		"docs/../pipes_config/README.md": false,
+		"pipes_config/docs/README.md":    false,
+		// The thirteenth: the report directives, reports/config.json and no
+		// other config.json (TestReportDirectivesRowAppliesToReportsConfigOnly).
+		"reports/config.json":      true,
+		"pipes_config/config.json": false,
+		"reports/x/config.json":    false,
 	}
 	for name, want := range cases {
 		if got := validatorFor(name) != nil; got != want {
@@ -47,12 +75,35 @@ func TestValidatorForPicksTheMostSpecificSuffix(t *testing.T) {
 // match only means something if two suffixes can overlap, and it is the rule
 // that keeps the *next* file type honest — `.tc.json` was the fourth and did not
 // need it, which is exactly when a guard like this stops being watched.
+//
+// **A suffix repeats since 2026-11-14**, deliberately: the `.sql` rows scoped
+// to `runbooks/` and `reports/` beside the one for every SQL file, where the
+// dispatch prefers a scoped row on a suffix of the same length. So the rule is
+// now that a repeated suffix is between a scoped row and others, and that two
+// scoped rows of one suffix never both apply to one file, which is probed in
+// every section's directory and at the root.
 func TestSuffixesAreDistinct(t *testing.T) {
 	for i, a := range workspaceFileValidators {
 		for j, b := range workspaceFileValidators {
-			if i != j && strings.HasSuffix(a.suffix, b.suffix) {
+			if i == j || !strings.HasSuffix(a.suffix, b.suffix) {
+				continue
+			}
+			if a.suffix != b.suffix || (a.applies == nil && b.applies == nil) {
 				t.Errorf("%q ends with %q; longest-match decides, and that should be deliberate",
 					a.suffix, b.suffix)
+				continue
+			}
+			if a.applies == nil || b.applies == nil {
+				continue
+			}
+			dirs := []string{""}
+			for _, section := range wsfile.WorkspaceSections {
+				dirs = append(dirs, section.Dir+"/", section.Dir+"/sub/")
+			}
+			for _, dir := range dirs {
+				if name := dir + "x" + a.suffix; a.applies(name) && b.applies(name) {
+					t.Errorf("rows %d and %d, both %q, both apply to %s", i, j, a.suffix, name)
+				}
 			}
 		}
 	}
@@ -212,7 +263,7 @@ func TestCheckWorkspaceFileIsTheWiring(t *testing.T) {
 	good := readGolden(t, "../workspace_assets/user_flows/loadFilesUF.uf.json")
 
 	t.Run("a valid flow is written", func(t *testing.T) {
-		if err := checkWorkspaceFile("user_flows/loadFilesUF.uf.json", good); err != nil {
+		if _, err := checkWorkspaceFile("user_flows/loadFilesUF.uf.json", good); err != nil {
 			t.Errorf("refused a shipping flow: %v", err)
 		}
 	})
@@ -224,7 +275,7 @@ func TestCheckWorkspaceFileIsTheWiring(t *testing.T) {
 		}
 		doc["states"].(map[string]any)["select_source_config"].(map[string]any)["defaultNextState"] = "typo"
 		out, _ := json.Marshal(doc)
-		err := checkWorkspaceFile("user_flows/x.uf.json", string(out))
+		_, err := checkWorkspaceFile("user_flows/x.uf.json", string(out))
 		if err == nil {
 			t.Fatal("accepted, and it must not be")
 		}
@@ -240,13 +291,13 @@ func TestCheckWorkspaceFileIsTheWiring(t *testing.T) {
 		_ = json.Unmarshal([]byte(good), &doc)
 		doc["states"].(map[string]any)["select_source_config"].(map[string]any)["defaultNextState"] = "typo"
 		out, _ := json.Marshal(doc)
-		if err := checkWorkspaceFile("reports/whatever.json", string(out)); err != nil {
+		if _, err := checkWorkspaceFile("reports/whatever.json", string(out)); err != nil {
 			t.Errorf("a plain .json should not be flow-validated: %v", err)
 		}
 	})
 
 	t.Run("malformed json is refused before any validator runs", func(t *testing.T) {
-		if err := checkWorkspaceFile("user_flows/x.uf.json", "{ not json"); err == nil {
+		if _, err := checkWorkspaceFile("user_flows/x.uf.json", "{ not json"); err == nil {
 			t.Error("accepted malformed json")
 		} else if !strings.Contains(err.Error(), "not a valid json file") {
 			t.Errorf("the well-formedness check should report first: %v", err)
@@ -254,7 +305,7 @@ func TestCheckWorkspaceFileIsTheWiring(t *testing.T) {
 	})
 
 	t.Run("a non-json file is not touched", func(t *testing.T) {
-		if err := checkWorkspaceFile("jet_rules/mapping.jr", "this is not json at all"); err != nil {
+		if _, err := checkWorkspaceFile("jet_rules/mapping.jr", "this is not json at all"); err != nil {
 			t.Errorf("refused a non-json file: %v", err)
 		}
 	})
@@ -276,7 +327,7 @@ func TestProvenanceSchemaGoesThroughTheSavePath(t *testing.T) {
 	    "properties": {"count": {"type": "integer"}}},
 	  "rules": [{"field": "count", "kind": "count_of", "sources": ["e[]"]}]
 	}`
-	if err := checkWorkspaceFile("provenance/patient_briefing.pv.json", good); err != nil {
+	if _, err := checkWorkspaceFile("provenance/patient_briefing.pv.json", good); err != nil {
 		t.Fatalf("a well-formed provenance schema must save: %v", err)
 	}
 
@@ -288,7 +339,7 @@ func TestProvenanceSchemaGoesThroughTheSavePath(t *testing.T) {
 	    "properties": {"count": {"type": "integer"}, "note": {"type": "string"}}},
 	  "rules": [{"field": "count", "kind": "count_of", "sources": ["e[]"]}]
 	}`
-	err := checkWorkspaceFile("provenance/patient_briefing.pv.json", uncovered)
+	_, err := checkWorkspaceFile("provenance/patient_briefing.pv.json", uncovered)
 	if err == nil {
 		t.Fatal("a briefing field with no provenance rule must not save")
 	}
@@ -302,7 +353,7 @@ func TestProvenanceSchemaGoesThroughTheSavePath(t *testing.T) {
 	  "key": "patient_briefing",
 	  "rules": [{"field": "note", "kind": "ungrounded"}]
 	}`
-	if err := checkWorkspaceFile("provenance/patient_briefing.pv.json", unreasoned); err == nil {
+	if _, err := checkWorkspaceFile("provenance/patient_briefing.pv.json", unreasoned); err == nil {
 		t.Fatal("an ungrounded field with no reason must not save")
 	}
 }
@@ -317,7 +368,7 @@ func TestSaveCheckValidatesSqlFiles(t *testing.T) {
 		// The shape that cost a deployment on 2026-09-12 and is now legal.
 		content := "-- Registering it does not schedule it; a pipeline runs when somebody\n" +
 			"-- starts it.\nDELETE FROM jetsapi.process_config WHERE key = 50105;\n"
-		if err := checkWorkspaceFile("process_config/base__workspace_init_db.sql", content); err != nil {
+		if _, err := checkWorkspaceFile("process_config/base__workspace_init_db.sql", content); err != nil {
 			t.Errorf("want the file saved, got %v", err)
 		}
 	})
@@ -325,11 +376,11 @@ func TestSaveCheckValidatesSqlFiles(t *testing.T) {
 	t.Run("an unterminated literal is refused, with the line", func(t *testing.T) {
 		content := "DELETE FROM jetsapi.source_config WHERE client = 'CI';\n" +
 			"INSERT INTO jetsapi.source_config VALUES ('CI', '{\n  \"a\": \"b; c\"\n}');\n"
-		// Closing quote removed from the JSON literal, which is the ciseit and
-		// fbin shape: unloadable, and reported at deployment against a line in
+		// Closing quote removed from the JSON literal, which is the shape of two
+		// client init scripts: unloadable, and reported at deployment against a line in
 		// whatever the unclosed quote swallowed.
 		content = strings.Replace(content, "}');", "});", 1)
-		err := checkWorkspaceFile("process_config/ci_workspace_init_db.sql", content)
+		_, err := checkWorkspaceFile("process_config/ci_workspace_init_db.sql", content)
 		if err == nil {
 			t.Fatal("want the save refused")
 		}
@@ -344,10 +395,10 @@ func TestSaveCheckValidatesSqlFiles(t *testing.T) {
 	})
 
 	t.Run("a report script is checked too", func(t *testing.T) {
-		if err := checkWorkspaceFile("reports/CM.sql", "--out.csv;\nSELECT 'a; b' FROM t;\n"); err != nil {
+		if _, err := checkWorkspaceFile("reports/claims.sql", "--out.csv;\nSELECT 'a; b' FROM t;\n"); err != nil {
 			t.Errorf("want the file saved, got %v", err)
 		}
-		if err := checkWorkspaceFile("reports/CM.sql", "--out.csv;\nSELECT 'a; b FROM t;\n"); err == nil {
+		if _, err := checkWorkspaceFile("reports/claims.sql", "--out.csv;\nSELECT 'a; b FROM t;\n"); err == nil {
 			t.Error("want the save refused")
 		}
 	})
@@ -355,16 +406,18 @@ func TestSaveCheckValidatesSqlFiles(t *testing.T) {
 	t.Run("a plain .json still gets its well-formedness check", func(t *testing.T) {
 		// The JSON check stopped being the gate on the whole function; it must
 		// not have stopped being applied.
-		if err := checkWorkspaceFile("reports/config.json", "{ not json"); err == nil {
+		// reports/config.json was this test's plain .json until it gained a
+		// row of its own (2026-11-14).
+		if _, err := checkWorkspaceFile("reports/thresholds.json", "{ not json"); err == nil {
 			t.Error("want a malformed plain .json refused")
 		}
-		if err := checkWorkspaceFile("reports/config.json", `{"a": 1}`); err != nil {
+		if _, err := checkWorkspaceFile("reports/thresholds.json", `{"a": 1}`); err != nil {
 			t.Errorf("want a well-formed plain .json saved, got %v", err)
 		}
 	})
 
 	t.Run("a file with no row is still untouched", func(t *testing.T) {
-		if err := checkWorkspaceFile("jet_rules/mapping.jr", "not json, not sql, not checked"); err != nil {
+		if _, err := checkWorkspaceFile("jet_rules/mapping.jr", "not json, not sql, not checked"); err != nil {
 			t.Errorf("want the file saved, got %v", err)
 		}
 	})
@@ -388,6 +441,89 @@ func TestDescribeFindingsRendersBothCoordinates(t *testing.T) {
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("rendering = %q, want it to contain %q", got, want)
+		}
+	}
+}
+
+// The statistics file is refused at the save unless the compiler can read it,
+// because a file it cannot read fails every compile of the workspace.
+func TestSaveCheckRefusesAStatisticsFileTheCompilerWouldRefuse(t *testing.T) {
+	good, err := optstats.Marshal(optstats.New())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := checkWorkspaceFile(optstats.FileName, string(good)); err != nil {
+		t.Fatalf("a valid statistics file was refused: %v", err)
+	}
+	for name, content := range map[string]string{
+		"an empty object": `{}`,
+		"another version": `{"format": "jetstore.optimizer_statistics", "version": 2, "rule_sets": {}}`,
+		"a misspelt key":  strings.Replace(string(good), `"rule_sets"`, `"rule_set"`, 1),
+		"not JSON at all": `{"format": `,
+	} {
+		if _, err := checkWorkspaceFile(optstats.FileName, content); err == nil {
+			t.Errorf("%s was accepted", name)
+		}
+	}
+}
+
+// The `.rb.json` row (runbooks Phase 1, AA.4): the save path reaches
+// runbook.ValidateFile, refuses what it refuses with the JSON Pointer in the
+// message, and saves a runbook whose SQL files it cannot see.
+func TestRunbookGoesThroughTheSavePath(t *testing.T) {
+	const good = `{"format": 1, "runbook": "health_check",
+	  "parameters": {"since_utc": {"type": "timestamp"}},
+	  "steps": [
+	    {"id": "recent", "type": "query", "returns": {"n": "integer"}},
+	    {"id": "scratch", "type": "ddl", "preview": true}
+	  ]}`
+	if _, err := checkWorkspaceFile("runbooks/health_check.rb.json", good); err != nil {
+		t.Fatalf("a valid runbook must save: %v", err)
+	}
+	// Every ddl pauses for a person: a runbook that turns it off does not save.
+	unconfirmed := strings.Replace(good, `"preview": true`, `"confirm": false`, 1)
+	_, err := checkWorkspaceFile("runbooks/health_check.rb.json", unconfirmed)
+	if err == nil {
+		t.Fatal("a ddl with confirm false must not save")
+	}
+	if !strings.Contains(err.Error(), "/steps/1/confirm") {
+		t.Errorf("the message should carry the pointer, got %v", err)
+	}
+	// Strict: a misspelt field is refused rather than ignored.
+	misspelt := strings.Replace(good, `"preview"`, `"preveiw"`, 1)
+	if _, err := checkWorkspaceFile("runbooks/health_check.rb.json", misspelt); err == nil {
+		t.Fatal("an unknown field must not save")
+	}
+	// A runbook's SQL file is checked lexically, as every workspace .sql is.
+	if _, err := checkWorkspaceFile("runbooks/health_check/recent.sql", "SELECT 'open"); err == nil {
+		t.Fatal("an unterminated string in a runbook's SQL must not save")
+	}
+}
+
+// The ninth row: the workspace guide's settings file is refused at the save when
+// the documentation build would refuse it (readSettings,
+// docs/scripts/workspace_docs.mjs), since that fails the next UI image build.
+func TestSaveCheckRefusesWorkspaceDocsSettingsTheBuildWouldRefuse(t *testing.T) {
+	const name = "docs/workspace_docs.json"
+	for _, content := range []string{`{}`, `{"rule_text": true}`, `{"rule_text": false}`, `{"rule_text": true, "later": 1}`} {
+		if _, err := checkWorkspaceFile(name, content); err != nil {
+			t.Errorf("%s was refused: %v", content, err)
+		}
+	}
+	for content, want := range map[string]string{
+		`null`:                 "JSON object",
+		`[]`:                   "not a valid json",
+		`"rule_text"`:          "not a valid json",
+		`{"rule_text": "yes"}`: "/rule_text: rule_text must be true or false",
+		`{"rule_text": 1}`:     "rule_text must be true or false",
+		`{"rule_text": null}`:  "rule_text must be true or false",
+		`{"rule_text": `:       "not a valid json",
+	} {
+		_, err := checkWorkspaceFile(name, content)
+		if err == nil {
+			t.Errorf("%s was accepted", content)
+		} else if !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: %v, want it to contain %q", content, err, want)
 		}
 	}
 }

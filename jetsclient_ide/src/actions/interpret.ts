@@ -1,5 +1,5 @@
 /**
- * The interpreter. Task S.2a.
+ * The interpreter.
  *
  * Runs an authored action's steps against a host. The host is the seam that
  * keeps this file testable and keeps the grammar honest — everything the Dart
@@ -41,7 +41,7 @@ import type { Action, Rows, Step, Value } from "./schema";
 /**
  * Everything an action can reach outside form state.
  *
- * **The I/O half moved to `EscapeHost` at F.8 and this interface extends it.**
+ * **The I/O half moved to `EscapeHost` and this interface extends it.**
  * An action escape needs `post`, `read`, `notify`, `setBusy`, `close`,
  * `userEmail` and `download`; it has no business with `validate`, `confirm`,
  * `goToState` or `now`, which are how a *step* decides what happens next. The
@@ -60,9 +60,15 @@ export interface ActionHost extends EscapeHost {
   query(name: string): Promise<Record<string, string | null> | null>;
   /** Runs the form's validators. False stops the action without failing it. */
   validate(): boolean;
-  /** A modal question. False stops the action without failing it. */
-  confirm(message: string): Promise<boolean>;
-  /** Jumps the flow. Declared on the state as `goToStates` — see I-18. */
+  /**
+   * A modal question. False stops the action without failing it.
+   *
+   * `detail` is the text of the step's `detailFromKey`, shown under the message
+   * with its line breaks; absent when the step names none or the key is empty.
+   * A host that predates it ignores the second argument and still asks.
+   */
+  confirm(message: string, detail?: string): Promise<boolean>;
+  /** Jumps the flow. Declared on the state as `goToStates`. */
   goToState(state: string): void;
   /** Injected so a fan-out's session ids are deterministic under test. */
   now(): number;
@@ -93,8 +99,8 @@ export type ActionOutcome = string | null;
 /**
  * What running an action did: whether it finished, and what to tell the user.
  *
- * **`message` alone could not say whether the action completed, and that is
- * I-29's second half.** A step that stops the action returns `{done: true}` with
+ * **`message` alone could not say whether the action completed.** A step that
+ * stops the action returns `{done: true}` with
  * an outcome that is *sometimes* null — a `validate` that did not pass and a
  * refused `confirm` both stop silently, because neither is an error worth
  * reporting. `runAction` returned only the message, so "stopped quietly" and "ran
@@ -142,7 +148,7 @@ function toPgArray(raw: unknown): string {
 }
 
 /**
- * `unpackToList(x)?.join(',')`. Task F.2.
+ * `unpackToList(x)?.join(',')`.
  *
  * **Null in, null out, and that is the whole reason this is not `toPgArray`
  * without the braces.** `makePgArray` turns a missing key into the string `'{}'`;
@@ -241,7 +247,7 @@ async function runStep(step: Step, run: ActionRun): Promise<{ done: boolean; out
   const group = field.group;
 
   /**
-   * F.2's guard, evaluated before anything else the step would do.
+   * The `when` guard, evaluated before anything else the step would do.
    *
    * **A skipped step is a no-op, not a stop**, which is what an `if` around a
    * mutation means in the Dart — `wpPullWorkspaceConfirmUF` carries its options
@@ -270,8 +276,16 @@ async function runStep(step: Step, run: ActionRun): Promise<{ done: boolean; out
       return missing.length === 0 ? carryOn : { done: true, outcome: step.message };
     }
 
-    case "confirm":
-      return (await host.confirm(step.message)) ? carryOn : { done: true, outcome: null };
+    case "confirm": {
+      // The detail is read as text, as `unpack` reads any scalar; a key holding
+      // nothing asks the static question alone rather than showing an empty box.
+      const detail = step.detailFromKey === undefined ? null : unpack(formState.getValue(group, step.detailFromKey));
+      const answer =
+        detail === null || detail === ""
+          ? await host.confirm(step.message)
+          : await host.confirm(step.message, detail);
+      return answer ? carryOn : { done: true, outcome: null };
+    }
 
     case "set":
       formState.setValue(group, step.key, evaluate(step.value, context) as never);
@@ -286,7 +300,7 @@ async function runStep(step: Step, run: ActionRun): Promise<{ done: boolean; out
       return carryOn;
 
     /**
-     * Append one value, or every element of a list value. Widened by F.6.
+     * Append one value, or every element of a list value. Widened later.
      *
      * **The list case is not a new capability so much as the removal of a silent
      * truncation.** This step used to read `unpack(evaluate(...))`, which takes
@@ -303,14 +317,14 @@ async function runStep(step: Step, run: ActionRun): Promise<{ done: boolean; out
      *
      * **A step rather than a new value form**, because what changes is what
      * *append* means when handed a list, not what a value is: `fromKeyList`
-     * already denotes a list everywhere else it appears. F.4's rule stands — two
+     * already denotes a list everywhere else it appears. The earlier rule stands — two
      * `set` steps beat a new primitive — and the same test applies here: nothing
      * new is expressible, one thing stopped being lost.
      *
      * **`removeFrom` is deliberately untouched.** Its two sites remove a single
      * selected key and no delegate removes a set, so widening it would be
-     * building for nobody — the reason I-62 gives for leaving `defaultValue`
-     * unbuilt until F.6 needed it.
+     * building for nobody — the same reason `defaultValue` was left
+     * unbuilt until a flow needed it.
      */
     case "appendUnique": {
       const list = unpackToList(formState.getValue(group, step.listKey)) ?? [];
@@ -349,8 +363,9 @@ async function runStep(step: Step, run: ActionRun): Promise<{ done: boolean; out
         if (result.statusCode === 200) {
           if (insertRows) host.close();
           // `invokeCallbacks()`, which is what makes tables on screen re-read
-          // after a write. See `FormState.onRefreshRequested`.
-          formState.requestRefresh();
+          // after a write. See `FormState.onRefreshRequested`. Not when the
+          // step says the write changes nothing they show.
+          if (step.refresh !== false) formState.requestRefresh();
           return carryOn;
         }
         if (insertRows) {

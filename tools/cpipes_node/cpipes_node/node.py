@@ -13,25 +13,25 @@ Go                            here
 ===========================  ==========================================
 sync the workspace            not this node's: the workspace files it
                               would fetch are the jetrules caches, and
-                              this node runs no rules (charter §1.3)
+                              this node runs no rules (the charter)
 default the partition label   `NodeArgs.jets_partition_label_or_default`
 SELECT the config             `ConfigSource.config_json`
 unmarshal                     `config.parse_config`
-— (the dispatch, much later)  **the scope gate, here (X6)**
+— (the dispatch, much later)  **the scope gate, here**
 find the main_input provider  `_main_input_provider`
 env, $SHARD_ID, $JETS_...     `environment`
 switch on cpipes_mode         `_file_keys`
-build and run                 `graph.run` — P9-T04
+build and run                 `graph.run`
 ===========================  ==========================================
 
-**The one row that is out of order is the scope gate, and that is X6.** In Go
+**The one row that is out of order is the scope gate, and that is deliberate.** In Go
 an unknown token is met by `BuildPipeTransformationEvaluator`'s `default:`
-branch inside a running worker — `site_operators.go` says so in terms and cites
-I-779, and the reason is structural: the registry is an argument to the node
+branch inside a running worker — `site_operators.go` says so in terms, and the reason
+is structural: the registry is an argument to the node
 while the document is seen by the starters. Here the registry and the document
 are in one process before anything opens, so the check is available at startup
 and is taken there. It is the earliest point at which it *can* run, which is
-the criterion X6 states.
+the criterion the scope rule states.
 """
 
 from __future__ import annotations
@@ -70,7 +70,7 @@ class NodeContext:
 
     The equivalent of `ComputePipesContext`, minus the six fields that are
     goroutine plumbing. It is what `graph.run` takes, and the fields on it are
-    the interface P9-T04 builds against.
+    the interface the graph builds against.
     """
 
     args: NodeArgs
@@ -117,7 +117,7 @@ def _main_input_provider(config: Any) -> Any:
 def environment(config: Any, args: NodeArgs) -> dict[str, Any]:
     """The env the expression evaluators read, with the node's two additions.
 
-    `$SHARD_ID` is the one P9-T05 derives a member index from, so that **which
+    `$SHARD_ID` is the one a site operator derives a member index from, so that **which
     node writes a member changes and what the member contains does not**.
 
     The Go source's warning travels with the code rather than being left in
@@ -175,14 +175,14 @@ def _file_keys(
     alone**. The argument for refusing the rest is unchanged: no document this
     node accepts can reach them, and writing a path no document can take is the
     class this repository has recorded thirty-seven times — a component whose own
-    tests pass and which reaches no working path (P4-I43).
+    tests pass and which reaches no working path.
 
     Where each Go arm goes:
 
     - **`reducing` with a `stage` channel on a `merge_files` pipe** reads the
       stage area with `GetS3FileKeys`, and that is implemented, because a merge
       is exactly a step whose input is a set of part files. It is reachable for
-      this pipe kind and no other, which is D-224's second limb: `stage` is not
+      this pipe kind and no other, which is the merge-pipe decision's second limb: `stage` is not
       a declared channel type, and the type is asserted rather than classified
       because `ValidatePipeSpecConfig` fixes it for a merge.
 
@@ -191,8 +191,8 @@ def _file_keys(
       and neither is in this node's declared scope
       (`cpipes_node.operators.channels` declares `generator` and `memory`), so
       `config.check_scope` has already aborted on the token. Implementing the
-      branch would mean implementing a record parser for a channel type X6
-      refuses.
+      branch would mean implementing a record parser for a channel type the scope
+      rule refuses.
 
     - **`sharding`** reads `jetsapi.compute_pipes_shard_registry`, a database
       table, for shards a sharding starter wrote. A sharding step's main input is
@@ -277,7 +277,7 @@ def _stage_file_keys(
         )
     resolved = prefixes or Prefixes()
     if not resolved.stage:
-        # **A named divergence rather than conformance, and it is P9-I66.** With
+        # **A named divergence rather than conformance, recorded as an issue.** With
         # `JETS_s3_STAGE_PREFIX` unset Go lists a prefix beginning with `/`,
         # matches no object — S3 keys under JetStore's layout carry no leading
         # slash — and merges nothing: an empty output file for a parquet merge
@@ -346,7 +346,7 @@ def _refuse_a_partition_this_node_cannot_be_reading(
     `actions_start_reducing_cp.go:190-197` lists the previous step's stage prefix,
     counts the `jets_partition=` labels under it, and returns *last step of type
     'merge_files' requires a single partition, currently has N partitons*. This
-    node is not a starter and **nothing in either repository is** (P9-I136), so
+    node is not a starter and **nothing in either repository is**, so
     a refusal that lives only in a starter is a refusal this node's deployments
     do not have. A build-time refusal is not available either: a partition
     writer cannot know how many partitions the step after it will see, and by
@@ -357,8 +357,8 @@ def _refuse_a_partition_this_node_cannot_be_reading(
     is the one `GetComputePipesPartitions` lists and the label extraction is
     `jetPartitionRe`, so any document the starter passes this node also passes,
     and the only documents refused are ones the starter would already have
-    refused. That is the judgement D-224 made for the merge's channel type and
-    D-242 made for a partition writer's bucket, taken a third time.
+    refused. That is the judgement made for the merge's channel type and
+    for a partition writer's bucket, taken a third time.
 
     **The second state is this node's addition and needs its own argument.**
     When exactly one partition exists and it is not the one this node was told
@@ -367,7 +367,7 @@ def _refuse_a_partition_this_node_cannot_be_reading(
     driver rather than a JetStore starter. The outcome without a refusal is an
     **empty merged object**, which is the one result a reader cannot tell from a
     partition that legitimately wrote nothing; that is `_stage_file_keys`' own
-    reason for refusing an unset stage prefix (P9-I66), one condition over.
+    reason for refusing an unset stage prefix, one condition over.
 
     **Nothing is refused when no partition exists at all.** A step whose
     partition wrote nothing writes no directory, so the set is empty, and
@@ -409,7 +409,7 @@ def _has_bytes(store: ObjectStore, key: str) -> bool:
     has no `size()` and adding one for this would put a method on the seam that
     only this function uses. The cost is that the object is read twice on the
     merge path; it is stated rather than hidden, and what would remove it is a
-    listing that carried sizes — which is P9-T07's writer's question as much as
+    listing that carried sizes — which is the partition writer's question as much as
     this one's.
     """
     return len(store.get(key)) > 0
@@ -466,7 +466,7 @@ def _writer_results(result: Any) -> tuple[Any, ...]:
     reports on every path.
 
     **Until 2026-09-29 a graph run reported no edge at all**, which this
-    docstring called a hole with an owner (P9-I67) - the writer had not been
+    docstring called a hole with an owner - the writer had not been
     built. The writer was built and the hole stayed: the first completed deployed
     run (2423) wrote four `pipeline_execution_details` rows with
     `output_records_count` 0, so the execution stats screen showed the corpus
@@ -507,6 +507,34 @@ def _writer_results(result: Any) -> tuple[Any, ...]:
     )
 
 
+def _register_node_error(
+    effects: Any, config: Any, args: NodeArgs, error: BaseException
+) -> None:
+    """Record a refusal at the start, logging rather than raising if that fails.
+
+    `CoordinateComputePipes`' `gotError:` label, in its order: no row without
+    the run's arguments (`cpConfig.CommonRuntimeArgs == nil` returns the error
+    unrecorded), and a failure to write the row is a warning, so the error the
+    caller sees is always the node's own. The error itself is not logged here,
+    as Go logs it, because this node raises it and its caller reports it.
+    """
+    common = getattr(config, "common_runtime_args", None)
+    if common is None:
+        return
+    session_id = getattr(common, "session_id", "") or ""
+    try:
+        effects.register_node_error(
+            error, cpipes_step_id=str(getattr(common, "read_step_id", "") or "")
+        )
+    except Exception as exc:
+        log.warning(
+            "%s node %d WARNING while registering node error: %s",
+            session_id,
+            args.node_id,
+            exc,
+        )
+
+
 def coordinate(
     args: NodeArgs,
     config_source: ConfigSource,
@@ -520,37 +548,51 @@ def coordinate(
     """Run one compute pipes node, and record what it did.
 
     Raises before doing any work when the document names an operator outside
-    the declared scope (X6), and again — distinguishably — when it names one
+    the declared scope, and again — distinguishably — when it names one
     this node declares and has not built.
 
     **The side-effect rows bracket the run and the order is Go's.**
     `ProcessFilesAndReportStatus` inserts the `in progress` row *before* any
     work and updates it with a status afterwards whether the work succeeded or
     not, so a node that crashed is a `failed` row rather than an `in progress`
-    one nothing ever closes. Everything the scope gate refuses happens **before**
-    the INSERT, which is deliberate: a document this node will not run is a run
-    that never started, and a `pipeline_execution_details` row for it would say
-    otherwise.
+    one nothing ever closes.
+
+    **A refusal before the INSERT is a `failed` row too, as in Go.** The scope
+    gate, the environment and the file keys are all resolved before `begin()`,
+    and an error from any of them is recorded by
+    `SideEffects.register_node_error`, which is `RegisterNodeError` — what
+    `CoordinateComputePipes`' `gotError:` label calls for every error after the
+    config is unmarshalled. Without it the error reaches the Lambda's own result
+    and never the pipeline status's node error message. A document that cannot
+    be read or parsed records nothing, which is also Go's rule: without the
+    config there is no run identity to write the row against. Until 2026-11-19
+    this docstring held the opposite, that a document the scope gate refuses
+    should leave no row because the run never started; the Go node records a
+    row for the same class of refusal, and the two engines now agree.
     """
     config = parse_config(config_source.config_json(args.pipeline_execution_key))
-
-    report = check_scope(config, site_operators=site_operators)
-    report.raise_if_out_of_scope()
-    report.raise_if_unimplemented()
-
-    ctx = NodeContext(
-        args=args,
-        settings=settings,
-        config=config,
-        scope_report=report,
-        site_operators=site_operators,
-        store=store,
-        env=environment(config, args),
-        prefixes=prefixes or Prefixes.from_env(),
-    )
-    ctx.input_file_keys = _file_keys(config, args, store, ctx.prefixes)
-
     effects = side_effects_for(config, args, connection)
+
+    try:
+        report = check_scope(config, site_operators=site_operators)
+        report.raise_if_out_of_scope()
+        report.raise_if_unimplemented()
+
+        ctx = NodeContext(
+            args=args,
+            settings=settings,
+            config=config,
+            scope_report=report,
+            site_operators=site_operators,
+            store=store,
+            env=environment(config, args),
+            prefixes=prefixes or Prefixes.from_env(),
+        )
+        ctx.input_file_keys = _file_keys(config, args, store, ctx.prefixes)
+    except Exception as exc:
+        _register_node_error(effects, config, args, exc)
+        raise
+
     effects.begin()
     reporter = side_effects.MetricsReporter.for_config(effects, config)
     error: BaseException | None = None

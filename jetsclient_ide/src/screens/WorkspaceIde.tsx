@@ -20,7 +20,13 @@ import { useNavigate, useParams } from "react-router-dom";
 
 import type { ApiClient } from "../api/client";
 import { SessionExpiredError } from "../api/client";
-import { WorkspaceApi, fileNameOf, type WorkspaceNode, type WorkspaceSummary } from "../api/workspace";
+import {
+  WorkspaceApi,
+  describeSaveWarnings,
+  fileNameOf,
+  type WorkspaceNode,
+  type WorkspaceSummary,
+} from "../api/workspace";
 import { FileTree } from "../components/FileTree";
 import { Editor } from "../editor/Editor";
 import { isServerValidatedJson, languageNameFor } from "../editor/language";
@@ -28,6 +34,12 @@ import { BuildInfoText, useBuildInfoInScreenBar } from "../shell/buildInfoFooter
 import { ActionButton } from "../shell/capabilities";
 import { useNotifications } from "../shell/notifications";
 import { usePrompts } from "../shell/prompts";
+import {
+  WORKSPACE_GUIDE_LABEL,
+  describesWorkspace,
+  openWorkspaceGuide,
+  useWorkspaceManifest,
+} from "../shell/workspaceGuide";
 import { CompiledView } from "./CompiledView";
 import { WorkspaceChanges } from "./WorkspaceChanges";
 import { WorkspaceToolbar } from "./WorkspaceToolbar";
@@ -100,6 +112,12 @@ type Tab =
       saved: string;
       current: string;
       size: number;
+      /**
+       * The node's `read_only` (`wsfile.IsReadOnly`): shown, never saved. It is
+       * set on a `.md` or `.mdx` file outside `docs/`, other than the
+       * workspace's root README.
+       */
+      readOnly: boolean;
     }
   | {
       kind: "view";
@@ -142,6 +160,13 @@ export function WorkspaceIde({ api }: { api: ApiClient }) {
   const [busy, setBusy] = useState(false);
   /** The shell's footer text, drawn in this screen's status bar instead (D05). */
   const buildInfo = useBuildInfoInScreenBar();
+  /**
+   * The installation's workspace guide, when its image was built with one. The
+   * *Workspace guide* button is shown only when it describes the workspace open
+   * here (`workspaceGuide.ts`).
+   */
+  const guideManifest = useWorkspaceManifest(api, workspace);
+  const hasGuide = describesWorkspace(guideManifest, workspace);
 
   const canEdit = api.can(WORKSPACE_IDE);
   const activeTab = useMemo(
@@ -278,6 +303,7 @@ export function WorkspaceIde({ api }: { api: ApiClient }) {
             saved: file.content,
             current: file.content,
             size: node.size,
+            readOnly: node.read_only === true,
           },
         ]);
         setActiveKey(`file:${file.fileName}`);
@@ -366,7 +392,7 @@ export function WorkspaceIde({ api }: { api: ApiClient }) {
     // A compiled view is read-only by construction: it shows what the compiler
     // produced, and the way to change it is to edit the sources below the
     // heading. Save is disabled on it rather than silently doing nothing.
-    if (!tab || tab.kind !== "file" || tab.current === tab.saved || !canEdit) return;
+    if (!tab || tab.kind !== "file" || tab.current === tab.saved || !canEdit || tab.readOnly) return;
 
     // The server parses .json before writing, so catch it here and point at the
     // problem rather than surfacing a bare 400.
@@ -386,15 +412,36 @@ export function WorkspaceIde({ api }: { api: ApiClient }) {
     setBusy(true);
     setError(null);
     void guard(async () => {
-      await workspaceApi.saveFile(workspace, tab.fileName, tab.current);
+      const { warnings } = await workspaceApi.saveFile(workspace, tab.fileName, tab.current);
       setTabs((prev) =>
         prev.map((t) =>
           t.kind === "file" && t.fileName === tab.fileName ? { ...t, saved: t.current } : t,
         ),
       );
-      setStatus(`Saved ${tab.label}`);
+      // The file is saved either way; warnings are what its validator found
+      // and did not refuse, shown in the warning colours until dismissed.
+      if (warnings.length > 0) {
+        setStatus(describeSaveWarnings(tab.label, warnings), "warn");
+      } else {
+        setStatus(`Saved ${tab.label}`);
+      }
     }).finally(() => setBusy(false));
   }, [activeKey, canEdit, guard, setError, setStatus, tabs, workspace, workspaceApi]);
+
+  /**
+   * Opens the guide's page for the file in the editor, else its landing page, in
+   * the documentation tab *Help* uses. A failure goes to the banner, as *Help*'s
+   * does.
+   */
+  const openGuide = useCallback(() => {
+    void openWorkspaceGuide({
+      workspace,
+      fileName: activeFile,
+      openDocsSession: () => api.openDocsSession(),
+    }).then((message) => {
+      if (message !== null) setError(message);
+    });
+  }, [activeFile, api, setError, workspace]);
 
   const onChange = useCallback(
     (value: string) => {
@@ -428,11 +475,39 @@ export function WorkspaceIde({ api }: { api: ApiClient }) {
         {busy && <span className="pill">Working…</span>}
         {!canEdit && <span className="pill pill-warn">Read only — no {WORKSPACE_IDE}</span>}
 
+        {/*
+          Beside Save rather than in the toolbar below: the toolbar's buttons are
+          registry actions authored in a table document (WorkspaceToolbar.tsx),
+          and this one is not; and it belongs to what this bar already holds, the
+          workspace picked and the file open. Not gated on workspace_ide, since
+          the guide is readable by every signed-in user.
+        */}
+        {hasGuide && (
+          <button
+            type="button"
+            className="btn btn-secondary"
+            onClick={openGuide}
+            title={
+              activeFile !== null
+                ? "Open this file's page in the workspace's guide"
+                : "Open the workspace's guide"
+            }
+          >
+            {WORKSPACE_GUIDE_LABEL}
+          </button>
+        )}
+
         <ActionButton
           capability={WORKSPACE_IDE}
           className="btn btn-primary"
           onClick={save}
-          disabled={!activeTab || activeTab.kind !== "file" || activeTab.current === activeTab.saved || busy}
+          disabled={
+            !activeTab ||
+            activeTab.kind !== "file" ||
+            activeTab.readOnly ||
+            activeTab.current === activeTab.saved ||
+            busy
+          }
         >
           Save
         </ActionButton>
@@ -487,11 +562,19 @@ export function WorkspaceIde({ api }: { api: ApiClient }) {
               onFilesChanged={refreshTree}
             />
           ) : activeTab ? (
+            /*
+              `content` is the tab's current text, not its saved text: the editor
+              makes a fresh state for each file it is shown (`I-65`, 2026-10-27),
+              so switching back to a tab must show the edits it still holds.
+              Until then it was `saved`, and the switch's replace transaction
+              reset `current` to it through `onChange`, so unsaved edits were
+              dropped silently by leaving the tab and coming back.
+            */
             <Editor
               docKey={activeTab.fileName}
               fileName={activeTab.label}
-              content={activeTab.saved}
-              readOnly={!canEdit}
+              content={activeTab.current}
+              readOnly={!canEdit || activeTab.readOnly}
               onChange={onChange}
               onSave={save}
             />
@@ -536,6 +619,7 @@ export function WorkspaceIde({ api }: { api: ApiClient }) {
                   <span title={activeTab.label}>{activeTab.label}</span>
                   <span className="spacer" />
                   <span>{languageNameFor(activeTab.label)}</span>
+                  {activeTab.readOnly && <span>Read only</span>}
                   <span>{activeTab.current.length.toLocaleString()} chars</span>
                   <span>{activeTab.current !== activeTab.saved ? "Modified" : "Saved"}</span>
                 </>

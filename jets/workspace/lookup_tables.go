@@ -14,6 +14,11 @@ import (
 	"github.com/artisoft-io/jetstore/jets/csv"
 	"github.com/artisoft-io/jetstore/jets/jetrules/rdf"
 	"github.com/artisoft-io/jetstore/jets/jetrules/rete"
+
+	// The "sqlite" driver lookup.db is written and fingerprinted with. It was
+	// registered by the Go engine's lookup table manager until that engine's
+	// deletion (October 2026), which this package relied on without importing it.
+	_ "modernc.org/sqlite"
 )
 
 // This file contains functions to package lookup tables into lookup.db
@@ -144,9 +149,9 @@ func buildLookupDb(tables []*rete.LookupTableNode, wsDir, dbPath, fingerprint, s
 			}
 			// Prepare the insert statement
 			var buf strings.Builder
-			buf.WriteString("INSERT INTO \"")
-			buf.WriteString(lookupTbl.Name)
-			buf.WriteString("\" VALUES ")
+			buf.WriteString("INSERT INTO ")
+			buf.WriteString(sqliteIdent(lookupTbl.Name))
+			buf.WriteString(" VALUES ")
 			outputRec := make([]string, len(lookupTbl.Columns)+2)
 			var keyPos []int
 			// Determine the position of the key columns
@@ -208,8 +213,8 @@ func buildLookupDb(tables []*rete.LookupTableNode, wsDir, dbPath, fingerprint, s
 							outputRec[i+2] = val
 						case "bool":
 							// Empty is null and anything outside the accepted
-							// spellings stops the compile, naming where (I-45).
-							// Both engines serve a NULL bool column as rdf null.
+							// spellings stops the compile, naming where.
+							// The engine serves a NULL bool column as rdf null.
 							b, err := rdf.ParseBool(val)
 							switch {
 							case errors.Is(err, rdf.ErrNullBool):
@@ -263,11 +268,26 @@ func quote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }
 
+// sqliteIdent quotes name as an SQL identifier: in double quotes, with an
+// embedded double quote doubled. Go's %q is not SQL quoting: it writes a
+// backslash escape for a double quote, a backslash or a non-printable
+// character, which SQLite reads as part of the name or as the end of it.
+//
+// For a name holding none of those, the two spell it the same, byte for byte.
+// That is why moving the CREATE statements off %q needed no
+// lookupDbFormatVersion bump, although their text is stored in lookup.db's
+// sqlite_schema: on 2026-11-14 every lookup table and column name in four
+// workspaces (52 tables, 172 columns) gave the same statements both ways.
+func sqliteIdent(name string) string {
+	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+}
+
 func makeCreateStatement(lookupTbl *rete.LookupTableNode) string {
 	var buf strings.Builder
+	tbl := sqliteIdent(lookupTbl.Name)
 
-	buf.WriteString(fmt.Sprintf("DROP TABLE IF EXISTS %q;\n", lookupTbl.Name))
-	buf.WriteString(fmt.Sprintf("CREATE TABLE %q (\n", lookupTbl.Name))
+	buf.WriteString("DROP TABLE IF EXISTS " + tbl + ";\n")
+	buf.WriteString("CREATE TABLE " + tbl + " (\n")
 	buf.WriteString("    __key__            INTEGER,\n")
 	buf.WriteString("    \"jets:key\"         TEXT NOT NULL,\n")
 	isFirst := true
@@ -278,12 +298,12 @@ func makeCreateStatement(lookupTbl *rete.LookupTableNode) string {
 		isFirst = false
 		// Convert jetrule type to sql type
 		sqlType := convertJetruleType(col.Type)
-		buf.WriteString(fmt.Sprintf("    %q %s", col.Name, sqlType))
+		buf.WriteString("    " + sqliteIdent(col.Name) + " " + sqlType)
 	}
 	buf.WriteString(");\n")
 
-	buf.WriteString(fmt.Sprintf("CREATE INDEX IF NOT EXISTS %q ON %q (\"jets:key\");\n", lookupTbl.Name+"_idx", lookupTbl.Name))
-	buf.WriteString(fmt.Sprintf("CREATE INDEX IF NOT EXISTS %q ON %q (__key__);\n", lookupTbl.Name+"_key_idx", lookupTbl.Name))
+	buf.WriteString("CREATE INDEX IF NOT EXISTS " + sqliteIdent(lookupTbl.Name+"_idx") + " ON " + tbl + " (\"jets:key\");\n")
+	buf.WriteString("CREATE INDEX IF NOT EXISTS " + sqliteIdent(lookupTbl.Name+"_key_idx") + " ON " + tbl + " (__key__);\n")
 
 	return buf.String()
 }

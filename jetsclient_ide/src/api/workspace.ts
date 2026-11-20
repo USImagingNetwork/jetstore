@@ -32,21 +32,27 @@ export interface WorkspaceNode {
    * the compiler reads — `wsfile.WorkspaceSections` is where the predicate and
    * the three current values live.
    *
-   * **Read by `screens/sectionContract.ts` as of C.3**, which is what this
+   * **Read by `screens/sectionContract.ts` since 2026-08-25**, which is what this
    * paragraph was waiting for. The Workspace IDE shows a workspace from both
    * sides of the compiler: the nodes below a heading are the source files, and
    * the heading itself is a view of the compiled artifact. This app rendered only
    * the first half until 2026-08-25; it now renders `data_model` and `jet_rules`,
-   * and `lookups` is C.3a.
+   * and `lookups`.
    *
    * **The field was mirrored here before anything read it, and that turned out to
    * be worth it** — the value of a mirror that omits nothing is that the next
-   * reader does not have to re-derive the field, and C.3 was that reader. What it
+   * reader does not have to re-derive the field, and `sectionContract.ts` was that reader. What it
    * does *not* say is whether this app renders a view for the value: the server
    * answers *does this section have one*, `sectionContract.ts` answers *do we draw
-   * it*, and C.1 removed the Flutter client's conflation of the two.
+   * it*, and an earlier change removed the Flutter client's conflation of the two.
    */
   compiled_view?: string;
+  /**
+   * Set on a file the IDE shows and does not save, absent otherwise
+   * (`wsfile.ReadOnlySuffixes`; a workspace's READMEs, 2026-10-27). The server
+   * refuses a save of one too, so this is what keeps the editor from offering it.
+   */
+  read_only?: boolean;
   route_path: string;
   route_params: Record<string, string> | null;
   children: WorkspaceNode[] | null;
@@ -70,7 +76,7 @@ export interface WorkspaceSummary {
  * `fileKeyLabelRe` comes back in the same response and is the pattern the
  * `fileKeyLabel` cell filter uses (`actions/registry.ts`). The Flutter app reads
  * it here too, at sign-in (`modules/actions/user_delegates.dart:107`,
- * `globalWorkspaceFileKeyLabelRe`); this app had no equivalent until F.0a needed
+ * `globalWorkspaceFileKeyLabelRe`); this app had no equivalent until the flow runner needed
  * the workspace name from the same call.
  */
 export interface ActiveWorkspace {
@@ -166,7 +172,7 @@ export class WorkspaceApi {
    * `FlowStore.readText` was constructing `{ label, key } as never` and passing
    * it in — a shape with no `type` — so every load through it would have thrown
    * *"…is not a file"* against the real API. Nothing said so because the store's
-   * tests stub `WorkspaceApi` and their stub keys off `node.key` (I-65).
+   * tests stub `WorkspaceApi` and their stub keys off `node.key`.
    *
    * A flow's documents are addressed by path and not by browsing, so the honest
    * fix is this method rather than a synthetic node. The tree is still how the
@@ -192,7 +198,7 @@ export class WorkspaceApi {
    * **Same content as `readWorkspaceFile`, a different capability, and that is
    * the whole reason it exists.** `get_workspace_file_content` gates on
    * `workspace_ide`, which `jets_init_db.sql` grants to `knowledge_engineer`
-   * alone. Once the eleven flows became workspace assets, the runner read its
+   * alone. Once the eleven flows became workspace assets (2026-08-26), the runner read its
    * documents at run time — so opening a flow required the IDE's capability, and
    * `ops_user` and `client_advocate`, the roles the flows are *for*, were refused.
    *
@@ -219,14 +225,55 @@ export class WorkspaceApi {
    * Save. The server validates any `.json` file before writing (it refuses to
    * persist one that will not parse), so a 400 here is frequently a real syntax
    * error in the buffer rather than a transport problem — worth surfacing verbatim.
+   *
+   * A save the server accepts may still carry **warnings**: findings of the
+   * file's validator that do not refuse it, such as a pipeline configuration
+   * key the run ignores (`checkWorkspaceFile`,
+   * `jets/datatable/workspace_file_validators.go`). The response gained the
+   * field in November 2026; a server without it answers no warnings.
    */
-  async saveFile(workspaceName: string, fileName: string, content: string): Promise<void> {
-    await this.api.dataTable({
+  async saveFile(workspaceName: string, fileName: string, content: string): Promise<SaveResult> {
+    const body = await this.api.dataTable<{ warnings?: unknown }>({
       action: "save_workspace_file_content",
       workspaceName,
       data: [{ file_name: fileName, file_content: content }],
     });
+    return { warnings: Array.isArray(body?.warnings) ? (body.warnings as SaveFinding[]) : [] };
   }
+}
+
+/**
+ * Mirrors wsvalidate.Finding (jets/wsvalidate/wsvalidate.go): `path` is a JSON
+ * Pointer into the document and `line` a 1-based line, each present only where
+ * the finding has one.
+ */
+export interface SaveFinding {
+  severity: "error" | "warning";
+  code: string;
+  message: string;
+  path?: string;
+  line?: number;
+}
+
+/** What a successful save answers. */
+export interface SaveResult {
+  warnings: SaveFinding[];
+}
+
+/**
+ * The text a save's warnings are shown with: a first line naming the file, then
+ * one line per warning, its coordinate first where it has one, in the form the
+ * server writes a refusal's (`describeFindings`, same file as
+ * `checkWorkspaceFile`): `/a/b: message`, `line 12: message`, `/a/b:12: message`.
+ */
+export function describeSaveWarnings(label: string, warnings: SaveFinding[]): string {
+  const lines = warnings.map((w) => {
+    let where = w.path ?? "";
+    if (w.line && w.line > 0) where = where !== "" ? `${where}:${w.line}` : `line ${w.line}`;
+    return where !== "" ? `  ${where}: ${w.message}` : `  ${w.message}`;
+  });
+  const count = warnings.length === 1 ? "1 warning" : `${warnings.length} warnings`;
+  return [`Saved ${label}, with ${count}:`, ...lines].join("\n");
 }
 
 /** The escaped relative path for a file node, or null for anything else. */

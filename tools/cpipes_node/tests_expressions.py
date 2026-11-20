@@ -104,12 +104,12 @@ def test_nbr_rows_is_substituted_then_parsed():
 
 
 def test_nbr_rows_does_no_arithmetic_which_is_what_d_217_rests_on():
-    """The measurement D-217 is ruled on, asserted rather than described.
+    """The measurement the row-count ruling rests on, asserted rather than described.
 
     `ToIntWithEnv` is `String2Int(ReplaceEnvVars(v, env))`. There is no
     expression, so a document cannot divide a household count by a node count and
     every node of a generator step is told the same `nbr_rows`. If this ever
-    stops raising, the ceiling can move into the pipeline and D-217's shape is
+    stops raising, the ceiling can move into the pipeline and the ruling's shape is
     open again.
     """
     env = {"$HOUSEHOLDS": "1000", "$NODES": "4"}
@@ -268,7 +268,7 @@ def test_an_unsupported_operator_is_refused_by_name_and_names_its_owner():
         evaluate_when(binary(value("1"), "+", value("2")), {})
     message = str(exc.value)
     assert "'+'" in message
-    assert "P9-T06" in message
+    assert "the expression and column evaluator work" in message
     # And the message says what the subset *is*, so the author can tell a typo
     # from a token this node has not taken on.
     assert "IN_NO_CASE" in message
@@ -276,7 +276,7 @@ def test_an_unsupported_operator_is_refused_by_name_and_names_its_owner():
 
 def test_an_unsupported_leaf_type_is_refused_by_name():
     for leaf in ("expr_proxy", "function"):
-        with pytest.raises(ExpressionUnsupported, match="P9-T06"):
+        with pytest.raises(ExpressionUnsupported, match="the expression and column evaluator work"):
             evaluate_when(Node(type=leaf, expr="x"), {})
     with pytest.raises(ExpressionUnsupported, match="leaf node type"):
         evaluate_when(Node(type="not_a_leaf", expr="x"), {})

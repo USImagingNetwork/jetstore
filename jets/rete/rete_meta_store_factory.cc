@@ -32,14 +32,8 @@ ReteMetaStoreFactory::ReteMetaStoreFactory()
 
 
 int
-ReteMetaStoreFactory::load_database(std::string const& jetrule_rete_db, std::string const& lookup_data_db,
-  RetractionMode mode)
+ReteMetaStoreFactory::load_database(std::string const& jetrule_rete_db, std::string const& lookup_data_db)
 {
-  this->retraction_mode_ = mode;
-  if(not mode.is_legacy()) {
-    LOG(INFO) << "Load Workspace DB: retraction mode " << mode.label()
-              << " -- LEGACY defects turned off, for a rules unit test only";
-  }
   VLOG(1) << "Current path is " << std::filesystem::current_path();
   // Open database -- check that db exists
   this->jetrule_rete_db_ = jetrule_rete_db;
@@ -142,7 +136,7 @@ ReteMetaStoreFactory::load_database(std::string const& jetrule_rete_db, std::str
     // Create the ReteMetaStore
     // create & initalize the meta store
     auto rete_meta_store = rete::create_rete_meta_store(lookup_sql_helper, alpha_nodes, node_vertexes);
-    err = rete_meta_store->initialize(this->retraction_mode_);
+    err = rete_meta_store->initialize();
     if(err) {
       LOG(ERROR) << "Load Workspace DB: ERROR while initializing meta store "<<item.first;
       return err;
@@ -260,7 +254,7 @@ ReteMetaStoreFactory::read_resources_cb(int argc, char **argv, char **colnm)
   
   if( strcmp(type, "bool") == 0) {
     // A rule-file bool literal: empty is null, anything outside the accepted
-    // spellings refuses to load (I-45). The compiler refuses it first, naming
+    // spellings refuses to load. The compiler refuses it first, naming
     // the file and line; this is the backstop.
     switch(rdf::parse_bool(std::string_view(value))) {
     case rdf::ParsedBool::True:  this->r_map_.insert({key, this->rmgr_->create_literal(true)}); return SQLITE_OK;

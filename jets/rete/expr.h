@@ -36,18 +36,20 @@ class ReteSession;
 // exception under its on_error policy. truth_of is v's truth when a rule tests
 // it: text is read with rdf::parse_bool, and text outside the accepted
 // spellings raises an exception and sets ok to false, which the caller turns
-// into a null result. Empty text is null, false with no exception (I-45).
+// into a null result. Empty text is null, false with no exception.
 // Defined in rete_session.cc, where ReteSession is complete.
 void raise_exception(ReteSession * rs, std::string const& msg);
 bool truth_of(ReteSession * rs, rdf::RdfAstType const& v, bool & ok);
 
-// Utility function for operators that need to get a graph rdf::r_index
+// Utility function for operators that need to get a graph rdf::r_index.
+// A name the session does not hold maps to nullptr: a resource built by
+// create_resource or create_uuid_resource and not yet asserted is one.
 inline 
 std::pair<rdf::r_index, rdf::r_index>
-get_resources(rdf::RManager *rmgr, std::string && lhs, std::string && rhs)
+get_resources(rdf::RManager *rmgr, std::string const& lhs, std::string const& rhs)
 {
-  auto * l = rmgr->get_resource(std::forward<std::string>(lhs));
-  auto * r = rmgr->get_resource(std::forward<std::string>(rhs));
+  auto * l = rmgr->get_resource(lhs);
+  auto * r = rmgr->get_resource(rhs);
   return {l, r};
 }
 
@@ -92,9 +94,8 @@ class ExprBase {
    * consequent carrying one records the triples it inferred on its beta row, and
    * retraction replays that record instead of evaluating the expression again (see
    * ReteSession::compute_consequent_triples). Operators that read the graph -- exist,
-   * size_of, the aggregates -- are deliberately NOT in the set: their consequents are
-   * still recomputed on retraction, which is a known defect that rule sets depend on
-   * (jets/jetrules/rete/README.md, 2026-10-09).
+   * size_of, the aggregates -- are not in the set: they mint nothing, and their
+   * consequents record for the reason reads_graph gives.
    */
   virtual bool
   mints_resource()const
@@ -107,11 +108,9 @@ class ExprBase {
    * size_of, the aggregates (min_of, max_of, sorted_head, sum_values, join_values),
    * lookup or multi_lookup.
    *
-   * Evaluating such an expression after the graph has moved gives a different value.
-   * In the legacy retraction mode this is not consulted, and such a consequent is
-   * recomputed on retraction -- LEGACY defect 1. A meta store initialized with
-   * RetractionMode::replay_graph_reading_consequents, which only the rules unit test
-   * harness builds, records it as it records a minting one. The wide predicate of
+   * Evaluating such an expression after the graph has moved gives a different value,
+   * so a consequent holding one records what it inferred, as a minting one does, and
+   * retraction replays the record rather than recomputing it. The wide predicate of
    * 1d993844 (is_row_pure) is (not mints_resource() and not reads_graph()).
    */
   virtual bool

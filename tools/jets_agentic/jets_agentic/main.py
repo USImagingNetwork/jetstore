@@ -1,8 +1,8 @@
-"""The `jets-agentic generate` command (A1.7).
+"""The `jets-agentic generate` command.
 
-One command, emitters registered so items 2a and 3 extend the registry rather
-than edit the command (§4, deliverable 2). Outputs land in
-`jets/workspace_assets/data_model/` (§3.9) and are committed — the generator
+One command, emitters registered so a new emitter extends the registry rather
+than edits the command. Outputs land in
+`jets/workspace_assets/data_model/` and are committed — the generator
 stays off the deployment path and out of the client's toolchain.
 """
 
@@ -14,16 +14,16 @@ from pathlib import Path
 
 from . import ddl, header, jr, phi, schema, sidecar, toolsig
 
-# The emitter registry: (repo-root-relative output path, emitter). Item 3's
+# The emitter registry: (repo-root-relative output path, emitter). The
 # glossary and tool-signature emitters append here. Workspace-installed
-# assets live under jets/workspace_assets/ (A21.1); the audit DDL lands in
+# assets live under jets/workspace_assets/; the audit DDL lands in
 # the Go package that go:embeds it, which cannot cross package directories.
 EMITTERS: list[tuple[str, object]] = [
     ("jets/workspace_assets/data_model/jets_agentic.jr", jr.emit),
     ("jets/workspace_assets/data_model/jets_agentic.meta.json", sidecar.emit),
     ("jets/workspace_assets/data_model/jets_agentic.schema.json", schema.emit),
     ("jets/agentic/audit/agent_audit.sql", ddl.emit),
-    # AE.2: the data_classification markers as data, beside the DDL and for
+    # The data_classification markers as data, beside the DDL and for
     # the same reason -- the package that consumes it is the package it has
     # to live in.
     ("jets/agentic/audit/data_classification.go", phi.emit),
@@ -34,7 +34,7 @@ EMITTERS: list[tuple[str, object]] = [
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_OUT = REPO_ROOT
 
-# A21.7. `jets/workspace_assets/data_model/` is installed into client
+# `jets/workspace_assets/data_model/` is installed into client
 # workspaces wholesale by `jets/workspace_assets/install.go`, whose embed glob
 # takes every `.jr` and `.json` in it — so a file arriving there by any route
 # reaches every client. --check therefore accounts for the whole directory, not
@@ -48,13 +48,13 @@ DEFAULT_OUT = REPO_ROOT
 # entry rather than widening this one.
 ASSET_DIR = "jets/workspace_assets/data_model"
 HAND_AUTHORED = {
-    # The platform base model (A21.6). Hand-authored in JetStore rather than
+    # The platform base model. Hand-authored in JetStore rather than
     # generated, JetStore-owned all the same, and installed by the same step —
     # which is what makes the six divergent copies non-authoritative.
     "jets_model.jr",
 }
 NOT_INSTALLED = {
-    # JetStore's own documentation of the convention (A1.10, A21.4). The embed
+    # JetStore's own documentation of the convention. The embed
     # glob excludes it; this list is what makes that deliberate rather than
     # incidental.
     "README.md",
@@ -76,18 +76,18 @@ def main(argv: list[str] | None = None) -> int:
         "--check",
         action="store_true",
         help="compare against the committed outputs instead of writing; "
-        "exit nonzero on any difference (the CI shape of I-9)",
+        "exit nonzero on any difference",
     )
     compile_cmd = sub.add_parser(
         "compile",
         help="compile the emitted .jr in a throwaway workspace and assert the "
-        "class, vocabulary and round-trip properties (A1.8, A1.9)",
+        "class, vocabulary and round-trip properties",
     )
     compile_cmd.add_argument("--keep", action="store_true", help="keep the throwaway workspace")
     precheck_cmd = sub.add_parser(
         "precheck",
         help="fail with the colliding names if any emitted class or property "
-        "name is already taken in a target workspace's workspace.db (A1.11); "
+        "name is already taken in a target workspace's workspace.db; "
         "run before the first install",
     )
     precheck_cmd.add_argument(
@@ -174,7 +174,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def check_asset_dir(out: Path) -> list[str]:
-    """A21.7's second half: the installed set is the directory's contents, so
+    """The installed set is the directory's contents, so
     the directory is what has to be accounted for."""
     directory = out / ASSET_DIR
     if not directory.is_dir():
@@ -189,7 +189,7 @@ def check_asset_dir(out: Path) -> list[str]:
                 problems.append(
                     f"{ASSET_DIR}/{path.name} has lost its {header.TOKEN} header, which "
                     f"is what the install guard reads to tell a JetStore file from a "
-                    f"client's (A21.4)"
+                    f"client's"
                 )
             continue
         problems.append(

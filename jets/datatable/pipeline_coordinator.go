@@ -23,7 +23,7 @@ import (
 // the schema provider json for the post map pipeline.
 //
 // The pipeline_coordinator_map_items table contains the list of the tasks that are being coordinated for
-// each request_id, their status and their pe_key to link them to the executions of the cgt_sqs_listener.
+// each request_id, their status and their pe_key to link them to the executions of a client's SQS listener.
 //
 // The pipeline_coordinator_lock table is used to lock the coordination for a request_id to avoid race conditions
 // in submitting the post map pipeline execution.
@@ -50,33 +50,20 @@ func (ca *StatusUpdate) updatePipelineCoordinator(sessionId string, schemaProvid
 	} else {
 		log.Printf("%s Found pipeline_coordinator_map with status %s, nbr_tasks %d for request_id %s\n", sessionId, mapStatus, nbrTasks, schemaProvider.RequestID)
 	}
-	switch ca.Status {
-	case "failed":
-		log.Printf("%s Task failed for request_id %s, updating pipeline_coordinator_map to failed\n", sessionId, schemaProvider.RequestID)
-		// Fail the coordination if not already failed
-		if mapStatus != "failed" {
-			updateStmt := `UPDATE jetsapi.pipeline_coordinator_map SET status = 'failed' WHERE request_id = $1`
-			_, err = ca.Dbpool.Exec(context.Background(), updateStmt, schemaProvider.RequestID)
-			if err != nil {
-				err = fmt.Errorf("%s while updating pipeline_coordinator_map to failed for request_id %s: %v\n", sessionId, schemaProvider.RequestID, err)
-				log.Println(err)
-				return err
-			}
-			log.Printf("%s Updated pipeline_coordinator_map to failed for request_id %s\n", sessionId, schemaProvider.RequestID)
+	// A task whose outputs are not usable fails the map, so the post map pipeline
+	// never starts on a partial output. That is "failed" and, since 2026-10-27,
+	// "interrupted", which counted as a completed task before.
+	switch {
+	case !outputsAreUsable(ca.Status):
+		log.Printf("%s Task %s for request_id %s, updating pipeline_coordinator_map to failed\n", sessionId, ca.Status, schemaProvider.RequestID)
+		// The map failed whichever status failed it, so the notification is
+		// a failure's: notifyApiGateway chooses its template on "failed".
+		notice := *ca
+		notice.Status = "failed"
+		if len(notice.FailureDetails) == 0 && ca.Status != "failed" {
+			notice.FailureDetails = fmt.Sprintf("task %s of the map ended %s", sessionId, ca.Status)
 		}
-		// Insert in pipeline_coordinator_lock, if successful notify the API Gateway of the failure using schemaEventJson for notification
-		err = insertPipelineCoordinatorLock(ca.Dbpool, schemaProvider.RequestID, sessionId)
-		if err == nil {
-			// Lock successful, perform notification using schemaEventJson as the schema provider for the notification
-			log.Printf("%s Inserted lock for request_id %s, performing failure notification\n", sessionId, schemaProvider.RequestID)
-			sp := &SchemaProviderShort{}
-			err = json.Unmarshal([]byte(schemaEventJson), sp)
-			if err != nil {
-				log.Printf("%s while unmarshalling schema_provider_json for request_id %s: %v\n", sessionId, schemaProvider.RequestID, err)
-				return err
-			}
-			ca.notifyApiGateway(sp)
-		}
+		return failPipelineCoordinatorMap(ca.Dbpool, schemaProvider.RequestID, sessionId, mapStatus, schemaEventJson, &notice)
 	default:
 		// Insert in pipeline_coordinator_map_items
 		// Count the nbr of rows in pipeline_coordinator_map_items for the request_id.
@@ -120,6 +107,40 @@ func (ca *StatusUpdate) updatePipelineCoordinator(sessionId string, schemaProvid
 			}
 		}
 	}
+	return nil
+}
+
+// failPipelineCoordinatorMap sets the map of requestId failed, unless mapStatus
+// says it already is, and sends the failure notice if this call takes the map's
+// lock, so a map announces its failure once however many of its tasks fail.
+// postMapEventJson is the map's schema_provider_json, read for the notification
+// overrides; notice is the failure to announce, with Status "failed". sessionId
+// names who takes the lock.
+func failPipelineCoordinatorMap(dbpool *pgxpool.Pool, requestId, sessionId, mapStatus, postMapEventJson string,
+	notice *StatusUpdate) error {
+	// Fail the coordination if not already failed
+	if mapStatus != "failed" {
+		updateStmt := `UPDATE jetsapi.pipeline_coordinator_map SET status = 'failed' WHERE request_id = $1`
+		_, err := dbpool.Exec(context.Background(), updateStmt, requestId)
+		if err != nil {
+			err = fmt.Errorf("%s while updating pipeline_coordinator_map to failed for request_id %s: %v\n", sessionId, requestId, err)
+			log.Println(err)
+			return err
+		}
+		log.Printf("%s Updated pipeline_coordinator_map to failed for request_id %s\n", sessionId, requestId)
+	}
+	// Insert in pipeline_coordinator_lock, if successful notify the API Gateway of the failure using postMapEventJson for notification
+	if insertPipelineCoordinatorLock(dbpool, requestId, sessionId) != nil {
+		return nil
+	}
+	// Lock successful, perform notification using postMapEventJson as the schema provider for the notification
+	log.Printf("%s Inserted lock for request_id %s, performing failure notification\n", sessionId, requestId)
+	sp := &SchemaProviderShort{}
+	if err := json.Unmarshal([]byte(postMapEventJson), sp); err != nil {
+		log.Printf("%s while unmarshalling schema_provider_json for request_id %s: %v\n", sessionId, requestId, err)
+		return err
+	}
+	notice.notifyApiGateway(sp)
 	return nil
 }
 

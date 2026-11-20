@@ -39,25 +39,42 @@ import { parseCompiledView, type CompiledViewDocument } from "./compiledView";
  * avoid — it would agree with the client whatever the server sends. Recorded
  * 2026-08-25 against `jetstore_ai` at `worktree-ui-c3-workspacehome`, and
  * identical to the copy in `jetsclient/test/workspace_section_contract_test.dart`.
+ * `provenance=` added 2026-10-27 (jetstore_maintenance_02 `AL.2`), the ninth
+ * section; the Dart copy went with `jetsclient/`, so this file and the Go test
+ * are the two ends now. `runbooks=` added 2026-11-06 (`runbooks` Phase 1, `AA.4`,
+ * jetstore#2398), the tenth section, with no compiled view. `docs=` added
+ * 2026-11-13, the eleventh: the workspace's documentation pages, with no
+ * compiled view.
+ *
+ * **The Go side reads this array** (2026-11-14,
+ * `TestTheIdeCarriesTheSameSectionDeclaration` in
+ * `jets/datatable/wsfile/sections_test.go`), and the checksum below, so a
+ * section added to the server and not here fails the Go test. Keep it an array
+ * of plain string literals joined with `"\n"`, which is what that test parses.
  */
 export const SERVER_SECTION_DECLARATION = [
   "data_model=data_model",
   "jet_rules=jet_rules",
   "lookups=lookups",
   "pipes_config=",
+  "provenance=",
   "user_flows=",
   "table_configs=",
   "process_config=",
   "reports=",
+  "runbooks=",
+  "docs=",
   "",
 ].join("\n");
 
 /**
- * Duplicated in `jets/datatable/wsfile/sections_test.go` and in
- * `jetsclient/test/workspace_section_contract_test.dart`, both as
- * `expectedDeclarationChecksum`. Update all three together or none.
+ * Duplicated in `jets/datatable/wsfile/sections_test.go` as
+ * `expectedDeclarationChecksum`. Update both together or neither. The third
+ * copy, in `jetsclient/test/workspace_section_contract_test.dart`, went with
+ * `jetsclient/` on 2026-08-26. A section's filters are not in the declaration,
+ * so adding `.mdx` to the `docs` section on 2026-11-13 moved neither copy.
  */
-export const EXPECTED_DECLARATION_CHECKSUM = "fnv1a32:b3fc79eb";
+export const EXPECTED_DECLARATION_CHECKSUM = "fnv1a32:1306f111";
 
 /**
  * FNV-1a, 32 bit, over the UTF-8 bytes — the same function the Go and Dart sides

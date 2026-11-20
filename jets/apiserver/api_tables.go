@@ -58,7 +58,7 @@ func (server *Server) DoDataTableAction(w http.ResponseWriter, r *http.Request) 
 
 		// fetch file from stage
 	case "fetch_file_from_stage":
-		// **This arm asked for nothing until 2026-08-25** (ui_refresh I-136's sweep).
+		// **This arm asked for nothing until 2026-08-25** (a capability sweep).
 		// It is handled here rather than by a method on DataTableContext, so the
 		// per-statement Capability in sql_stmts.go never applied to it and no test
 		// over that type's methods could see it. It reads an object out of the S3
@@ -90,13 +90,13 @@ func (server *Server) DoDataTableAction(w http.ResponseWriter, r *http.Request) 
 
 		// resubmit pipeline
 	case "resubmit_pipeline":
-		// **A second route to a gated table, and it was the ungated one** (ui_refresh
-		// I-136's sweep, 2026-08-25). insert_rows on jetsapi.pipeline_execution_status
+		// **A second route to a gated table, and it was the ungated one** (a
+		// capability sweep, 2026-08-25). insert_rows on jetsapi.pipeline_execution_status
 		// resolves sqlInsertStmts and is refused without run_pipelines; this arm
 		// hand-writes the same INSERT, resolves no statement, and inherited no
 		// capability -- then calls StartPendingTasks, so it does not merely record a
 		// run, it starts one. It stamps the token's user onto the row, which is the
-		// same pairing I-124 named: careful about attribution, silent about
+		// same pairing found on other routes: careful about attribution, silent about
 		// authorisation. datatable.TestResubmitPipelineUsesTheSameCapabilityAsItsInsert
 		// ties the constant below to the statement's own Capability so the two routes
 		// to this table cannot drift apart.
@@ -119,25 +119,41 @@ func (server *Server) DoDataTableAction(w http.ResponseWriter, r *http.Request) 
 			ERROR(w, 400, err)
 			return
 		}
+		// Refuse a run whose input was purged, rather than start one that fails at
+		// its first step
+		if err = datatable.CheckResubmittable(context.TODO(), server.dbpool, sid); err != nil {
+			log.Printf("Error: %v", err)
+			ERROR(w, 400, err)
+			return
+		}
 		newSessionId, err := datatable.ReserveSessionId(server.dbpool)
 		if err != nil {
 			log.Printf("Error: %v", err)
 			ERROR(w, 400, err)
 			return
 		}
-		// The workspace binding is taken as it stands now rather than copied from
-		// the run being resubmitted: a resubmission runs under today's compiled
-		// workspace, and copying the old row's version would assert the opposite.
-		stmt := `INSERT INTO jetsapi.pipeline_execution_status (
-								pipeline_config_key, main_input_registry_key, main_input_file_key,
-								client, process_name, main_object_type, input_session_id, request_id, session_id, source_period_key, status, user_email,
-								workspace_name, workspace_version)
-							(SELECT
-								pipeline_config_key, main_input_registry_key, main_input_file_key,
-								client, process_name, main_object_type, input_session_id, request_id, $1, source_period_key, 'pending', $2,
-								NULLIF($4, ''), (SELECT MAX(version) FROM jetsapi.workspace_version)
-							FROM jetsapi.pipeline_execution_status WHERE session_id = $3 )`
-		_, err = server.dbpool.Exec(context.TODO(), stmt, newSessionId, user, sid, os.Getenv("WORKSPACE"))
+		// datatable.ResubmitPipelineStmt says what is copied and what is not.
+		stmt := datatable.ResubmitPipelineStmt
+		// The copy reads the same input sessions as the runs it copies, so it is
+		// guarded as InsertPipelineExecutionStatus guards a start: in one
+		// transaction, each input session locked and refused with 409 when it is
+		// queued for deletion or deleted.
+		tx, err := server.dbpool.Begin(context.TODO())
+		if err != nil {
+			log.Printf("Error: %v", err)
+			ERROR(w, http.StatusInternalServerError, err)
+			return
+		}
+		defer tx.Rollback(context.Background())
+		if code, err = datatable.GuardResubmission(context.TODO(), tx, sid); err != nil {
+			log.Printf("Error: %v", err)
+			ERROR(w, code, err)
+			return
+		}
+		_, err = tx.Exec(context.TODO(), stmt, newSessionId, user, sid, os.Getenv("WORKSPACE"))
+		if err == nil {
+			err = tx.Commit(context.TODO())
+		}
 		if err != nil {
 			err = fmt.Errorf("error: failed resubmit to database: %v", err)
 			log.Printf("Error: %v", err)
@@ -150,6 +166,77 @@ func (server *Server) DoDataTableAction(w http.ResponseWriter, r *http.Request) 
 			log.Printf("Error: %v", err)
 			ERROR(w, 400, err)
 			return
+		}
+
+		// start pending tasks
+	case "start_pending_tasks":
+		// The Pipeline Status screen's *Check Pending* button (2026-11-05). A row
+		// inserted into jetsapi.pipeline_execution_status with status 'pending' by
+		// SQL, rather than through the UI, waits for the next StartPendingTasks:
+		// after a resubmit_pipeline, a status update or a domain-table registration,
+		// or the apiserver's hourly sweep (Start, server.go), which does not run in
+		// dev mode. This arm is that call, on demand, and nothing else. It starts
+		// pipelines, so it asks for the capability resubmit_pipeline asks for,
+		// before it does anything.
+		if code, err = ctx.RequireCapability(datatable.CapabilityRunPipelines, token); err != nil {
+			ERROR(w, code, err)
+			return
+		}
+		// Also marks submitted runs past their timeout as timed_out, as every
+		// caller of StartPendingTasks does.
+		if err = ctx.StartPendingTasks(); err != nil {
+			log.Printf("Error: %v", err)
+			ERROR(w, 400, err)
+			return
+		}
+		// What is still pending afterwards, so the caller can tell a run held
+		// back by throttling from one that started. Counted the way
+		// StartPendingTasks selects them: a staged file key and a process_config row.
+		var pending int64
+		if pending, _, err = ctx.GetTaskThrottlingInfo("pending"); err != nil {
+			log.Printf("Error: %v", err)
+			ERROR(w, 400, err)
+			return
+		}
+		results = &map[string]any{"pending_count": pending}
+		code = 200
+
+	case "resubmit_sessions_as_pending":
+		// Session Registry's Resubmit as Pending (2026-11-12): copies the
+		// selected sessions' runs into new sessions with status pending and starts
+		// nothing, so the sessions they replace can be deleted before Check Pending
+		// starts them (datatable.ResubmitSessionsAsPending). It inserts what
+		// resubmit_pipeline inserts, so it asks for the capability that arm asks for.
+		if code, err = ctx.RequireCapability(datatable.CapabilityRunPipelines, token); err != nil {
+			ERROR(w, code, err)
+			return
+		}
+		results, code, err = ctx.ResubmitSessionsAsPending(&dataTableAction, user, os.Getenv("WORKSPACE"))
+
+	case "preview_session_deletion":
+		// The sessions a Delete of the selected ones would delete: each selected
+		// session and, transitively, every session whose run read one of them.
+		// It writes nothing, and answers
+		// {"rows": [...]} (datatable.PreviewSessionDeletion). Asked for
+		// delete_session because what it shows is the confirmation of a deletion.
+		if code, err = ctx.RequireCapability(datatable.CapabilityDeleteSession, token); err != nil {
+			ERROR(w, code, err)
+			return
+		}
+		results, code, err = ctx.PreviewSessionDeletion(&dataTableAction)
+
+	case "delete_sessions":
+		// Queues the closure of the selected sessions for deletion, when it is the
+		// one the caller previewed, and answers {"queued": n, "waiting": [...]}
+		// (datatable.DeleteSessions); then starts this process's executor, which
+		// deletes after the answer. requested_by is the token's user.
+		if code, err = ctx.RequireCapability(datatable.CapabilityDeleteSession, token); err != nil {
+			ERROR(w, code, err)
+			return
+		}
+		results, code, err = ctx.DeleteSessions(&dataTableAction, user)
+		if err == nil {
+			server.runUserDeletions()
 		}
 
 	case "workspace_insert_rows":
@@ -246,7 +333,7 @@ func addToken(r *http.Request, results *map[string]any) {
 // stageFetchStatus is the status fetch_file_from_stage answers a failed download
 // with: 404 when there is no such object, 400 for anything else.
 //
-// jetstore_maintenance_02 I-23, 2026-10-01. Every failure was a 400, so a client
+// Changed 2026-10-01. Every failure was a 400, so a client
 // could tell "no such object" from "the read failed" only by finding NoSuchKey in
 // the message text. The difference matters to the Pipeline Status screen's Get
 // Run Manifest: a manifest is written for completed cpipes runs only, so its

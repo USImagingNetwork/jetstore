@@ -62,16 +62,22 @@ func NewJetstoreOneStack(scope constructs.Construct, id string, props *jetstores
 	jsComp := &jetstorestack.JetStoreStackComponents{
 		CpipesSmArn: fmt.Sprintf("arn:aws:states:%s:%s:stateMachine:%s",
 			os.Getenv("AWS_REGION"), os.Getenv("AWS_ACCOUNT"), *props.MkId("cpipesSM")),
-		ReportsSmArn: fmt.Sprintf("arn:aws:states:%s:%s:stateMachine:%s",
-			os.Getenv("AWS_REGION"), os.Getenv("AWS_ACCOUNT"), *props.MkId("reportsSM")),
 		DeployCpipesNative: strings.ToUpper(os.Getenv("DEPLOY_CPIPES_NATIVE")) == "TRUE" || strings.ToUpper(os.Getenv("DEPLOY_CPIPES_NATIVE")) == "1",
 		// Read through a function rather than inline, so that the unset case -- which is the
-		// whole of exit criterion 96 for the Python arm -- is reachable by a test in the stack
+		// whole of the claim that the Python arm changes nothing when off -- is reachable by a test in the stack
 		// package. See DeployCpipesPythonFromEnv.
 		DeployCpipesPython: jetstorestack.DeployCpipesPythonFromEnv(),
+		SkipReportsSM:      jetstorestack.SkipReportsSMFromEnv(),
 	}
 	if jsComp.DeployCpipesPython {
 		log.Println("Deploying CPIPES Python Node Image")
+	}
+	if jsComp.SkipReportsSM {
+		// JETS_REPORTS_SM_ARN is then empty, so starting a reportsSM process fails right away
+		log.Println("Skipping the reports state machine (JETS_SKIP_REPORTS_SM)")
+	} else {
+		jsComp.ReportsSmArn = fmt.Sprintf("arn:aws:states:%s:%s:stateMachine:%s",
+			os.Getenv("AWS_REGION"), os.Getenv("AWS_ACCOUNT"), *props.MkId("reportsSM"))
 	}
 	if jsComp.DeployCpipesNative {
 		log.Println("Deploying CPIPES Native Image")
@@ -351,7 +357,9 @@ func NewJetstoreOneStack(scope constructs.Construct, id string, props *jetstores
 
 	// Build Run Reports State Machine
 	// ---------------------------------------------
-	jsComp.BuildRunReportsSM(scope, stack, props)
+	if !jsComp.SkipReportsSM {
+		jsComp.BuildRunReportsSM(scope, stack, props)
+	}
 
 	// Build lambdas used by cpipesSM/cpipesNativeSM:
 	//	- CpipesNodeLambda
@@ -390,7 +398,9 @@ func NewJetstoreOneStack(scope constructs.Construct, id string, props *jetstores
 	// ---------------------------------------
 	resources := []*string{
 		jsComp.CpipesSM.StateMachineArn(),
-		jsComp.ReportsSM.StateMachineArn(),
+	}
+	if jsComp.ReportsSM != nil {
+		resources = append(resources, jsComp.ReportsSM.StateMachineArn())
 	}
 	if jsComp.DeployCpipesNative {
 		resources = append(resources, jsComp.CpipesNativeSM.StateMachineArn())
@@ -524,7 +534,8 @@ func NewJetstoreOneStack(scope constructs.Construct, id string, props *jetstores
 // AWS_REGION (required)
 // BASTION_HOST_KEYPAIR_NAME (optional, no keys deployed if not defined)
 // ENVIRONMENT (used by run_report)
-// EXTERNAL_BUCKETS (optional, list of third party buckets to read/write file for cpipes)
+// EXTERNAL_BUCKETS (optional, comma-separated list of third party buckets to read/write file for cpipes;
+//   an empty name, the jetstore_bucket sentinel or a name S3 would not accept stops the synth)
 // EXTERNAL_S3_KMS_KEY_ARN (optional, additional kms keys for reading external buckets)
 // EXTERNAL_SQS_ARN (optional, sqs queue for sqs register key lambda)
 // JETS_PIVOT_YEAR_TIME_PARSING (optional, pivot year used in date_util.ParseDateTime function)
@@ -555,7 +566,7 @@ func NewJetstoreOneStack(scope constructs.Construct, id string, props *jetstores
 // CPIPES_START_NOTIFICATION_JSON template for the cpipes start notification
 // CPIPES_COMPLETED_NOTIFICATION_JSON template for the cpipes completed notification
 // CPIPES_FAILED_NOTIFICATION_JSON template for the cpipes failed notification
-// JETS_CPU_UTILIZATION_ALARM_THRESHOLD (required, Alarm threshold for metric CPUUtilization, default 80)
+// JETS_CPU_UTILIZATION_ALARM_THRESHOLD (optional, threshold of the database CPUUtilization alarm, in percent, default 60)
 // JETS_CUSTOM_BUTTONS_CONFIG_JSON (optional) the deployment's own buttons on the UI's Pipeline
 //	Status table, as a JSON array in the shape the Flutter UI read: each entry has a type
 //	(fetch_stage_to_clipboard), a key, a label, fsk_params, a file_path under the stage prefix
@@ -569,10 +580,8 @@ func NewJetstoreOneStack(scope constructs.Construct, id string, props *jetstores
 //	refuses it, by serving no buttons rather than failing the login.
 //	Until 2026-10-01 nothing read this variable: it was a compile-time constant of the Flutter
 //	app, and its Docker build argument was removed with that app. This synth-time half landed
-//	first; ~~the apiserver and React halves are jetstore_maintenance_02 tasks AE.7 and AE.8, and
-//	until they land the entry reaches the container and nothing there reads it.~~ The apiserver
-//	serves it at sign-in as of AE.7 (jets/apiserver/custom_buttons.go, 2026-10-01), and the React
-//	app draws the buttons on the Pipeline Status table as of AE.8 the same day
+//	first. The apiserver serves it at sign-in (jets/apiserver/custom_buttons.go, 2026-10-01),
+//	and the React app draws the buttons on the Pipeline Status table from the same day
 //	(jetsclient_ide/src/actions/customButtons.ts).
 // JETS_DB_MAX_CAPACITY (required, Aurora Serverless v2 max capacity in ACU units, default 6)
 // JETS_DB_MIN_CAPACITY (required, Aurora Serverless v2 min capacity in ACU units, default 0.5)
@@ -600,7 +609,11 @@ func NewJetstoreOneStack(scope constructs.Construct, id string, props *jetstores
 //	attempted. The runtime switch is JETS_NO_GIT_ACCESS below.
 // JETS_IMAGE_TAG (required)
 // CPIPES_IMAGE_TAG (required for cpipes server)
-// DEPLOY_CPIPES_NATIVE (required for cpipes native task and lambdas, values: TRUE, FALSE, requires JETS_IMAGE_TAG)
+// DEPLOY_CPIPES_NATIVE (optional, values: TRUE, 1, case-insensitive) builds cpipesNativeSM and its
+//
+//	node lambda CpipesNativeNodeLambda, read from CPIPES_LAMBDA_ECR_REPO_ARN at CPIPES_IMAGE_TAG. Read at
+//	synth only; it is not passed to the containers or lambdas.
+//
 // DEPLOY_CPIPES_PYTHON (optional, values: TRUE, 1, case-insensitive; anything else including
 //
 //	unset and empty leaves it off) builds the Python compute pipes node -- the
@@ -609,8 +622,8 @@ func NewJetstoreOneStack(scope constructs.Construct, id string, props *jetstores
 //	ecsOrLambdaChoice that routes a reducing iteration to it, in **both** cpipes state
 //	machines. Requires CPIPES_PYTHON_LAMBDA_ECR_REPO_ARN and CPIPES_PYTHON_LAMBDA_IMAGE_TAG.
 //	**With it unset nothing changes**: the two blocks it gates are the whole of the change,
-//	so the synthesised template is the one a deployment gets today (exit criterion 96,
-//	measured as a byte comparison rather than claimed). It is a separate gate from
+//	so the synthesised template is the one a deployment gets today (measured as a byte
+//	comparison rather than claimed). It is a separate gate from
 //	DEPLOY_CPIPES_NATIVE and not a value of one selector, because the two are not
 //	alternatives -- a deployment can want the native node for jetrules steps and the Python
 //	node for its own operators.
@@ -623,8 +636,6 @@ func NewJetstoreOneStack(scope constructs.Construct, id string, props *jetstores
 //
 //	that image). Named for the lambda, as CPIPES_PYTHON_LAMBDA_ECR_REPO_ARN above is:
 //	the two describe one image and are read together, so they carry one prefix.
-// JETS_INPUT_ROW_JETS_KEY_ALGO (values: uuid, row_hash, domain_key (default: uuid))
-// JETS_INVALID_CODE (optional) code value when client code is not is the code value mapping, default return the client value
 // JETS_NBR_NAT_GATEWAY (optional, default to 0), set to 1 to be able to reach out to github for git integration
 // JETS_NO_GIT_ACCESS (optional, values: 1/true/yes/on, case-insensitive and trimmed; anything
 //	else, including unset and including the empty string, leaves git integration on) turns the
@@ -640,7 +651,21 @@ func NewJetstoreOneStack(scope constructs.Construct, id string, props *jetstores
 //	operator who never set it still gets it in the task definition, empty. See
 //	jets/datatable/git/no_git_access.go. Distinct from JETS_GIT_ACCESS above, which is a
 //	synth-time network control the runtime cannot read.
+// JETS_IDE_CODE_GUARD (optional, value: off, case-insensitive and trimmed; anything else,
+//	including unset and the empty string, leaves the guard on) turns off the IDE code guard,
+//	the event trigger jets_ide_code_guard that refuses functions, triggers, policies and the
+//	like from the jets_ide login (jets/dblogin/codeguard.go). At its next start the apiserver
+//	drops the trigger as its own database user. It is the way out of a guard that refuses DDL
+//	it should not, on an installation whose database only the application reaches; while it is
+//	off, SQL run as jets_ide can create code that runs as the apiserver's user. Passed to every
+//	component that can call dblogin.Ensure, so none re-installs the guard: the apiserver (and
+//	the update_db it starts), the run_reports task and Lambdas, and the compute-pipes nodes
+//	(the ECS task and the Go and native node Lambdas).
 // JETS_CPIPES_RUN_REPORTS_LAMBDA_ENTRY (optional, path to handler code for run_reports lambda in cpipes pipelines)
+// JETS_SKIP_REPORTS_SM (optional, values: TRUE, FALSE, default FALSE) set to TRUE to leave out the
+// reports state machine (reportsSM) and its run reports ECS task, for installations where no
+// process_config row uses reportsSM. When JETS_CPIPES_RUN_REPORTS_LAMBDA_ENTRY is also set, the
+// stock RunReportsLambda it replaces in cpipesSM is left out too.
 //
 //	JETS_REGISTER_KEY_LAMBDA_ENTRY (optional, path to handler code for the register key
 //	lambda, default lambdas/register_keys/register_keys_v2) Points registerKeyV2 at a site
@@ -681,6 +706,11 @@ func NewJetstoreOneStack(scope constructs.Construct, id string, props *jetstores
 // JETS_TAG_VALUE_OWNER (optional, stack-level tag value for owner)
 // JETS_TAG_VALUE_PROD (optional, stack-level tag value for indicating it's a production env)
 // JETS_UI_PORT (defaults 8080)
+// JETS_UI_HEALTH_CHECK_GRACE_PERIOD_SEC (optional, default CDK's 60) seconds the UI service ignores
+// load balancer health checks after a task starts. Set it above the slowest apiserver start-up
+// (migrations, then the workspace compile when overrides apply), or the deployment circuit
+// breaker rolls back a start-up that was only slow. Synth fails on a value that is not a
+// non-negative integer.
 // JETS_VPC_ID (optional, use existing vpc by id, must be in the same region as AWS_REGION)
 // when JETS_VPC_ID is set the following env vars must be set as well:
 //   - JETS_VPC_ID
@@ -695,17 +725,24 @@ func NewJetstoreOneStack(scope constructs.Construct, id string, props *jetstores
 //   - AWS_PREFIX_LIST_S3
 //
 // JETS_VPC_ENDPOINTS_SG_ID (optional, security group id to use for ecs tasks, required if JETS_VPC_ID is set)
+// JETS_VPC_ENDPOINTS_EXCLUDE (optional, ignored when JETS_VPC_ID is set) comma separated list of
+// interface endpoints not to create, by service short name (the <name> in com.amazonaws.<region>.<name>):
+// ecr.dkr, ecr.api, config, kms, sns, sqs, ecs-agent, ecs-telemetry, ecs, lambda, secretsmanager,
+// git-codecommit, sync-states, states, logs, monitoring, events. The api gateway endpoint
+// (execute-api) cannot be excluded. Default creates them all. Workloads in the isolated subnets
+// have no NAT route, so ecr.dkr, ecr.api, secretsmanager, states and logs must stay.
 // JETS_API_GATEWAY_VPC_ENDPOINT_ID (optional, API gateway VPC endpoint id, required if JETS_VPC_ID is set)
 // JETS_API_GATEWAY_CODECOMMIT_REPO_ARN (optional, API gateway codecommit repo arn, required for lmm endpoint)
 // JETS_API_GATEWAY_LAMBDA_ASSUME_ROLE_ARN (optional, API gateway lambda assume role arn, required for cross account access)
 // JETS_VPC_CIDR VPC cidr block, default 10.10.0.0/16
 // JETS_VPC_INTERNET_GATEWAY (optional, default to false), set to true to create VPC with internet gateway, if false JETS_NBR_NAT_GATEWAY is set to 0
 // JETS_DB_VERSION (optional, default to latest version supported by jetstore, expected values are 14.5, 15.10 etc. only specific versions are supported)
-// JETS_DB_POOL_SIZE (optional, default is 8, min allowed is 5, used for serverv2 running standalone as ecs task or lambda function)
+// JETS_DB_POOL_SIZE (optional, read by cpipes_native_server in the compute pipes ecs task, default 3, never less than 3)
 // CPIPES_DB_POOL_SIZE (optional, default is 3, used for cpipes node, may run jetrules as cpipes operator)
 // JETS_PIPELINE_THROTTLING_JSON json configuration ThrottlingSpec
 // RETENTION_DAYS site global rentention days, delete sessions if > 0
 // PURGE_DATA_SCHEDULED_HOUR_UTC hour of day to run purge_data, default 7 UTC
+// PURGE_DRY_RUN the purge lambda deletes only when exactly "false"; unset or anything else is a dry run
 // JETS_AGENTIC_DETECT_HOUR_UTC (optional) hour of day, 0 to 23 UTC, to run the agentic detection task (anomaly_detect, then shadow_triage); unset builds neither the task nor its schedule
 // TASK_MAX_CONCURRENCY (defaults to 1)
 // JETS_DEFAULT_ERROR_REPORTING (optional, defaults to on) false/off/0/no stops giving operators that name no error_channel a default one writing to jetsapi.process_errors; read by the two cpipes starter lambdas only
@@ -732,7 +769,7 @@ func NewJetstoreOneStack(scope constructs.Construct, id string, props *jetstores
 // INFER_ROOT_VOLUME_GB (optional) size of the infer instance root volume in GB, default 50
 // OLLAMA_NUM_PARALLEL, OLLAMA_MAX_LOADED_MODELS, OLLAMA_KEEP_ALIVE, OLLAMA_CONTEXT_LENGTH
 // (optional) Ollama tuning passed through to the infer container, defaults 4 / 1 / 30m / 32768
-// (see infer_server_readme.md before changing the last two — they are GPU-memory bound)
+// (see docs/src/content/docs/install/planning/infer-server-memory.md before changing the last two — they are GPU-memory bound)
 // INFER_BACKEND (optional) which model server the infer service runs, "ollama" (default) or
 // "vllm". It must agree with the image INFER_IMAGE_TAG names — Dockerfile.infer_service builds
 // the first, Dockerfile.infer_service_vllm the second — and nothing checks that it does.
@@ -802,11 +839,11 @@ func main() {
 	log.Println("env DEPLOY_CPIPES_PYTHON:", os.Getenv("DEPLOY_CPIPES_PYTHON"))
 	log.Println("env CPIPES_PYTHON_LAMBDA_ECR_REPO_ARN:", os.Getenv("CPIPES_PYTHON_LAMBDA_ECR_REPO_ARN"))
 	log.Println("env CPIPES_PYTHON_LAMBDA_IMAGE_TAG:", os.Getenv("CPIPES_PYTHON_LAMBDA_IMAGE_TAG"))
-	log.Println("env JETS_INPUT_ROW_JETS_KEY_ALGO:", os.Getenv("JETS_INPUT_ROW_JETS_KEY_ALGO"))
-	log.Println("env JETS_INVALID_CODE:", os.Getenv("JETS_INVALID_CODE"))
 	log.Println("env JETS_NBR_NAT_GATEWAY:", os.Getenv("JETS_NBR_NAT_GATEWAY"))
 	log.Println("env JETS_NO_GIT_ACCESS:", os.Getenv("JETS_NO_GIT_ACCESS"))
+	log.Println("env JETS_IDE_CODE_GUARD:", os.Getenv("JETS_IDE_CODE_GUARD"))
 	log.Println("env JETS_CPIPES_RUN_REPORTS_LAMBDA_ENTRY:", os.Getenv("JETS_CPIPES_RUN_REPORTS_LAMBDA_ENTRY"))
+	log.Println("env JETS_SKIP_REPORTS_SM:", os.Getenv("JETS_SKIP_REPORTS_SM"))
 	log.Println("env JETS_REGISTER_KEY_LAMBDA_ENTRY:", os.Getenv("JETS_REGISTER_KEY_LAMBDA_ENTRY"))
 	log.Println("env JETS_s3_INPUT_PREFIX:", os.Getenv("JETS_s3_INPUT_PREFIX"))
 	log.Println("env JETS_s3_OUTPUT_PREFIX:", os.Getenv("JETS_s3_OUTPUT_PREFIX"))
@@ -834,15 +871,18 @@ func main() {
 	log.Println("env JETS_TAG_VALUE_OWNER:", os.Getenv("JETS_TAG_VALUE_OWNER"))
 	log.Println("env JETS_TAG_VALUE_PROD:", os.Getenv("JETS_TAG_VALUE_PROD"))
 	log.Println("env JETS_UI_PORT:", os.Getenv("JETS_UI_PORT"))
+	log.Println("env JETS_UI_HEALTH_CHECK_GRACE_PERIOD_SEC:", os.Getenv("JETS_UI_HEALTH_CHECK_GRACE_PERIOD_SEC"))
 	log.Println("env JETS_VPC_CIDR:", os.Getenv("JETS_VPC_CIDR"))
 	log.Println("env JETS_VPC_ID:", os.Getenv("JETS_VPC_ID"))
 	log.Println("env JETS_VPC_ENDPOINTS_SG_ID:", os.Getenv("JETS_VPC_ENDPOINTS_SG_ID"))
+	log.Println("env JETS_VPC_ENDPOINTS_EXCLUDE:", os.Getenv("JETS_VPC_ENDPOINTS_EXCLUDE"))
 	log.Println("env JETS_API_GATEWAY_VPC_ENDPOINT_ID:", os.Getenv("JETS_API_GATEWAY_VPC_ENDPOINT_ID"))
 	log.Println("env JETS_API_GATEWAY_CODECOMMIT_REPO_ARN:", os.Getenv("JETS_API_GATEWAY_CODECOMMIT_REPO_ARN"))
 	log.Println("env JETS_API_GATEWAY_LAMBDA_ASSUME_ROLE_ARN:", os.Getenv("JETS_API_GATEWAY_LAMBDA_ASSUME_ROLE_ARN"))
 	log.Println("env JETS_VPC_INTERNET_GATEWAY:", os.Getenv("JETS_VPC_INTERNET_GATEWAY"))
 	log.Println("env JETS_PIPELINE_THROTTLING_JSON:", os.Getenv("JETS_PIPELINE_THROTTLING_JSON"))
 	log.Println("env RETENTION_DAYS:", os.Getenv("RETENTION_DAYS"))
+	log.Println("env PURGE_DRY_RUN:", os.Getenv("PURGE_DRY_RUN"))
 	log.Println("env PURGE_DATA_SCHEDULED_HOUR_UTC:", os.Getenv("PURGE_DATA_SCHEDULED_HOUR_UTC"))
 	log.Println("env JETS_AGENTIC_DETECT_HOUR_UTC:", os.Getenv("JETS_AGENTIC_DETECT_HOUR_UTC"))
 	log.Println("env TASK_MAX_CONCURRENCY:", os.Getenv("TASK_MAX_CONCURRENCY"))
@@ -921,6 +961,10 @@ func main() {
 	if v := os.Getenv("JETS_CUSTOM_BUTTONS_CONFIG_JSON"); v != "" && !json.Valid([]byte(v)) {
 		log.Println("Warning: env var JETS_CUSTOM_BUTTONS_CONFIG_JSON is not valid JSON; it is passed to the UI service unchanged and the apiserver will serve no custom buttons")
 	}
+	if _, err := jetstorestack.ExternalBucketNames(os.Getenv("EXTERNAL_BUCKETS")); err != nil {
+		hasErr = true
+		errMsg = append(errMsg, err.Error())
+	}
 	if os.Getenv("JETS_DOMAIN_KEY_HASH_ALGO") == "" && os.Getenv("JETS_DOMAIN_KEY_HASH_SEED") == "" {
 		log.Println("Warning: env var JETS_DOMAIN_KEY_HASH_ALGO and JETS_DOMAIN_KEY_HASH_SEED not provided, no hashing of the domain keys will be applied")
 	}
@@ -941,7 +985,8 @@ func main() {
 			errMsg = append(errMsg, fmt.Sprintf("Invalid value for JETS_DB_MAX_CAPACITY: %s", os.Getenv("JETS_DB_MAX_CAPACITY")))
 		}
 	}
-	CpuUtilizationAlarmThreshold := 80.0
+	// 60 when unset: the alarm was the literal 60 before it read this variable.
+	CpuUtilizationAlarmThreshold := 60.0
 	if os.Getenv("JETS_CPU_UTILIZATION_ALARM_THRESHOLD") != "" {
 		CpuUtilizationAlarmThreshold, err = strconv.ParseFloat(os.Getenv("JETS_CPU_UTILIZATION_ALARM_THRESHOLD"), 64)
 		if err != nil {

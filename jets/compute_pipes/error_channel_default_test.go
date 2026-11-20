@@ -12,14 +12,14 @@ import (
 // specs, all ten output_tables entries bind to jetsapi.process_errors, and every one
 // of them is followed by a pipe reading the error channel and map_record'ing it into
 // the channel the table writer drains. Measured 2026-09-05 over the 45 .pc.json
-// documents of cedargate_ws, jets_ws, usi_ws and walrus_ws.
+// documents of the corpus's four workspaces.
 //
 // The backwards-compatibility clause of this change is a claim about these ten, so
 // the tests below are written against the shape rather than against an invented one.
 //
 // The paragraph above is kept as the measurement it was and is not renumbered. The
 // corpus moved on 2026-09-11: patient_profile.pc.json dropped its two declarations,
-// leaving eight in eight documents of usi_ws and walrus_ws. One of the two was the
+// leaving eight in eight documents of two client workspaces. One of the two was the
 // corpus's only non-jetrules declaration -- the "one on ollama" above, which had
 // since become an infer step -- so all eight survivors are on jetrules, and the
 // family this paragraph says is one shape is now one operator as well. The shape did
@@ -427,7 +427,7 @@ func TestSynthesizeIsIdempotent(t *testing.T) {
 	}
 }
 
-// --- The deployment switch (AM.2) ---------------------------------------------
+// --- The deployment switch ---------------------------------------------
 //
 // Always-on is the default and off is one environment variable, because how much
 // error data a deployment wants written by default belongs to whoever operates it
@@ -561,8 +561,8 @@ func TestDefaultErrorMaxCountIgnoresWhatItCannotUse(t *testing.T) {
 
 // The cap is silent when unset: an operator that names no max_error_count keeps the
 // zero its builder reads as "use my default" (20 for map_record and jetrules, 50 for
-// the inference operators). This is what makes the default arm of AM.2 identical to
-// what AM.1 shipped.
+// the inference operators). This is what makes the default arm of the cap identical to
+// what shipped before it.
 func TestNoCapLeavesTheOperatorDefaults(t *testing.T) {
 	pipeConfig := []PipeSpec{{Apply: []TransformationSpec{{Type: "map_record"}}}}
 	SynthesizeDefaultErrorChannels(&ComputePipesConfig{}, pipeConfig)

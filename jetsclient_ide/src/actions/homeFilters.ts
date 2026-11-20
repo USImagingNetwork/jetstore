@@ -1,9 +1,9 @@
 /**
- * `homeFiltersUF`'s escapes, and the store they write. Task F.5.
+ * `homeFiltersUF`'s escapes, and the store they write.
  *
- * **This is the first action escape the port has, and it earned the name.** F.1
- * expected `mapFileUF` to need one and the grammar swallowed both of its save
- * buttons instead (I-74), so `productionRegistry.actions` has been `{}` since it
+ * **This is the first action escape the port has, and it earned the name.** The
+ * port expected `mapFileUF` to need one and the grammar swallowed both of its save
+ * buttons instead, so `productionRegistry.actions` has been `{}` since it
  * was written. `updateHomeFilters` is different in kind: it does not post, set or
  * navigate — it **compiles a filter into `WhereClause` objects** that a *different*
  * screen's query builder will splice into its `WHERE`, including `LIKE` patterns
@@ -13,7 +13,7 @@
  * and the flow that wanted it would still be the only caller.
  *
  * **So the answer to "could a primitive remove this?" is no, and the question was
- * asked.** I-74 is the direction this project travels — F.1 *removed* an escape by
+ * asked.** Fewer escapes is the port's direction — `mapFileUF` *removed* one by
  * adding two primitives — and the test that decides it is whether the primitive
  * would be justified beyond the one arm. `rows: "everyGroup"` and `require` were;
  * a where-clause builder is not.
@@ -47,6 +47,23 @@
  *
  * The validator therefore keeps only its **validation**, and only where the rule
  * is a relation between siblings; see `homeFiltersFormValidator` below.
+ *
+ * ## A third list, with no Dart original
+ *
+ * **`sessionRegistryFilters`, for the Session Registry tab** (added
+ * 2026-11-08), set by that tab's *Set Filters* dialog and *Set
+ * Session Id* prompt and read by `makeQuery` for `sessionRegistryTable` alone.
+ * It is a list of its own rather than a share of the home filters because the
+ * view it filters, `jetsapi.session_registry_view`, has none of
+ * `pipeline_execution_status`'s columns that the home filters name — and the
+ * archive tab, which does have them, shares the home filters instead, with
+ * their table rewritten (`datatable/query.ts`, `FILTERS_BY_FIELD`).
+ *
+ * **It refuses what the server would splice.** `ge` and `le` reach the SQL as
+ * written (`jets/datatable/data_table_action.go`, `visitWhereClause`), which is
+ * also true of the home filters' time bounds. This list builds its bounds only from
+ * input that has been checked to be digits, a date, or a count of units, so a
+ * typed quote is a refusal rather than part of a query.
  */
 
 import type { FormState } from "../datatable/formState";
@@ -72,13 +89,25 @@ const SAVED_KEYS = [
 const EXEC_STATUS = "pipeline_execution_status";
 const INPUT_REGISTRY = "input_registry";
 
+/** The Session Registry tab's view. */
+const SESSION_REGISTRY = "session_registry_view";
+
 interface FilterStore {
   homeFilters: WhereClause[] | null;
   dataRegistryFilters: WhereClause[] | null;
   saved: Record<string, string | string[]>;
+  sessionRegistryFilters: WhereClause[] | null;
+  /** The Session Registry dialog's answers, which seed its next open. */
+  sessionRegistrySaved: Record<string, string | string[]>;
 }
 
-const store: FilterStore = { homeFilters: null, dataRegistryFilters: null, saved: {} };
+const store: FilterStore = {
+  homeFilters: null,
+  dataRegistryFilters: null,
+  saved: {},
+  sessionRegistryFilters: null,
+  sessionRegistrySaved: {},
+};
 
 /** The home filters as they stand, for a `QueryContext`. */
 export const currentHomeFilters = (): WhereClause[] | null => store.homeFilters;
@@ -87,11 +116,19 @@ export const currentDataRegistryFilters = (): WhereClause[] | null => store.data
 /** The saved filter values, which `seedFromHomeFilters` reads. */
 export const savedHomeFilterState = (): Readonly<Record<string, string | string[]>> => store.saved;
 
-/** Empties all three, as a fresh page load would. Tests, and nothing else. */
+/** The Session Registry tab's filters as they stand, for a `QueryContext`. */
+export const currentSessionRegistryFilters = (): WhereClause[] | null => store.sessionRegistryFilters;
+/** The Session Registry dialog's last answers, which the screen seeds it from. */
+export const savedSessionRegistryFilterState = (): Readonly<Record<string, string | string[]>> =>
+  store.sessionRegistrySaved;
+
+/** Empties every list, as a fresh page load would. Tests, and nothing else. */
 export function resetHomeFilters(): void {
   store.homeFilters = null;
   store.dataRegistryFilters = null;
   store.saved = {};
+  store.sessionRegistryFilters = null;
+  store.sessionRegistrySaved = {};
 }
 
 const where = (parts: Omit<WhereClause, "defaultValue" | "lookupColumnInFormState"> &
@@ -133,7 +170,7 @@ function unpackToList(value: unknown): string[] | null {
  * (`datatable/query.ts`) and the Go builder splices it. That is the Flutter app's
  * behaviour and this port reproduces it rather than improving it, because a
  * different shape here would make the two apps disagree about a live table while
- * both are shipping. Recorded as **I-103**.
+ * both are shipping.
  */
 function timeBound(at: string | null, offset: string | null): string | null {
   const hasAt = at !== null && at !== "";
@@ -150,8 +187,8 @@ function timeBound(at: string | null, offset: string | null): string | null {
  * Step for step with the Dart: process names, statuses, the file-key match, the
  * start bound, the end bound. **The order matters and is asserted**, because the
  * lists are sent as an array and a server-side `WHERE` built from them in a
- * different order is a different query text — which is the trap F.3 found in a
- * coverage document (I-90).
+ * different order is a different query text — which is a trap found once in a
+ * coverage document.
  */
 export function updateHomeFilters(context: EscapeContext): Promise<string | null> {
   const { formState, group } = context;
@@ -301,7 +338,7 @@ export const alwaysEnabled = (_formState: FormState, _group: number): boolean =>
  * The one cross-field rule of the flow. The validator escape.
  *
  * **`homeFiltersFormValidator` is 70 lines in the Dart and about two rules here**,
- * for the reason I-73 gave about `mappingFormValidator`: most of a Dart validator
+ * for the reason given about `mappingFormValidator`: most of a Dart validator
  * is not validation. Six of its eight cases `return null` unconditionally after a
  * side effect, and the side effects are the accumulation this module's escape does
  * instead. What is left:
@@ -330,4 +367,224 @@ export function homeFiltersFormValidator(
   if (filterType === null || filterType === "None") return null;
   const substring = unpack(value);
   return substring === null || substring === "" ? "Enter a file key fragment" : null;
+}
+
+// ---------------------------------------------------------------------------
+// The Session Registry tab's filters. Added 2026-11-08.
+// ---------------------------------------------------------------------------
+
+/**
+ * The dialog's text keys, in the order their clauses are built.
+ *
+ * Prefixed `sr` as `homeFiltersUF`'s are `hf`, because the dialog's form state is
+ * a group of the screen's and a bare `source_type` there would be read by any
+ * table whose where clause names it.
+ *
+ * **Changed 2026-11-12 (from a client's sessions to delete).** The month
+ * period range is gone: a user does not know month periods, and a weekly or daily
+ * session is not found by one. In its place, a file key fragment and a range on
+ * the date in the file key, the view's `file_key_date`. The process names are
+ * the dialog's table, `SESSION_REGISTRY_PROCESS_KEY`, read as a list.
+ */
+export const SESSION_REGISTRY_FILTER_KEYS = [
+  "srSourceType",
+  "srFileKeyFragment",
+  "srFileKeyDateFrom",
+  "srFileKeyDateTo",
+  "srUpdatedFrom",
+  "srUpdatedTo",
+] as const;
+
+/** The dialog's process table: the selected process names, a list. */
+export const SESSION_REGISTRY_PROCESS_KEY = "srProcessName";
+
+/** The most digits a `session_num` holds: the view's own bound, a bigint's 18. */
+const SESSION_NUM = /^[0-9]{1,18}$/;
+/** A source type: a word, as `session_registry.source_type` holds one. */
+const WORD = /^[A-Za-z0-9_]{1,40}$/;
+/** A session id in a comma list: what the server may put between quotes. */
+const SESSION_ID = /^[A-Za-z0-9_.:-]{1,80}$/;
+/** A date, or a date and time, as `timestamp '…'` reads it. */
+const TIMESTAMP = /^[0-9]{4}-[0-9]{2}-[0-9]{2}([ T][0-9]{2}:[0-9]{2}(:[0-9]{2})?Z?)?$/;
+/** A count of units, as `interval '…'` reads it: `3 days`, `12 hours`. */
+const OFFSET = /^[0-9]{1,4} (minute|hour|day|week|month|year)s?$/;
+
+/**
+ * An instant typed into the dialog, as the SQL fragment `ge`/`le` carries.
+ *
+ * A date or timestamp is `timestamp '<it>'`; a count of units is that long
+ * before now, `now()-interval '<it>'`, the home filters' offset in one field
+ * rather than two. Null for anything else, which the validator refuses — this is
+ * the check that keeps a typed quote out of the query.
+ */
+function instant(value: string): string | null {
+  if (TIMESTAMP.test(value)) return `timestamp '${value.replace("T", " ").replace(/Z$/, "")}'`;
+  if (OFFSET.test(value)) return `now()-interval '${value}'`;
+  return null;
+}
+
+/**
+ * A file key fragment as a `LIKE` pattern that matches it anywhere.
+ *
+ * The pattern travels as a quoted literal (`visitWhereClause`'s `sqlLiteral`), so
+ * a quote in it is data. `%` and `_`, `LIKE`'s wildcards, and the backslash that
+ * escapes them are escaped, so the fragment is matched as typed: `CI_A` does
+ * not also match `CIXA`.
+ */
+function containsPattern(fragment: string): string {
+  return `%${fragment.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
+}
+
+/** The dialog's value for a key, trimmed; empty when unset. */
+function answer(formState: FormState, group: number, key: string): string {
+  return (unpack(formState.getValue(group, key)) ?? "").trim();
+}
+
+/**
+ * The Session Registry dialog's field rule. The validator escape.
+ *
+ * One rule per kind of field: a source type is a word, an instant is a date or
+ * a count of units, a file key fragment is anything at most 200 characters long.
+ * Blank is always allowed — a blank field is no filter — and the two ends of a
+ * range are checked apart, so an open range is a range.
+ */
+export function sessionRegistryFiltersValidator(
+  _context: EscapeContext,
+  key: string,
+  value: unknown,
+): string | null {
+  const text = (unpack(value) ?? "").trim();
+  if (text === "") return null;
+  switch (key) {
+    case "srSourceType":
+      return WORD.test(text) ? null : "A source type is one word, such as file or domain_table";
+    case "srFileKeyFragment":
+      return text.length <= 200 ? null : "A file key fragment is at most 200 characters";
+    case "srFileKeyDateFrom":
+    case "srFileKeyDateTo":
+    case "srUpdatedFrom":
+    case "srUpdatedTo":
+      return instant(text) !== null
+        ? null
+        : "Enter a date (2026-11-08), a date and time (2026-11-08T15:00:00Z), or a duration (3 days)";
+    default:
+      return null;
+  }
+}
+
+/**
+ * Compiles the dialog's answers into `sessionRegistryFilters`. The action escape.
+ *
+ * **It replaces the list**, the session-id filter included, as `updateHomeFilters`
+ * replaces the home filters: the tab has one set of filters and the last thing
+ * the user asked for is it. The answers are checked again here, although
+ * `validate` ran first, because a filter that reached the store unchecked would
+ * reach the server unchecked; a refusal stops the action with its message.
+ *
+ * The process names come first, as an `IN` on the view's `process_name` (the
+ * session's own run, so a file's session, which has none, is not listed).
+ */
+export function updateSessionRegistryFilters(context: EscapeContext): Promise<string | null> {
+  const { formState, group } = context;
+  const filters: WhereClause[] = [];
+  const saved: Record<string, string | string[]> = {};
+  const processNames = (unpackToList(formState.getValue(group, SESSION_REGISTRY_PROCESS_KEY)) ?? []).filter(
+    (name) => name !== "",
+  );
+  if (processNames.length > 0) {
+    filters.push(where({ table: SESSION_REGISTRY, column: "process_name", defaultValue: processNames }));
+    saved[SESSION_REGISTRY_PROCESS_KEY] = processNames;
+  }
+  for (const key of SESSION_REGISTRY_FILTER_KEYS) {
+    const text = answer(formState, group, key);
+    if (text === "") continue;
+    const refusal = sessionRegistryFiltersValidator(context, key, text);
+    if (refusal !== null) return Promise.resolve(refusal);
+    saved[key] = text;
+    switch (key) {
+      case "srSourceType":
+        filters.push(where({ table: SESSION_REGISTRY, column: "source_type", defaultValue: [text] }));
+        break;
+      case "srFileKeyFragment":
+        filters.push(where({ table: SESSION_REGISTRY, column: "file_key", like: containsPattern(text) }));
+        break;
+      case "srFileKeyDateFrom":
+        filters.push(where({ table: SESSION_REGISTRY, column: "file_key_date", ge: instant(text)! }));
+        break;
+      case "srFileKeyDateTo":
+        filters.push(where({ table: SESSION_REGISTRY, column: "file_key_date", le: instant(text)! }));
+        break;
+      case "srUpdatedFrom":
+        filters.push(where({ table: SESSION_REGISTRY, column: "last_update", ge: instant(text)! }));
+        break;
+      case "srUpdatedTo":
+        filters.push(where({ table: SESSION_REGISTRY, column: "last_update", le: instant(text)! }));
+        break;
+    }
+  }
+  store.sessionRegistryFilters = filters;
+  store.sessionRegistrySaved = saved;
+  formState.notifyListeners();
+  return Promise.resolve(null);
+}
+
+/** The Session Registry tab's *Clear Filters*. An action escape. */
+export function clearSessionRegistryFilters(context: EscapeContext): Promise<string | null> {
+  store.sessionRegistryFilters = [];
+  store.sessionRegistrySaved = {};
+  context.formState.notifyListeners();
+  return Promise.resolve(null);
+}
+
+/** Whether the Session Registry tab has a filter to clear. */
+export const hasSessionRegistryFilters = (_formState: FormState, _group: number): boolean =>
+  store.sessionRegistryFilters !== null && store.sessionRegistryFilters.length > 0;
+
+/**
+ * The Session Registry tab's *Set Session Id*: a comma list, or a range.
+ *
+ * - **`a, b, c`** filters `session_id` on those values, as `setIdFilter` does for
+ *   the other tabs. The server puts each between quotes as written, so an id is
+ *   refused unless it is letters, digits and `_ . : -`.
+ * - **`from..to`**, either end empty, becomes `ge` and `le` clauses on the view's
+ *   numeric `session_num`, which is what makes `1000..` mean a number and not a
+ *   string that sorts after `1000`. **Each bound must be digits only, at most 18**
+ *   — the server splices `ge` and `le` as written, so this check is the whole of
+ *   what keeps the range out of the SQL — and a range with neither end, or with
+ *   its ends reversed, is refused rather than read as everything or nothing.
+ *
+ * Returns the refusal, or null once the filter is set. **It replaces the tab's
+ * filters**, as `setIdFilter` replaces the home filters.
+ */
+export function setSessionRegistryIdFilter(input: string): string | null {
+  const text = input.trim();
+  const range = text.indexOf("..");
+  if (range >= 0) {
+    const from = text.slice(0, range).trim();
+    const to = text.slice(range + 2).trim();
+    if (from === "" && to === "") return "Give at least one end of the range, as 1000.. or ..2000";
+    for (const bound of [from, to]) {
+      if (bound !== "" && !SESSION_NUM.test(bound)) {
+        return `A range bound is digits only, at most 18 of them: "${bound}" is not`;
+      }
+    }
+    if (from !== "" && to !== "" && BigInt(from) > BigInt(to)) {
+      return `The range ${from}..${to} is empty: its first end is after its second`;
+    }
+    const filters: WhereClause[] = [];
+    if (from !== "") filters.push(where({ table: SESSION_REGISTRY, column: "session_num", ge: from }));
+    if (to !== "") filters.push(where({ table: SESSION_REGISTRY, column: "session_num", le: to }));
+    store.sessionRegistryFilters = filters;
+    store.sessionRegistrySaved = {};
+    return null;
+  }
+  const values = text.split(",").map((part) => part.trim()).filter((part) => part !== "");
+  if (values.length === 0) return "Enter session ids separated by commas, or a range such as 1000..2000";
+  const refused = values.find((value) => !SESSION_ID.test(value));
+  if (refused !== undefined) {
+    return `"${refused}" is not a session id: letters, digits and _ . : - only`;
+  }
+  store.sessionRegistryFilters = [where({ table: SESSION_REGISTRY, column: "session_id", defaultValue: values })];
+  store.sessionRegistrySaved = {};
+  return null;
 }

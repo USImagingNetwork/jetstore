@@ -89,8 +89,8 @@ function stubServer(options: { reteCell?: string | null } = {}) {
       return new Response(
         JSON.stringify({
           token: "t0",
-          name: "Michel",
-          user_email: "michel@artisoft.io",
+          name: "Test User",
+          user_email: "user@example.com",
           is_admin: false,
           capabilities: ["jetstore_read"],
         }),
@@ -164,7 +164,7 @@ async function mount(options: { session?: string; reteCell?: string | null } = {
     "reteCell" in options ? { reteCell: options.reteCell } : {},
   );
   const api = new ApiClient("", fetchImpl);
-  await api.login("michel@artisoft.io", "pw");
+  await api.login("user@example.com", "pw");
 
   render(
     <ApiProvider api={api}>
@@ -240,6 +240,18 @@ describe("the screen", () => {
     expect(cell.className).toContain("clamp");
   });
 
+  it("says its title once, and tells its two domain key columns apart", async () => {
+    // The table's label repeated the screen's heading, and both the run's
+    // domain key and the row's key value were headed `Domain Key`.
+    await mount();
+    expect(screen.getAllByRole("heading", { name: "Pipeline Execution Errors" })).toHaveLength(1);
+    const headers = screen
+      .getAllByRole("columnheader")
+      .map((th) => (th.textContent ?? "").replace(/[▲▼]/g, "").trim());
+    expect(headers.filter((h) => h === "Domain Key")).toHaveLength(1);
+    expect(headers.filter((h) => h === "Domain Key Value")).toHaveLength(1);
+  });
+
   it("offers both row buttons only once a row is selected", async () => {
     await mount();
     expect(button("View Input Records").hasAttribute("disabled")).toBe(true);
@@ -313,6 +325,17 @@ describe("the input-records dialog", () => {
     fireEvent.click(button("View Input Records"));
     const dialog = await screen.findByRole("dialog", { name: "Input Records for a Domain Key" });
     await waitFor(() => expect(within(dialog).getAllByRole("table")).toHaveLength(2));
+    // **The tables' reads are waited for, not only the tables** (jetstore_maintenance_02
+    // `I-30`, 2026-10-27). Each table posts its read from its own effect, after the
+    // markup the wait above settles on, so a count taken there could still move:
+    // the read then arrived after `before` and was reported below as a post made
+    // by Close. The race D.9 fixed in the case above, one test further on; it lost
+    // once in twenty full runs.
+    await waitFor(() =>
+      expect(
+        readsOf(posts).filter((r) => (r["withClauses"] as unknown[] | undefined)?.length === 1),
+      ).toHaveLength(2),
+    );
     const before = posts.length;
     fireEvent.click(within(dialog).getByRole("button", { name: "Close" }));
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());

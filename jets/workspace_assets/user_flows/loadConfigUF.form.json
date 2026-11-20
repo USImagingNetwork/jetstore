@@ -15,7 +15,7 @@
           {
             "field": "text",
             "key": "workspace_uri",
-            "label": "Worksapce URI",
+            "label": "Workspace URI",
             "hint": "Repository where the workspace is versioned",
             "isReadOnly": true,
             "maxLength": 200
@@ -62,7 +62,7 @@
           {
             "field": "text",
             "key": "workspace_uri",
-            "label": "Worksapce URI",
+            "label": "Workspace URI",
             "hint": "Repository where the workspace is versioned",
             "isReadOnly": true,
             "maxLength": 200
@@ -79,7 +79,7 @@
       "actions": [
         { "action": "ufPrevious", "label": "Previous", "style": "primary" },
         { "action": "ufCancel", "label": "Cancel", "style": "primary" },
-        { "action": "ufCompleted", "label": "Comfirm", "style": "secondary" }
+        { "action": "ufCompleted", "label": "Confirm", "style": "secondary" }
       ]
     }
   }

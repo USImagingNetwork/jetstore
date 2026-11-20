@@ -6,7 +6,8 @@ import (
 )
 
 // Filter operator. Filter input records based on filter criteria.
-// Note: Automatically filter the bad rows (ie rows w/o the expected number of columns)
+// With row_length_strict, a row without the input channel's number of columns is dropped; otherwise
+// rows of any length are filtered by the when expression like the rest.
 type FilterTransformationPipe struct {
 	cpConfig         *ComputePipesConfig
 	source           *InputChannel
@@ -44,7 +45,7 @@ func (ctx *FilterTransformationPipe) Apply(input *[]any) error {
 		if err != nil {
 			return fmt.Errorf("while evaluating when clause of filter: %v", err)
 		}
-		
+
 		if !ToBool(resp) {
 			// Filter out the row
 			// log.Println("*** ROW FILTERED OUT: ", *input)

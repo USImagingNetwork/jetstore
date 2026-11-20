@@ -7,6 +7,7 @@ import (
 	"os"
 	"regexp"
 
+	"github.com/artisoft-io/jetstore/jets/awsi"
 	"github.com/artisoft-io/jetstore/jets/workspace"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -146,7 +147,7 @@ func (args *ComputePipesNodeArgs) CoordinateComputePipes(ctx context.Context, db
 				cpConfig.CommonRuntimeArgs.SessionId, args.NodeId, getTotNbrFileKeys(fileKeys), inputChannelConfig.FileKey)
 		} else {
 			// Case reducing, get the file keys from s3
-			fileKeys, err = GetS3FileKeys(cpConfig.CommonRuntimeArgs.ProcessName, cpConfig.CommonRuntimeArgs.SessionId,
+			fileKeys, err = GetS3FileKeys(ctx, dbpool, cpConfig.CommonRuntimeArgs.ProcessName, cpConfig.CommonRuntimeArgs.SessionId,
 				cpConfig.CommonRuntimeArgs.MainInputStepId, args.JetsPartitionLabel, inputChannelConfig, envSettings)
 			if err != nil {
 				cpErr = err
@@ -180,12 +181,12 @@ func (args *ComputePipesNodeArgs) CoordinateComputePipes(ctx context.Context, db
 	}
 	if cpConfig.CommonRuntimeArgs.CpipesMode == "sharding" {
 		switch {
-		case len(inputChannelConfig.Bucket) > 0 && inputChannelConfig.Bucket != "jetstore_bucket":
-			externalBucket = inputChannelConfig.Bucket
-		case inputChannelConfig.Bucket == "jetstore_bucket":
+		case len(inputChannelConfig.Bucket) == 0:
+			externalBucket = mainSchemaProviderConfig.Bucket
+		case awsi.IsJetStoreBucket(inputChannelConfig.Bucket):
 			externalBucket = ""
 		default:
-			externalBucket = mainSchemaProviderConfig.Bucket
+			externalBucket = inputChannelConfig.Bucket
 		}
 	}
 

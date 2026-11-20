@@ -227,7 +227,8 @@ export function FlowRunner({ api }: { api: ApiClient }) {
    * `/fileMappingUF/mapping/:table_name/:object_type`
    * (`jetsclient/lib/routes/jets_routes_app.dart`, `ufMappingPath`), and both are
    * substituted into its form's queries — with neither, the worksheet has no rows
-   * to draw. **Five** of the eleven flow routes carry parameters this way —
+   * to draw. **Five** of the Flutter flow routes (eleven when counted, ten since
+   * 2026-10-01; the retired one carried none) carry parameters this way —
    * `clientRegistryUF` and `sourceConfigUF` a `startAtKey`, `mapFileUF` those
    * two, `workspacePullUF` five and `loadConfigUF` a `workspace_name`. This
    * comment said four until F.10 counted them off `jetsRoutesMap`; the Flutter
@@ -413,6 +414,19 @@ export function FlowRunner({ api }: { api: ApiClient }) {
    * the same keys of the same groups.
    */
   const repeatRows = currentForm?.repeat === undefined ? undefined : queries.rows(currentForm.repeat.from);
+  /**
+   * The rows the groups were last seeded from. 2026-11-11.
+   *
+   * **The groups are drawn only once their seed has run**, and they were drawn
+   * one render earlier. The render that learns the rows draws group 0 at once,
+   * because the store already has one group, and its widgets read their values
+   * when they mount, which is before this effect seeds them; they do not follow
+   * the store afterwards. So the worksheet's first row showed empty while the
+   * form state held its saved mapping: a required property that looked unmapped,
+   * no message under it, and Save enabled. Groups 1 and up mounted after the
+   * resize and were right, which is why only the first row was ever wrong.
+   */
+  const [seededRows, setSeededRows] = useState<readonly JetsRow[] | undefined>(undefined);
   useEffect(() => {
     const repeat = currentForm?.repeat;
     if (repeat === undefined || repeatRows === undefined || loaded === null) return;
@@ -421,6 +435,7 @@ export function FlowRunner({ api }: { api: ApiClient }) {
     repeatRows.forEach((row, index) => {
       seed({ formState, group: GROUP, flowKey: loaded.flow.key }, row, index);
     });
+    setSeededRows(repeatRows);
     formState.notifyListeners();
   }, [currentForm, repeatRows, formState, loaded]);
 
@@ -606,6 +621,10 @@ export function FlowRunner({ api }: { api: ApiClient }) {
         URL.revokeObjectURL(url);
       },
       notify: (level, message) => (level === "error" ? setError(message) : setStatus(message)),
+      // A completed action the user must read, such as a workspace file saved
+      // with the save check's warnings (`cpipesTemplateApply`). The shell's
+      // status outlives the screen, so it is still there when the flow exits.
+      warn: (message) => setStatus(message, "warn"),
       setBusy,
       goToState: (state: string) => {
         jumpTo.current = state;
@@ -979,10 +998,14 @@ export function FlowRunner({ api }: { api: ApiClient }) {
           // the store does not have yet, because the resize happens in an effect
           // *after* the render that learns the rows. `min` is the state both are
           // true in.
+          // And none until the rows they draw have been seeded (`seededRows`):
+          // a group drawn before its seed shows empty fields over a seeded store.
           groupCount:
             currentForm.repeat === undefined
               ? 1
-              : Math.min(repeatRows?.length ?? 0, formState.groupCount),
+              : repeatRows === undefined || seededRows !== repeatRows
+                ? 0
+                : Math.min(repeatRows.length, formState.groupCount),
           tableConfig: (tableKey) => withCustomButtons(tableConfigOf(loaded.flow, tableKey), customButtons),
           fetcher,
           tableContext,

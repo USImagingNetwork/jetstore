@@ -13,6 +13,19 @@
         }
       ]
     },
+    "checkPendingTasks": {
+      "description": "Start the pipeline executions waiting in pending, such as rows inserted by SQL",
+      "steps": [
+        {
+          "do": "post",
+          "endpoint": "/dataTable",
+          "action": "start_pending_tasks",
+          "spinner": true,
+          "data": { "rows": "none" }
+        },
+        { "do": "notify", "level": "info", "message": "Pending pipelines checked: those that can start now have been started" }
+      ]
+    },
     "putSchemaEvent": {
       "description": "Save the pasted schema event to the schema triggers folder; the server names the file",
       "steps": [
@@ -55,6 +68,75 @@
     "getSchemaEvent": {
       "description": "Copy the schema event of the selected run's input registration to the clipboard",
       "steps": [{ "do": "escape", "name": "copySchemaEvent" }]
+    },
+    "deleteSessions": {
+      "description": "List the selected sessions and every session reading them, confirm, and queue their deletion",
+      "steps": [
+        { "do": "escape", "name": "previewSessionDeletion" },
+        {
+          "do": "confirm",
+          "message": "Delete these sessions? Their rows are deleted from the database, the sessions reading them included; their files on S3 are kept, and a later lookback read skips them. This cannot be undone.",
+          "detailFromKey": "session_deletion_preview"
+        },
+        {
+          "do": "post",
+          "endpoint": "/dataTable",
+          "action": "delete_sessions",
+          "spinner": true,
+          "onConflict": "The sessions to delete changed since they were listed. Select Delete again to review them.",
+          "data": {
+            "rows": "fields",
+            "fields": {
+              "session_id": { "fromKeyList": "sessionRegistryTable" },
+              "expected": { "fromKeyList": "session_deletion_expected" }
+            }
+          }
+        },
+        {
+          "do": "notify",
+          "level": "info",
+          "message": "Deletion queued: the sessions show as pending until they are deleted, and a session with a run still active waits for it to end"
+        }
+      ]
+    },
+    "resubmitSessionsAsPending": {
+      "description": "Copy the selected sessions' runs into new pending runs, which nothing starts until Check Pending",
+      "steps": [
+        {
+          "do": "confirm",
+          "message": "Resubmit the runs of the selected sessions as pending? Each run is copied into a new session with status pending, and nothing starts it: delete the sessions it replaces if needed, then press Check Pending on Pipelines Status. A file's session has no run and is skipped, as is a run already pending."
+        },
+        {
+          "do": "post",
+          "endpoint": "/dataTable",
+          "action": "resubmit_sessions_as_pending",
+          "spinner": true,
+          "refresh": false,
+          "data": {
+            "rows": "fields",
+            "fields": {
+              "session_id": { "fromKeyList": "sessionRegistryTable" }
+            }
+          }
+        },
+        {
+          "do": "notify",
+          "level": "info",
+          "message": "Resubmitted as pending: the runs wait on Pipelines Status until Check Pending starts them"
+        }
+      ]
+    },
+    "setSessionRegistryFilters": {
+      "description": "Record the Session Registry filters",
+      "steps": [
+        { "do": "validate" },
+        { "do": "escape", "name": "updateSessionRegistryFilters" },
+        { "do": "close" }
+      ]
+    },
+    "clearSessionRegistryFilters": {
+      "description": "Clear the Session Registry filters",
+      "steps": [{ "do": "escape", "name": "clearSessionRegistryFilters" }]
     }
   }
 }

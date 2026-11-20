@@ -23,7 +23,7 @@ import (
 // Skipping the lookup.db rebuild when nothing it is built from has changed.
 //
 // **Packaging lookup.db is most of a workspace compile**: measured 2026-10-11,
-// about 2.1 s of jets_ws's 2.2 s and 1.6 s of usi_ws's 5.6 s. Since a compile
+// about 2.1 s of jets_ws's 2.2 s and 1.6 s of a client workspace's 5.6 s. Since a compile
 // and a rules unit test run exclude each other, that is time a user waits.
 //
 // **What decides lookup.db's bytes, and therefore what the fingerprint covers:**
@@ -56,7 +56,7 @@ import (
 // 2: rdf.ParseBool reads "yes" as true, so a YES in a bool column packages as 1.
 // 3: and "y", so a Y does too.
 // 4: an empty bool cell packages as NULL, served as rdf null, not 0; a value
-// outside the accepted spellings stops the compile (I-45).
+// outside the accepted spellings stops the compile.
 var lookupDbFormatVersion = 4
 
 // lookupDbMetaTable holds the fingerprint. The double underscores keep it out
@@ -154,7 +154,7 @@ func storedLookupDbFingerprint(dbPath string) (fingerprint string, formatVersion
 	defer db.Close()
 	// A file shorter than its header says is refused by SQLite itself
 	// ("database disk image is malformed"), so a truncated copy fails here.
-	rows, err := db.Query(fmt.Sprintf("SELECT name, value FROM %q", lookupDbMetaTable))
+	rows, err := db.Query("SELECT name, value FROM " + sqliteIdent(lookupDbMetaTable))
 	if err != nil {
 		if strings.Contains(err.Error(), "no such table") {
 			return "", "", errors.New("no input fingerprint, it was built before one was recorded")
@@ -186,9 +186,10 @@ func storedLookupDbFingerprint(dbPath string) (fingerprint string, formatVersion
 // writeLookupDbFingerprint records the fingerprint. Nothing time-dependent is
 // stored: a skipped lookup.db must be byte for byte what a rebuild produces.
 func writeLookupDbFingerprint(db *sql.DB, fingerprint, sqliteVersion string) error {
-	stmt := fmt.Sprintf(`CREATE TABLE %q (name TEXT PRIMARY KEY, value TEXT NOT NULL);
-INSERT INTO %q (name, value) VALUES ('inputs_sha256', '%s'), ('format_version', '%d'), ('sqlite_version', '%s');`,
-		lookupDbMetaTable, lookupDbMetaTable, fingerprint, lookupDbFormatVersion, sqliteVersion)
+	meta := sqliteIdent(lookupDbMetaTable)
+	stmt := fmt.Sprintf(`CREATE TABLE %s (name TEXT PRIMARY KEY, value TEXT NOT NULL);
+INSERT INTO %s (name, value) VALUES ('inputs_sha256', '%s'), ('format_version', '%d'), ('sqlite_version', '%s');`,
+		meta, meta, fingerprint, lookupDbFormatVersion, sqliteVersion)
 	_, err := db.Exec(stmt)
 	return err
 }

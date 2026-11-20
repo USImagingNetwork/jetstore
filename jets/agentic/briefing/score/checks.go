@@ -12,14 +12,14 @@ import (
 // check is sits beside the code that implements it and cannot drift from it.
 //
 // **Reading order matters here.** The two maintenance checks come first because
-// they are the phase's headline result and the ones `I-579` says to get exactly
+// they are the headline result and the ones most worth getting exactly
 // right; the union at the end reads the others and is a lower bound by
 // construction.
 
 // ---------------------------------------------------------------- maintenance
 
 // maintenanceAbsent is the check with no free parameter, and it is the one
-// behind `AT.5`'s *5 of 6*.
+// behind the side-by-side run's *5 of 6*.
 //
 // When the fact set holds drugs and none of them is flagged maintenance, the
 // briefing's only subject is those drugs - so any unnegated mention of
@@ -66,7 +66,7 @@ func maintenanceAbsent(f *FactSet, p *reading, _ Options) Result {
 	return res
 }
 
-// maintenanceDrug is `I-579`'s check: the drug name appears in the prose within
+// maintenanceDrug is the drug-level check: the drug name appears in the prose within
 // N words of the word *maintenance*, over the closed list of this member's
 // drugs.
 //
@@ -87,7 +87,7 @@ func maintenanceDrug(f *FactSet, p *reading, opt Options) Result {
 		Unit:      "drug",
 		Residue: "the containment is decidable and **the attribution is not**, which is why this is approximate where " +
 			"CatMaintenanceAbsent is decidable. A maintenance claim naming no drug - `maintenance opioids` - attributes to " +
-			"nothing and is missed; a coordination the attribution rules get wrong is counted. Measured against AT.5's hand " +
+			"nothing and is missed; a coordination the attribution rules get wrong is counted. Measured against a hand " +
 			"count it agrees exactly on M007, 7 of the 16 drugs named, and scores 0 over 66 template briefings",
 	}
 	res := Result{Category: cat, Denominator: len(f.Drugs)}
@@ -146,7 +146,7 @@ func maintenanceDrug(f *FactSet, p *reading, opt Options) Result {
 // maintenanceUnderCall is the other direction, and it is here to be reported as
 // zero rather than to be counted.
 //
-// `F824` measured the error one-directional - `N` becomes `Y` and never the
+// An earlier measurement found the error one-directional - `N` becomes `Y` and never the
 // reverse - over three runs. **That is a measurement about the model, and an
 // instrument that returned 0 because it cannot see the reverse would be
 // indistinguishable from one that returned 0 because the reverse did not
@@ -161,7 +161,7 @@ func maintenanceUnderCall(_ *FactSet, _ *reading, _ Options) Result {
 		Soundness: NotAutomatable,
 		Unit:      "drug",
 		Residue: "the whole category. It needs the scope of a negation over a noun phrase. " +
-			"F824 measured the model's error one-directional over three runs, so the true count over that corpus is " +
+			"The model's error was measured one-directional over three runs, so the true count over that corpus is " +
 			"believed to be zero - which is a fact about the model and not evidence from this check",
 	}}
 }
@@ -176,7 +176,7 @@ func adherenceSurfaced(f *FactSet, p *reading, _ Options) Result {
 		Soundness: Decidable,
 		Unit:      "briefing",
 		Residue: "a briefing that reports the number without naming it - `filled 0 of the days supplied` - " +
-			"is not seen. Q-98's design keeps the ratio on the entity for both arms, so the denominator is every briefing",
+			"is not seen. The design keeps the ratio on the entity for both arms, so the denominator is every briefing",
 	}
 	res := Result{Category: cat, Denominator: 1}
 	for _, w := range []string{"adherence", "adherent", "compliance", "compliant"} {
@@ -189,13 +189,13 @@ func adherenceSurfaced(f *FactSet, p *reading, _ Options) Result {
 	return res
 }
 
-// adherenceEvaluated counts `F823`: the model giving an integer-division
+// adherenceEvaluated counts the model giving an integer-division
 // artefact an evaluative reading.
 //
 // **This is a lexicon and it is wrong in both directions**, which is why it is
 // approximate. It misses a phrasing nobody thought of, and it flags an
 // evaluative word that happens to sit near the ratio without qualifying it. The
-// line it draws is the one `AT.5`'s hand count drew: reading the number out is
+// line it draws is the one the side-by-side hand count drew: reading the number out is
 // not evaluation - *"an adherence value of 0"* - and re-expressing it as a grade
 // is - *"no reported adherence"*, *"one hundred percent adherence"*, *"full
 // adherence"*, *"0.00%"*, the unit `M040` invented that the pipeline cannot
@@ -209,7 +209,7 @@ func adherenceEvaluated(f *FactSet, p *reading, _ Options) Result {
 		Direction: BothWays,
 		Unit:      "briefing",
 		Residue: "the boundary between reading the number out and grading it is a reader's line, drawn here where " +
-			"AT.5's hand count drew it: `an adherence value of 0` is not evaluation and `no reported adherence` is",
+			"a hand count drew it: `an adherence value of 0` is not evaluation and `no reported adherence` is",
 	}
 	res := Result{Category: cat, Denominator: 1}
 	anchors := anchorsFor(p, "adherence", "adherent", "compliance", "compliant")
@@ -218,15 +218,15 @@ func adherenceEvaluated(f *FactSet, p *reading, _ Options) Result {
 	}
 	for _, a := range anchors {
 		// A percent sign anywhere in the clause. `M040` writes the ratio as
-		// `0.00%`, which is a unit the pipeline cannot produce - F822 measured
-		// the ratio taking two values by integer division - and the character is
+		// `0.00%`, which is a unit the pipeline cannot produce - the ratio was
+		// measured taking two values by integer division - and the character is
 		// dropped by the tokeniser, so it is looked for in the clause as
 		// written rather than among the words.
 		if strings.Contains(p.clauseText(p.words[a].clause), "%") {
 			res.Flagged = 1
 			res.Findings = append(res.Findings, Finding{
 				Category: cat.Name, Subject: "%",
-				Detail: "the ratio rendered as a percentage; the pipeline produces no such unit (F822)",
+				Detail: "the ratio rendered as a percentage; the pipeline produces no such unit",
 				Quote:  p.quote(a),
 			})
 			return res
@@ -240,7 +240,7 @@ func adherenceEvaluated(f *FactSet, p *reading, _ Options) Result {
 				res.Findings = append(res.Findings, Finding{
 					Category: cat.Name,
 					Subject:  phrase,
-					Detail:   "an evaluative reading of a ratio that takes two values on this pipeline (F822)",
+					Detail:   "an evaluative reading of a ratio that takes two values on this pipeline",
 					Quote:    p.quote(a),
 				})
 				return res
@@ -260,7 +260,7 @@ var evaluativeTerms = []string{
 	"consistent", "suboptimal", "optimal",
 }
 
-// adherenceAttributed counts `F826`: an adherence value attributed to a drug
+// adherenceAttributed counts an adherence value attributed to a drug
 // that carries none. It reuses maintenanceDrug's attribution machinery exactly,
 // with the anchor changed and the fact-set predicate changed.
 func adherenceAttributed(f *FactSet, p *reading, opt Options) Result {
@@ -330,7 +330,7 @@ func anchorsFor(p *reading, words ...string) []int {
 
 // ------------------------------------------------------------------- omission
 
-// conditionOmitted is the category `AT.5`'s report calls *an instrument, not a
+// conditionOmitted is the category the side-by-side report calls *an instrument, not a
 // measurement*, and it is the one this package changes most.
 //
 // # Three rules over one question, reported as a bracket
@@ -354,7 +354,7 @@ func anchorsFor(p *reading, words ...string) []int {
 //
 // # One change to the rule itself, and it moves a number
 //
-// Tokens are matched **as words**, not as substrings. `AT.5`'s script used
+// Tokens are matched **as words**, not as substrings. The original script used
 // `strings.Contains` and therefore passed `M007`'s missing *rheumatoid
 // arthritis*, because *arthritis* is inside *osteoarthritis* - which its own
 // report names as the instrument's clearest error. A word-boundary test does not
@@ -409,11 +409,11 @@ func conditionOmitted(f *FactSet, p *reading, _ Options) Result {
 
 // ------------------------------------------------------------ prompt and tone
 
-// advisoryLanguage reuses `AK.3`'s lexicon and says what reusing it costs.
+// advisoryLanguage reuses the advisory guardrail's lexicon and says what reusing it costs.
 //
 // # The base is briefing.AdvisoryMarker and the supplement is this package's
 //
-// `AK.3` was built to police the fields of a briefing *record*, and its own doc
+// That lexicon was built to police the fields of a briefing *record*, and its own doc
 // comment says it is blunt on purpose and safe because its blast radius is a
 // declared free-text field. Applied to whole prose it is neither blunt enough
 // nor broad enough in the same places, and the corpus shows exactly where: it
@@ -435,11 +435,11 @@ func advisoryLanguage(_ *FactSet, p *reading, _ Options) Result {
 	cat := Category{
 		Name:      CatAdvisory,
 		Question:  "does the briefing carry an imperative or a recommendation?",
-		Rule:      "AK.3's lexicon (briefing.AdvisoryMarker) over each clause, plus this package's prose supplement",
+		Rule:      "the advisory lexicon (briefing.AdvisoryMarker) over each clause, plus this package's prose supplement",
 		Soundness: Approximate,
 		Direction: BothWays,
 		Unit:      "briefing",
-		Residue: "a lexicon cannot see advice phrased as an observation. AK.3's own comment says it is blunt by design " +
+		Residue: "a lexicon cannot see advice phrased as an observation. The lexicon's own comment says it is blunt by design " +
 			"because its blast radius is a declared free-text field; over whole prose that argument does not hold, " +
 			"and this check is reported as approximate for that reason rather than inheriting the guardrail's confidence",
 	}
@@ -453,7 +453,7 @@ func advisoryLanguage(_ *FactSet, p *reading, _ Options) Result {
 			res.Flagged = 1
 			res.Findings = append(res.Findings, Finding{
 				Category: cat.Name, Subject: marker,
-				Detail: "AK.3 lexicon", Quote: strings.Join(strings.Fields(text), " "),
+				Detail: "advisory lexicon", Quote: strings.Join(strings.Fields(text), " "),
 			})
 			continue
 		}
@@ -461,14 +461,14 @@ func advisoryLanguage(_ *FactSet, p *reading, _ Options) Result {
 			res.Flagged = 1
 			res.Findings = append(res.Findings, Finding{
 				Category: cat.Name, Subject: marker,
-				Detail: "prose supplement; AK.3's lexicon does not see this form", Quote: strings.Join(strings.Fields(text), " "),
+				Detail: "prose supplement; the advisory lexicon does not see this form", Quote: strings.Join(strings.Fields(text), " "),
 			})
 		}
 	}
 	return res
 }
 
-// proseSupplement is what `AK.3`'s lexicon does not see in whole prose. Every
+// proseSupplement is what the guardrail's lexicon does not see in whole prose. Every
 // entry is here because the labelled corpus carries it, and none is speculative:
 // a lexicon grown by imagination is a lexicon whose false-positive rate nobody
 // measured.
@@ -483,17 +483,17 @@ func proseSupplement(s string) (string, bool) {
 }
 
 var supplementMarkers = []string{
-	// participles of the recommendation verbs. AK.3 matches on word boundaries,
+	// participles of the recommendation verbs. The lexicon matches on word boundaries,
 	// so `suggest` does not match inside `suggesting`.
 	"suggesting", "recommending", "advising", "urging", "encouraging",
 	"indicating a need", "warranting", "warrants",
-	// clause-initial `remember` without the `to`. AK.3 carries `remember to`.
+	// clause-initial `remember` without the `to`. The lexicon carries `remember to`.
 	"remember,", "remember that", "note that", "keep in mind",
 	// the passive form of an instruction, which reads as guidance to the reader.
 	"should be", "may want to", "might consider", "it is advisable",
 }
 
-// aboutTheSummary counts `F831`, the finding `AT.5`'s report calls the one that
+// aboutTheSummary counts the finding the side-by-side report calls the one that
 // is about the product rather than the guardrail: the model writes a document
 // about a document.
 func aboutTheSummary(_ *FactSet, p *reading, _ Options) Result {
@@ -526,7 +526,7 @@ func aboutTheSummary(_ *FactSet, p *reading, _ Options) Result {
 // list, read off the same document.
 //
 // The second half is the `Briefing_Data_Flags` value read back. That is
-// `I-578`'s subject: a sentence of prompt instruction that lives on the entity,
+// a known defect: a sentence of prompt instruction that lives on the entity,
 // which the model treats as content. It is approximate because a paraphrase of
 // the flag is still an echo and half a flag is a judgement.
 //
@@ -568,7 +568,7 @@ func echoesPrompt(f *FactSet, p *reading, opt Options) Result {
 		})
 	}
 	// (b) an underscored identifier that occurs inside a flag's *value*. The
-	// ratio reaches this entity as `Adherence` (F839), so `Adherence_Ratio` is
+	// ratio reaches this entity as `Adherence`, so `Adherence_Ratio` is
 	// a name the prompt carries only inside the flag sentence - and three
 	// briefings write it out.
 	for _, id := range identifiersIn(f.Flags) {
@@ -578,7 +578,7 @@ func echoesPrompt(f *FactSet, p *reading, opt Options) Result {
 		res.Flagged = 1
 		res.Findings = append(res.Findings, Finding{
 			Category: cat.Name, Subject: id,
-			Detail: "a property name from a Briefing_Data_Flags value, verbatim (I-578)", Quote: quoteAround(p, id),
+			Detail: "a property name from a Briefing_Data_Flags value, verbatim", Quote: quoteAround(p, id),
 		})
 	}
 	// (c) a contiguous run of a flag's own words. Contiguity is what separates
@@ -593,7 +593,7 @@ func echoesPrompt(f *FactSet, p *reading, opt Options) Result {
 			res.Flagged = 1
 			res.Findings = append(res.Findings, Finding{
 				Category: cat.Name, Subject: "Briefing_Data_Flags",
-				Detail: "a five-word run of a flag value, verbatim (I-578)", Quote: p.quote(i),
+				Detail: "a five-word run of a flag value, verbatim", Quote: p.quote(i),
 			})
 			break
 		}
@@ -785,7 +785,7 @@ func invention(_ *FactSet, _ *reading, _ Options) Result {
 		Rule:      "none; this reports zero and means unmeasured",
 		Soundness: NotAutomatable,
 		Unit:      "briefing",
-		Residue: "the whole category. F828's `oxycontin` for `oxyCODONE-Acetaminophen` is a drug name that is not " +
+		Residue: "the whole category. In a measured case, `oxycontin` for `oxyCODONE-Acetaminophen` is a drug name that is not " +
 			"this member's drug, and no containment test separates it from a legitimate short form - which is the same " +
 			"reason the drug surface forms above accept `metformin` for `metFORMIN HCl`",
 	}}
@@ -798,7 +798,7 @@ func mispairing(_ *FactSet, _ *reading, _ Options) Result {
 		Rule:      "none; this reports zero and means unmeasured",
 		Soundness: NotAutomatable,
 		Unit:      "briefing",
-		Residue: "the whole category. F829's `(J4540) ... and (J309) ..., both of which are uncomplicated` needs the " +
+		Residue: "the whole category. In a measured case, `(J4540) ... and (J309) ..., both of which are uncomplicated` needs the " +
 			"scope of a modifier over a coordination, which is a reader's judgement",
 	}}
 }
@@ -810,14 +810,14 @@ func implication(_ *FactSet, _ *reading, _ Options) Result {
 		Rule:      "none; this reports zero and means unmeasured",
 		Soundness: NotAutomatable,
 		Unit:      "briefing",
-		Residue: "the whole category, and section 1.7.4 says so in terms: implication is *the residue*, no check catches " +
-			"it and none is proposed. F834's `for diabetes management` is true of the world and absent from the fact set",
+		Residue: "the whole category, and the design says so in terms: implication is *the residue*, no check catches " +
+			"it and none is proposed. In a measured case, `for diabetes management` is true of the world and absent from the fact set",
 	}}
 }
 
 // --------------------------------------------------------------------- union
 
-// untrueUnion is `AT.5`'s *at least one statement not true of the fact set*, and
+// untrueUnion is the side-by-side report's *at least one statement not true of the fact set*, and
 // it is a **lower bound** by construction.
 //
 // It is the union of the categories above that assert something false about the

@@ -298,7 +298,7 @@ func (dkInfo *HeadersAndDomainKeysInfo) Initialize(mainObjectType string, domain
 			v.ColumnPos[jpos], ok = dkInfo.HeadersPosMap[columnName]
 			if !ok {
 				err := fmt.Errorf(
-					"error while getting domain keys: column name '%s' not found in headers of table %s, see if table jetsapi.domain_keys_registry has an invaid record",
+					"error while getting domain keys: column name '%s' not found in headers of table %s, see if table jetsapi.domain_keys_registry has an invalid record",
 					columnName, dkInfo.TableName)
 				log.Println(err)
 				return err
@@ -378,7 +378,7 @@ func applyPreprocessingFunction(fncName, value string) (string, error) {
 		formatedDate := fmt.Sprintf("%d%02d%02d", year, month, day)
 		return formatedDate, nil
 
-	case "remove_mi": // remove last 2 char if last-1 is a space, e.g. "michel f" becomes "michel"
+	case "remove_mi": // remove last 2 char if last-1 is a space, e.g. "martin f" becomes "martin"
 		l := len(value)
 		if l < 3 {
 			return value, nil

@@ -1,15 +1,16 @@
 /**
  * @vitest-environment jsdom
  *
- * Tests for the text input and dropdown widgets (task A.3).
+ * Tests for the text input and dropdown widgets.
  *
  * The assertions that matter are the ones about **form state**, not about
  * markup: these widgets exist to feed the same store the data table publishes
- * into (I-9), and the query builder downstream distinguishes an absent key from
+ * into, and the query builder downstream distinguishes an absent key from
  * an empty one. Getting that wrong would not look wrong on screen.
  */
 
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { createRoot } from "react-dom/client";
 import { afterEach, describe, expect, it } from "vitest";
 
 import corpus from "../datatable/fixtures/form_fields.json";
@@ -46,7 +47,7 @@ describe("TextInput", () => {
   });
 
   it("clears the binding rather than storing an empty string", () => {
-    // A.4a's where-clause fallback tests for *absence*; an empty string would
+    // The where-clause fallback tests for *absence*; an empty string would
     // filter on "" and return nothing, which looks like a broken query.
     const formState = new FormState();
     formState.setValue(0, "client", "acme");
@@ -179,6 +180,56 @@ describe("Dropdown", () => {
     );
     expect(formState.getValue(0, "format")).toBe("csv");
   });
+
+  it("keeps a choice made after the items are drawn and before the re-seed runs", async () => {
+    // **2026-10-27.** The re-seed above is a
+    // passive effect, and a render that is not inside an event leaves it to run
+    // later. A change landing in that gap wrote the store, and the effect then
+    // compared against the render's stale `value` and put the default back.
+    // `FlowRunner.test.tsx`'s waiting-query case picks a client as soon as the
+    // options are drawn, and lost this race about once in twenty full runs.
+    //
+    // Made deterministic here: no `act`, so React schedules the effect rather
+    // than flushing it, and the change is dispatched from a MutationObserver,
+    // whose callback runs as a microtask right after the commit's DOM writes.
+    const env = globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean };
+    const wasAct = env.IS_REACT_ACT_ENVIRONMENT;
+    env.IS_REACT_ACT_ENVIRONMENT = false;
+    const host = document.body.appendChild(document.createElement("div"));
+    const root = createRoot(host);
+    const formState = new FormState();
+    const props = { formState, group: 0, fieldKey: "client", label: "Client" };
+    const prompt = { value: "", label: "Select a Client" };
+    try {
+      root.render(<Dropdown {...props} items={[prompt]} loading />);
+      await new Promise((r) => setTimeout(r, 20));
+
+      let chosen = false;
+      const observer = new MutationObserver(() => {
+        const select = host.querySelector("select")!;
+        if (chosen || select.options.length !== 3) return;
+        chosen = true;
+        fireEvent.change(select, { target: { value: "acme" } });
+      });
+      observer.observe(host, { subtree: true, childList: true, attributes: true });
+      root.render(
+        <Dropdown
+          {...props}
+          items={[prompt, { value: "acme", label: "acme" }, { value: "globex", label: "globex" }]}
+        />,
+      );
+      await new Promise((r) => setTimeout(r, 50));
+      observer.disconnect();
+
+      expect(chosen).toBe(true);
+      expect(formState.getValue(0, "client")).toBe("acme");
+      expect((host.querySelector("select") as HTMLSelectElement).value).toBe("acme");
+    } finally {
+      root.unmount();
+      host.remove();
+      env.IS_REACT_ACT_ENVIRONMENT = wasAct;
+    }
+  });
 });
 
 describe("the field corpus", () => {
@@ -192,7 +243,7 @@ describe("the field corpus", () => {
   ).forms;
   const fields = Object.values(forms).flatMap((f) => f.fields);
 
-  it("is the 50 flow forms, and A.3 covers the two scalar input types in them", () => {
+  it("is the 50 flow forms, and these widgets cover the two scalar input types in them", () => {
     expect(Object.keys(forms)).toHaveLength(50);
     const counts = fields.reduce<Record<string, number>>((acc, f) => {
       acc[f.type] = (acc[f.type] ?? 0) + 1;
@@ -200,14 +251,14 @@ describe("the field corpus", () => {
     }, {});
     expect(counts["FormInputFieldConfig"]).toBe(46);
     expect(counts["FormDropdownFieldConfig"]).toBe(11);
-    // The data-table field is A.4's, and its 37 match the 37 table configurations
+    // The data-table field is covered elsewhere, and its 37 match the 37 table configurations
     // exactly — the cross-check that says the traversal reaches everything.
     expect(counts["FormDataTableFieldConfig"]).toBe(37);
   });
 
   it("cannot see the two exotic field types, which is not the same as their being absent", () => {
     // **This assertion was read for a year as evidence about the app and it is
-    // evidence about the corpus** (I-60, 2026-08-23). `FormTypeaheadFieldConfig`
+    // evidence about the corpus** (2026-08-23). `FormTypeaheadFieldConfig`
     // and `FormDropdownWithSharedItemsFieldConfig` have three constructor sites
     // between them — two live, one commented out — all inside `mapFileUF`'s
     // `inputFieldRowBuilder`, and `allFields` deliberately does not walk a row
@@ -220,7 +271,7 @@ describe("the field corpus", () => {
     // say what it measures: it is still the guard that would fire if one of these
     // types appeared in a statically declared field, which is a real thing to
     // learn. Both are now served — the typeahead by `widgets/Typeahead.tsx` and
-    // the shared-items dropdown by `Dropdown.tsx` plus `itemsFrom` (I.2b).
+    // the shared-items dropdown by `Dropdown.tsx` plus `itemsFrom`.
     for (const type of ["FormTypeaheadFieldConfig", "FormDropdownWithSharedItemsFieldConfig"]) {
       expect(fields.some((f) => f.type === type)).toBe(false);
     }

@@ -2,7 +2,7 @@
  * @vitest-environment jsdom
  *
  * The app's own `confirm` and `prompt`, and the rule that nothing else asks.
- * jetstore_maintenance_02 `I-39`, 2026-10-02.
+ * Added 2026-10-02.
  *
  * The first block pins the native contract the call sites rely on: a call site
  * changed by an `await` and nothing else, so `true`/`false` and value/`null`
@@ -75,6 +75,31 @@ describe("confirm", () => {
     fireEvent(screen.getByRole("dialog"), new Event("cancel", { cancelable: true }));
     expect(await answer).toBe(false);
     expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("shows a detail under the message, line breaks kept, named by the message alone", async () => {
+    // The Session Registry (2026-11-08): *Delete*'s list of sessions. The
+    // class is the message's, whose rule is `white-space: pre-wrap`; jsdom
+    // computes no style, so the text node carrying the newlines is what is held.
+    const prompts = mount();
+    let answer!: Promise<boolean>;
+    act(() => {
+      answer = prompts.confirm("Delete these sessions?", "1001: claim\n2002: map_records, reads 1001");
+    });
+    const dialog = screen.getByRole("dialog", { name: "Delete these sessions?" });
+    const detail = within(dialog).getByTestId("prompt-detail");
+    expect(detail.textContent).toBe("1001: claim\n2002: map_records, reads 1001");
+    expect(detail.className).toBe("prompt-dialog__message");
+    fireEvent.click(within(dialog).getByRole("button", { name: "OK" }));
+    expect(await answer).toBe(true);
+  });
+
+  it("shows no detail when none is given, or an empty one", () => {
+    const prompts = mount();
+    act(() => {
+      void prompts.confirm("Sure?", "");
+    });
+    expect(within(screen.getByRole("dialog")).queryByTestId("prompt-detail")).toBeNull();
   });
 
   it("has no text box", () => {

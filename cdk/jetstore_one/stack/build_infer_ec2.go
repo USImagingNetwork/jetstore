@@ -24,7 +24,7 @@ import (
 // INFER_AMI_NAME (optional) escape hatch to pin a custom AMI; when unset the stock ECS
 // GPU-optimized Amazon Linux 2023 AMI is used (NVIDIA driver + ECS agent preinstalled)
 // INFER_AMI_OWNER (optional) owner of the custom AMI, default "self"; ignored unless INFER_AMI_NAME is set
-// INFER_MEM_LIMIT_MB (optional) memory limit in MB for infer task, default 51200 (64 GB * 0.8)
+// INFER_MEM_LIMIT_MB (optional) memory limit in MB for infer task, default 52224 (1024 * 51, about 80% of g6e.2xlarge's 64 GiB; see InferMemLimitMB)
 // INFER_EC2_INSTANCE_TYPE (optional) EC2 instance type for infer task, default g6e.2xlarge
 // INFER_ROOT_VOLUME_GB (optional) size of the instance root volume in GB, default 50
 
@@ -66,7 +66,7 @@ func (jsComp *JetStoreStackComponents) BuildInferEc2(scope constructs.Construct,
 	//    managed independently of the instance lifecycle.
 	//
 	// This volume holds the model weights, so its throughput is the model-load
-	// half of scale-from-zero. Measured 2026-09-10 (agentic_ai F894, I-607):
+	// half of scale-from-zero. Measured 2026-09-10:
 	// vLLM reads a 6.34 GiB bf16 checkpoint in 51.0 s and ollama a ~2.1 GiB
 	// Q4_K_M blob in 17.3 s -- 124 and ~120 MiB/s. Neither server is slow at
 	// loading; both are reading at gp3's *baseline* 125 MiB/s, because nothing

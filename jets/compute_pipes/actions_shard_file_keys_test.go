@@ -1,8 +1,12 @@
 package compute_pipes
 
 import (
+	"bytes"
 	"fmt"
+	"log"
+	"os"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/artisoft-io/jetstore/jets/awsi"
@@ -24,12 +28,13 @@ func TestAssignShardInfo10(t *testing.T) {
 	if nShards != 5 {
 		t.Errorf("error, expecting 5 shard, got %d", nShards)
 	}
+	// The last chunk ends at the file's last byte, Size-1: the range is inclusive.
 	expected := [][]any{
 		{"012345", "file_key1", int64(100), int64(0), int64(20), 0, 0},
 		{"012345", "file_key1", int64(100), int64(21), int64(41), 1, 0},
 		{"012345", "file_key1", int64(100), int64(42), int64(62), 2, 0},
 		{"012345", "file_key1", int64(100), int64(63), int64(83), 3, 0},
-		{"012345", "file_key1", int64(100), int64(84), int64(100), 4, 0},
+		{"012345", "file_key1", int64(100), int64(84), int64(99), 4, 0},
 	}
 
 	for i, row := range rows {
@@ -56,7 +61,7 @@ func TestAssignShardInfoP10(t *testing.T) {
 		t.Errorf("error, expecting 1 shard, got %d", nShards)
 	}
 	expected := [][]any{
-		{"012345", "file_key1", int64(0), int64(0), int64(0), 0, 0},
+		{"012345", "file_key1", int64(25), int64(0), int64(0), 0, 0},
 	}
 
 	for i, row := range rows {
@@ -163,7 +168,7 @@ func TestAssignShardInfoP13(t *testing.T) {
 }
 
 func TestAssignShardInfo11(t *testing.T) {
-  // shard_offset = 10
+	// shard_offset = 10
 	rows, nShards := assignShardInfo(
 		[]*awsi.S3Object{
 			{Key: "file_key1", Size: 100},
@@ -180,7 +185,7 @@ func TestAssignShardInfo11(t *testing.T) {
 		{"012345", "file_key1", int64(100), int64(11), int64(41), 1, 0},
 		{"012345", "file_key1", int64(100), int64(32), int64(62), 2, 0},
 		{"012345", "file_key1", int64(100), int64(53), int64(83), 3, 0},
-		{"012345", "file_key1", int64(100), int64(74), int64(100), 4, 0},
+		{"012345", "file_key1", int64(100), int64(74), int64(99), 4, 0},
 	}
 
 	for i, row := range rows {
@@ -283,7 +288,7 @@ func TestAssignShardInfo4(t *testing.T) {
 		{"012345", "file_key1", int64(10), int64(0), int64(0), 0, 0},
 		{"012345", "file_key2", int64(50), int64(0), int64(10), 0, 0},
 		{"012345", "file_key2", int64(50), int64(11), int64(31), 1, 0},
-		{"012345", "file_key2", int64(50), int64(32), int64(50), 2, 0},
+		{"012345", "file_key2", int64(50), int64(32), int64(49), 2, 0},
 		{"012345", "file_key3", int64(20), int64(0), int64(0), 3, 0},
 	}
 
@@ -378,6 +383,21 @@ func TestPruneIgnoredFileKeys(t *testing.T) {
 			wantKeys: []string{sentinel, property, part1, part2},
 		},
 		{
+			name:     "entries padded with whitespace are trimmed, not matched as written",
+			ignore:   " test_harness_filters.txt | _COMPLETE\t",
+			wantKeys: []string{part1, part2},
+		},
+		{
+			name:     "a whitespace-only entry is empty, it does not match keys ending in a space",
+			ignore:   "test_harness_filters.txt|  ",
+			wantKeys: []string{sentinel, part1, part2},
+		},
+		{
+			name:     "a whitespace-only value is the same as absent",
+			ignore:   " \t ",
+			wantKeys: []string{sentinel, property, part1, part2},
+		},
+		{
 			name:     "the suffix carries no path boundary, so .csv prunes every data file",
 			ignore:   ".csv",
 			wantKeys: []string{sentinel, property},
@@ -434,5 +454,27 @@ func TestPruneIgnoredFileKeysEmptyFolder(t *testing.T) {
 	if totalFileSize != 0 {
 		t.Errorf("error: expecting a total file size of 0, so that the guard at :95 is reached, got %d",
 			totalFileSize)
+	}
+}
+
+// TestPruneIgnoredFileKeysLogsSkippedEntries asserts that an entry skipped for being
+// empty, after trimming, is logged, so that a stray '|' or a blank entry in
+// ${JETS_IGNORE_FILE} is visible in the run's log rather than silent.
+func TestPruneIgnoredFileKeysLogsSkippedEntries(t *testing.T) {
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	folder := []*awsi.S3Object{{Key: "client/period/test_harness_filters.txt", Size: 120}}
+	pruneIgnoredFileKeys(folder, "test_harness_filters.txt| |")
+	out := buf.String()
+	for _, want := range []string{"Skipping empty entry 2 of ${JETS_IGNORE_FILE}",
+		"Skipping empty entry 3 of ${JETS_IGNORE_FILE}"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expecting the log to contain %q, got %q", want, out)
+		}
+	}
+	if strings.Contains(out, "Skipping empty entry 1 ") {
+		t.Errorf("entry 1 is not empty and must not be reported as skipped, got %q", out)
 	}
 }

@@ -15,9 +15,18 @@ corrected 2026-08-27 at D.10.**
 sections are kept because they say what this file *is*, and they should be read
 as history rather than as a procedure.
 
-**So this file is now the authoring surface for a flow table's configuration**,
+~~**So this file is now the authoring surface for a flow table's configuration**,
 because the emitter still owns the 63 committed `.tc.json` documents and
-`table.test.ts` fails on a hand-edit to one of them. D.10 wrote the first
+`table.test.ts` fails on a hand-edit to one of them.~~ **Nothing is emitted from
+this file since 2026-11-14, and it is no authoring surface.** `table.test.ts`
+wrote the translated documents under `UPDATE_SCHEMA=1` (`npm run emit-schema`),
+which could only rewrite what was committed, overwrite an edit, or delete a new
+document it did not know. The committed `.tc.json` is the source. `table.test.ts`
+still compares each document nobody has edited with its translation from this
+file, so a table edited by hand is listed in `HAND_MAINTAINED_KEYS` in the same
+change; editing this file changes no document. The other tests read it as
+material: the configurations of a real app, to test the query builder and the
+model against. D.10 wrote the first
 configuration in here that has no Dart original: `fmInputSourceMappingUF`'s
 *Load Data* and *Loader Status* buttons (**I-260**). Everything else is still the
 measurement.
@@ -113,7 +122,8 @@ with the fixture — see the README beside it", and the README beside it describ
 only `table_configs.json`. Written now because the traversal repair below adds
 data this file had never carried and there was nowhere to say what that data is.
 
-It holds the 50 form configurations the eleven user flows define, their fields
+It holds the 50 form configurations the eleven user flows defined when it was
+generated (the Flutter app was deleted on 2026-08-26), their fields
 across the three field containers, and — since 2026-08-25 — the buttons they
 declare in `FormConfig.actions`.
 

@@ -145,8 +145,8 @@ function stubServer() {
       return new Response(
         JSON.stringify({
           token: "t0",
-          name: "Michel",
-          user_email: "michel@artisoft.io",
+          name: "Test User",
+          user_email: "user@example.com",
           is_admin: false,
           capabilities: [WORKSPACE_IDE],
         }),
@@ -212,7 +212,7 @@ function stubServer() {
 async function mount(at = "/workspace") {
   const { fetchImpl, posts } = stubServer();
   const api = new ApiClient("", fetchImpl);
-  await api.login("michel@artisoft.io", "pw");
+  await api.login("user@example.com", "pw");
 
   render(
     <MemoryRouter initialEntries={[at]}>
@@ -584,7 +584,7 @@ describe("the two tabs that write workspace files", () => {
     // One row, naming the file itself rather than its key: the handler reads
     // `request["source_file_name"]` (`DeleteWorkspaceFile`).
     expect(sent.body["data"]).toEqual([
-      { source_file_name: "data_model/FilesRow.jr", user_email: "michel@artisoft.io" },
+      { source_file_name: "data_model/FilesRow.jr", user_email: "user@example.com" },
     ]);
 
     // The tree is re-read, and the view tab is still open — see the header.
@@ -641,7 +641,41 @@ describe("the two tabs that write workspace files", () => {
     const sent = adds()[0]!;
     expect(sent.workspaceName).toBe("ws");
     expect(sent.body["data"]).toEqual([
-      { source_file_name: "data_model/FilesNew.jr", user_email: "michel@artisoft.io" },
+      { source_file_name: "data_model/FilesNew.jr", user_email: "user@example.com" },
+    ]);
+  });
+
+  it("keeps a cancelled Add File's name out of the view's state", async () => {
+    // The dialog's field and the table's selection share the key
+    // `source_file_name`. A dialog that wrote into the view's own state left the
+    // typed name (or the seeded prefix) where Delete reads the selection, and in
+    // the box the next time the dialog opened.
+    const { posts } = await openFilesTab();
+    await screen.findByText("data_model/FilesRow.jr");
+    fireEvent.click(screen.getAllByRole("checkbox")[0]!);
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Delete" }).hasAttribute("disabled")).toBe(false),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Add File" }));
+    const name = (await screen.findByLabelText("File Name")) as HTMLInputElement;
+    fireEvent.change(name, { target: { value: "data_model/Typed.jr" } });
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByLabelText("File Name")).toBeNull());
+
+    // Reopened, it starts from the section prefix again.
+    fireEvent.click(screen.getAllByRole("button", { name: "Add File" })[0]!);
+    expect(((await screen.findByLabelText("File Name")) as HTMLInputElement).value).toBe("data_model/");
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByLabelText("File Name")).toBeNull());
+
+    // And Delete still deletes the selected file, not a name typed into the dialog.
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    expect(await answerConfirm("OK")).toBe("Are you sure you want to delete the selected file(s)?");
+    const deletes = () => posts.filter((p) => p.action === "delete_workspace_files");
+    await waitFor(() => expect(deletes().length).toBe(1));
+    expect(deletes()[0]!.body["data"]).toEqual([
+      { source_file_name: "data_model/FilesRow.jr", user_email: "user@example.com" },
     ]);
   });
 
