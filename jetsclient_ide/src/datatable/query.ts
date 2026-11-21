@@ -1,6 +1,6 @@
 /**
  * Builds the `/dataTable` request body from a table configuration and the state
- * around it. Task A.4a of the UI port's Phase 2.
+ * around it.
  *
  * **This is a port, not a redesign.** It reproduces
  * `jetsclient/lib/components/data_table_source.dart` — `_addOrWith` (`:294`),
@@ -11,7 +11,7 @@
  * does something surprising, the comment says so rather than fixing it.
  *
  * It is deliberately free of React, the DOM and any transport: the whole point
- * of splitting A.4a out of the widget is that this half has a checkable contract
+ * of splitting the query builder out of the widget is that this half has a checkable contract
  * and can be tested without either.
  */
 
@@ -65,7 +65,7 @@ export function isRawStatementTable(config: TableConfig): boolean {
 }
 
 /**
- * The request a raw-statement table sends. Task C.4.
+ * The request a raw-statement table sends.
  *
  * **Three divergences from `fetchData`, all of them stated rather than silent.**
  *
@@ -124,9 +124,9 @@ export function makeRawQuery(ctx: QueryContext): RawQueryAction {
  * Form-state and table keys the builder special-cases.
  *
  * Every one of these is a hard-coded key inside otherwise generic code, and that
- * is the assessment's §3.2 defect rather than a design: three of the four make
- * the builder behave differently for one named table. They are gathered here so
- * the port carries them visibly, and so Phase 3 can move them into the flow
+ * is a defect of the configuration (it embeds code) rather than a design: three
+ * of the four make the builder behave differently for one named table. They are
+ * gathered here so the port carries them visibly, and so they can move into the flow
  * configuration where they belong. Values from `jetsclient/lib/utils/constants.dart`.
  */
 export const KEYS = {
@@ -137,7 +137,59 @@ export const KEYS = {
   inputRegistryTable: "inputRegistryTable", // DTKeys
   mainInputRegistryKey: "main_input_registry_key", // FSK
   mergedInputRegistryKeys: "merged_input_registry_keys", // FSK
+  // No Dart original: the Home tabs the session registry added (2026-11-08).
+  pipelineArchiveTable: "pipelineArchiveTable",
+  sessionRegistryTable: "sessionRegistryTable",
 } as const;
+
+/**
+ * Which filter list a table receives, by its field key, and the table name its
+ * clauses are rewritten to. 2026-11-08.
+ *
+ * **One table where `makeQuery` had a branch per list.** It said
+ * `if (field.key === pipelineExecStatusTable)` for the home filters and an
+ * `if` over three keys for the data-registry filters — the Dart's two blocks,
+ * ported as written. The session registry added two tables: *Archived Pipelines*, which takes
+ * the home filters, and *Session Registry*, which takes a list of its own. Two
+ * more branches would have made four places that know a table key; this is one.
+ *
+ * **`rewrite` is the archive's, and it is why the archive does not alias its
+ * `FROM`.** The home filters name `pipeline_execution_status` as their table
+ * (`homeFilters.ts`, `EXEC_STATUS`), and the server qualifies the column with it
+ * (`visitWhereClause`). Aliasing the archive as `pipeline_execution_status` in
+ * its document would have made those clauses resolve, and would also have made
+ * the client filter — which names the real first table — refer to a name the
+ * query no longer has. So the clauses are rewritten to the archive's real name
+ * here, and the document names its table as it is.
+ */
+interface FilterSource {
+  filters: (ctx: QueryContext) => WhereClause[] | null | undefined;
+  rewrite?: { from: string; to: string };
+}
+
+const homeFiltersOf = (ctx: QueryContext) => ctx.homeFilters;
+const dataRegistryFiltersOf = (ctx: QueryContext) => ctx.dataRegistryFilters;
+
+export const FILTERS_BY_FIELD: Readonly<Record<string, FilterSource>> = {
+  [KEYS.pipelineExecStatusTable]: { filters: homeFiltersOf },
+  [KEYS.pipelineArchiveTable]: {
+    filters: homeFiltersOf,
+    rewrite: { from: "pipeline_execution_status", to: "pipeline_execution_status_archive" },
+  },
+  [KEYS.inputRegistryTable]: { filters: dataRegistryFiltersOf },
+  [KEYS.mainInputRegistryKey]: { filters: dataRegistryFiltersOf },
+  [KEYS.mergedInputRegistryKeys]: { filters: dataRegistryFiltersOf },
+  [KEYS.sessionRegistryTable]: { filters: (ctx) => ctx.sessionRegistryFilters },
+};
+
+/** A clause, and its `orWith` chain, with one table name replaced. */
+function rewriteTable(wc: WhereClause, rewrite: { from: string; to: string }): WhereClause {
+  return {
+    ...wc,
+    ...(wc.table === rewrite.from ? { table: rewrite.to } : {}),
+    ...(wc.orWith ? { orWith: rewriteTable(wc.orWith, rewrite) } : {}),
+  };
+}
 
 /** Mutable bookkeeping that `_makeQuery` and `_makeWhereClause` share. */
 interface BuildState {
@@ -159,7 +211,7 @@ function firstRouteParam(
  * Returns `null` when the clause contributes nothing — an unsatisfied predicate,
  * or a form-state key with no value and no default. A null here is how a table
  * ends up querying without a filter it nominally has; the *blocking* behaviour
- * that stops the query outright lives in A.4c, not in this function.
+ * that stops the query outright lives in the form-state binding, not in this function.
  */
 export function makeWhereClause(
   wc: WhereClause,
@@ -268,6 +320,19 @@ function addOrWith(
 }
 
 /**
+ * Whether a table's own selection writes `key` into form state: the key it is
+ * bound under, or one of the row's other columns (`publishSelection`).
+ */
+export function publishesKey(
+  config: TableConfig,
+  field: { group: number; key: string },
+  key: string,
+): boolean {
+  if (field.key === key) return true;
+  return config.formStateConfig?.otherColumns.some((c) => c.stateKey === key) ?? false;
+}
+
+/**
  * `_makeQuery` (`data_table_source.dart:428`).
  *
  * Key insertion order follows the Dart, so a serialised payload compares equal
@@ -338,7 +403,7 @@ export function makeQuery(ctx: QueryContext): DataTableAction {
       }
       // The Dart prints "Error: Don't have a table_name!" and carries on with an
       // empty table, producing a query the server rejects. Left as-is: turning it
-      // into a throw is a behaviour change, and A.4b is where the user-visible
+      // into a throw is a behaviour change, and the table widget is where the user-visible
       // error belongs.
     }
     return fc.asTableName !== ""
@@ -356,24 +421,15 @@ export function makeQuery(ctx: QueryContext): DataTableAction {
     if (value != null) whereClauses.push(value);
   }
 
-  // Two blocks of filters that apply to named tables only. See KEYS above: this
-  // is generic code that knows four table keys by name.
-  if (field && field.key === KEYS.pipelineExecStatusTable && ctx.homeFilters) {
-    for (const wc of ctx.homeFilters) {
+  // The filter lists that apply to named tables only, by field key — see
+  // `FILTERS_BY_FIELD` above, which is the one place generic code knows them.
+  const source = field && Object.hasOwn(FILTERS_BY_FIELD, field.key) ? FILTERS_BY_FIELD[field.key] : undefined;
+  const filters = source?.filters(ctx);
+  if (source && filters) {
+    for (const original of filters) {
+      const wc = source.rewrite ? rewriteTable(original, source.rewrite) : original;
       const value = addOrWith(wc, makeWhereClause(wc, ctx, state), ctx, state);
       if (value != null) whereClauses.push(value);
-    }
-  }
-  if (field && ctx.dataRegistryFilters) {
-    if (
-      field.key === KEYS.inputRegistryTable ||
-      field.key === KEYS.mainInputRegistryKey ||
-      field.key === KEYS.mergedInputRegistryKeys
-    ) {
-      for (const wc of ctx.dataRegistryFilters) {
-        const value = addOrWith(wc, makeWhereClause(wc, ctx, state), ctx, state);
-        if (value != null) whereClauses.push(value);
-      }
     }
   }
 
@@ -417,16 +473,29 @@ export function makeQuery(ctx: QueryContext): DataTableAction {
     msg.sortColumn = ctx.sortColumnName;
     msg.sortColumnTable = ctx.sortColumnTableName;
   } else {
+    // A table that declares no columns learns them from the reply's `columnDef`,
+    // and a heading press then names one of those. It is sent, so the server can
+    // order by it; before the first reply the name is empty, which asks the
+    // server for its default (the table's first column).
     msg.columns = [];
-    msg.sortColumn = "";
-    msg.sortColumnTable = "";
+    msg.sortColumn = ctx.sortColumnName;
+    msg.sortColumnTable = ctx.sortColumnTableName;
   }
 
   msg.sortAscending = ctx.sortAscending;
 
-  const fromState = field
-    ? ctx.formState?.getValue(field.group, KEYS.workspaceName)
-    : undefined;
+  // **Not from form state when this table's own selection writes the key.** The
+  // workspace registry publishes its selected row's `workspace_name`, so reading
+  // it back here made a tick change the table's own request: `useDataTable`
+  // fetches whenever the request changes, the reply cleared the selection, and
+  // the restore put it back a moment later, so the box flickered off and on.
+  // The name of a selected row is not a parameter of the query that lists the
+  // rows (the server ignores it for the registry, a `jetsapi` table), and no
+  // other table publishes the key. The route still supplies it.
+  const fromState =
+    field && !publishesKey(config, field, KEYS.workspaceName)
+      ? ctx.formState?.getValue(field.group, KEYS.workspaceName)
+      : undefined;
   const workspaceName =
     fromState != null ? fromState : ctx.routeParams?.[KEYS.workspaceName];
   if (workspaceName != null) {

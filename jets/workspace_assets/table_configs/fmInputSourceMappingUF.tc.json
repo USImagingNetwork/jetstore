@@ -5,6 +5,7 @@
     {
       "name": "key",
       "label": "Key",
+      "table": "source_config",
       "tooltip": "Row Primary Key",
       "isNumeric": true,
       "isHidden": true
@@ -96,7 +97,8 @@
         "client": 1,
         "org": 2,
         "object_type": 3,
-        "table_name": 4
+        "table_name": 4,
+        "lfSourceConfigTable": 0
       }
     },
     {

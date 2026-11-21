@@ -1,7 +1,7 @@
 /**
- * Criterion 32, driven end to end: a projected template configured one step at a time.
+ * Driven end to end: a projected template configured one step at a time.
  *
- * **Task M.5, and it is a demonstration rather than a unit test.** Everything before it
+ * **A demonstration rather than a unit test.** Everything before it
  * checked one piece — the generator's output against four validation layers, the
  * assembly against a fixture. This walks the `qc_metrics` projection the way an author
  * would: read the four documents off disk exactly as the generator committed them, load
@@ -10,16 +10,16 @@
  *
  * ## Why it is a test and not a screenshot
  *
- * **There is no flow runner in this application yet** — verified 2026-08-23 with the
- * `ui_refresh` session, whose gap it is: `App.tsx` registers no `/flow/:key` route,
+ * **There is no flow runner in this application yet** — verified 2026-08-23:
+ * `App.tsx` registers no `/flow/:key` route,
  * `FlowStore` has no non-test consumer, nothing outside tests reads a `.form.json`, and
  * the only `EscapeRegistry` value in non-test code is `emptyRegistry`. The two
  * "migrated" flows are migrated in the sense that their documents exist and
  * `proofFlows.test.ts` drives them, not in the sense that a browser runs one.
  *
- * So criterion 32's *in the IDE* cannot be shown in a browser today, and this file does
+ * So a template configured *in the IDE* cannot be shown in a browser today, and this file does
  * not pretend otherwise. What it does show is that **every part of the mechanism the
- * criterion names is built and works together**: the shipped `engine`, the shipped
+ * goal names is built and works together**: the shipped `engine`, the shipped
  * action interpreter, the shipped `validateForm`, the generator's documents, and this
  * project's escape. What is missing is the screen that hosts them, and it is missing for
  * every flow rather than for projected ones. That is the honest report, and it is the
@@ -27,7 +27,7 @@
  *
  * ## What it would catch
  *
- * The chooser bug M.4 found, and I-84, and the `ufNext`-on-an-end-state defect this task
+ * A chooser bug, an unread action document, and the `ufNext`-on-an-end-state defect this test
  * found — all three passed every layer that reads one document, and all three are
  * visible the moment something presses the buttons in order.
  */
@@ -47,13 +47,13 @@ import { escapeReferences } from "../userflow/store";
 import { resolveEscapes } from "../actions/escapes";
 import { strictPolicy, validateFlow } from "../userflow/validate";
 import { isFormValid } from "../userflow/validateForm";
-import { queryEscape } from "../api/workspace";
+import { queryEscape, type SaveFinding, type SaveResult } from "../api/workspace";
 import { createCpipesTemplateApply, configPath, applyPlanPath, type ApplyPlan } from "./templateApply";
 
 /**
  * The generator's committed output, read rather than imported so tsc keeps its size out.
  *
- * **It moved on 2026-08-25 (task U.2)** from `tools/cpipes_contract/projections/` to
+ * **It moved on 2026-08-25** from `tools/cpipes_contract/projections/` to
  * `jets/workspace_assets/user_flows/`, where `//go:embed` can reach it and the installer
  * writes it into every workspace. Reading it from the asset directory rather than from a
  * copy is what makes this file a check on the bytes a workspace receives.
@@ -66,7 +66,7 @@ const PROJECTIONS = fileURLToPath(
  * Where the *config* the walk produces is kept — deliberately not beside the
  * documents.
  *
- * The two paths were one until U.2 moved the documents into the asset directory,
+ * The two paths were one until the documents moved into the asset directory,
  * and keeping them one would have written a `.pc.json` into a directory whose
  * whole contents install into every workspace. The embed glob names four document
  * suffixes and would not have taken it, so nothing would have broken; a pipeline
@@ -82,12 +82,12 @@ const TEMPLATE = "qc_metrics";
 const WORKSPACE = "test_ws";
 
 /** A workspace that serves the apply plan and remembers what was written to it. */
-function workspace(plan: unknown) {
+function workspace(plan: unknown, warnings: SaveFinding[] = []) {
   const saved: { fileName: string; content: string }[] = [];
   return {
     saved,
     api: {
-      // **`readWorkspaceDocument`, since I-147 and the 2026-08-26 capability split.** This stub used to answer `readFile`
+      // **`readWorkspaceDocument`, since the 2026-08-26 capability split.** This stub used to answer `readFile`
       // and to key off the synthetic node's `label`, which is what let the escape
       // ship for two days with a call the real `WorkspaceApi` would have refused.
       // A stub shaped like the caller rather than like the callee is the whole
@@ -96,8 +96,10 @@ function workspace(plan: unknown) {
         if (path !== applyPlanPath(TEMPLATE)) throw new Error(`no such file: ${path}`);
         return { fileName: path, label: path, content: JSON.stringify(plan) };
       },
-      saveFile: async (_ws: string, fileName: string, content: string) => {
+      // Answers what `WorkspaceApi.saveFile` answers: the save check's warnings.
+      saveFile: async (_ws: string, fileName: string, content: string): Promise<SaveResult> => {
         saved.push({ fileName, content });
+        return { warnings };
       },
     },
   };
@@ -114,22 +116,22 @@ const host: ActionHost = {
   setBusy: () => {},
   goToState: () => {},
   close: () => {},
-  userEmail: () => "michel@artisoft.io",
+  userEmail: () => "user@example.com",
   now: () => 1_700_000_000_000,
 };
 
 /**
  * Fills one form the way a careful author would: every required field, no optional one.
  *
- * **Leaving the optional fields empty is the point rather than laziness.** I-80 settled
- * that every declarable property gets a field, so `partition_output` alone offers
+ * **Leaving the optional fields empty is the point rather than laziness.** Every
+ * declarable property gets a field, so `partition_output` alone offers
  * properties the corpus never sets; a config that carried all of them as `""` would be a
  * different config from the one the author meant. What comes out the other end is the
  * check that "empty is absent" holds.
  */
 function fill(form: Form, formState: FormState, choose: (key: string) => string | undefined): void {
   // **`valueFieldsOf` rather than walking the rows and skipping the kinds that are
-  // not inputs.** F.2 added a `button` field kind, which broke the skip list here —
+  // not inputs.** A `button` field kind was added, which broke the skip list here —
   // and a skip list is the shape that breaks every time a kind is added. The
   // function exists to answer exactly this question (`userflow/form.ts`), so the
   // next field kind costs this file nothing.
@@ -152,15 +154,15 @@ function fill(form: Form, formState: FormState, choose: (key: string) => string 
   }
 }
 
-describe("criterion 32 — a template configured step at a time", () => {
+describe("a template configured step at a time", () => {
   it("loads as a triple, walks to its end, and writes a config", async () => {
     const flow = UserFlowSchema.parse(read(`${TEMPLATE}.uf.json`)) as UserFlow;
     const actions = ActionDocumentSchema.parse(read(`${TEMPLATE}.ua.json`)) as ActionDocument;
     const forms = FormDocumentSchema.parse(read(`${TEMPLATE}.form.json`)) as FormDocument;
     const plan = read(`${TEMPLATE}.apply.json`) as ApplyPlan;
 
-    // 1. The load path, in the order `FlowStore.load` runs it. I-84 is what makes the
-    //    action document part of this rather than an afterthought: without it the read
+    // 1. The load path, in the order `FlowStore.load` runs it. The
+    //    action document is part of this rather than an afterthought: without it the read
     //    throws before anything below is reached.
     // **Under the strict policy, which is the one that refuses a save.** Nothing ships
     // the deployment's policy to the browser, so an author on a strict deployment sees a
@@ -221,7 +223,7 @@ describe("criterion 32 — a template configured step at a time", () => {
     expect(new Set(visited).size).toBe(visited.length);
 
     // 4. What came out.
-    // The *escaped* path, since I-147: `saveFile` takes what the server
+    // The *escaped* path: `saveFile` takes what the server
     // url-unescapes, and the editor hands it a node's already-escaped
     // `file_name`. `queryEscape` writes `%2F` where Go's `url.QueryEscape` does.
     expect(ws.saved.map((s) => s.fileName)).toEqual([queryEscape(configPath(TEMPLATE))]);
@@ -248,5 +250,81 @@ describe("criterion 32 — a template configured step at a time", () => {
     expect(ws.saved).toEqual([]);
     expect(Object.keys(actions.actions)).toEqual(["cpipesTemplateApply"]);
     expect(flow.states[flow.startAtKey]).toBeDefined();
+  });
+});
+
+/**
+ * **A configuration saved with warnings is saved, and the author is told what the
+ * save check found.** The save answers its validator's warnings (a key the
+ * pipeline ignores, for one), and the escape used to drop them: the flow ended
+ * as if nothing had been found.
+ */
+describe("a save the server accepts with warnings", () => {
+  /** A plan with nothing to collect, so the escape goes straight to the save. */
+  const plan: ApplyPlan = {
+    schemaVersion: 1,
+    template: TEMPLATE,
+    fillMarker: "$fill",
+    bindingMarker: "$bind:",
+    choosers: {},
+    constants: {},
+    jsonFields: [],
+    skeleton: { cluster_config: {}, output_tabel: [] },
+  };
+  const warning: SaveFinding = {
+    severity: "warning",
+    code: "cpipes_config_unknown_field",
+    message: 'ignored when the pipeline runs: unknown field "output_tabel"',
+    path: "/output_tabel",
+  };
+  const context = () => ({ formState: new FormState(), group: 0, flowKey: TEMPLATE });
+  const expected = [
+    `Saved ${configPath(TEMPLATE)}, with 1 warning:`,
+    `  /output_tabel: ignored when the pipeline runs: unknown field "output_tabel"`,
+  ].join("\n");
+
+  it("succeeds and shows them through the host's warning tone", async () => {
+    const ws = workspace(plan, [warning]);
+    const warned: string[] = [];
+    const notified: [string, string][] = [];
+    const escape = createCpipesTemplateApply({ workspaceName: WORKSPACE, api: ws.api as never });
+    const outcome = await escape(context(), {
+      ...host,
+      notify: (level, message) => notified.push([level, message]),
+      warn: (message) => warned.push(message),
+    });
+
+    expect(outcome).toBeNull();
+    expect(ws.saved).toHaveLength(1);
+    expect(warned).toEqual([expected]);
+    expect(notified).toEqual([]);
+  });
+
+  it("falls back to an info notice on a host with no warning tone", async () => {
+    const ws = workspace(plan, [warning]);
+    const notified: [string, string][] = [];
+    const escape = createCpipesTemplateApply({ workspaceName: WORKSPACE, api: ws.api as never });
+    const outcome = await escape(context(), {
+      ...host,
+      notify: (level, message) => notified.push([level, message]),
+    });
+
+    expect(outcome).toBeNull();
+    expect(notified).toEqual([["info", expected]]);
+  });
+
+  it("says nothing when the check found nothing", async () => {
+    const ws = workspace(plan);
+    const said: string[] = [];
+    const escape = createCpipesTemplateApply({ workspaceName: WORKSPACE, api: ws.api as never });
+    const outcome = await escape(context(), {
+      ...host,
+      notify: (_level, message) => said.push(message),
+      warn: (message) => said.push(message),
+    });
+
+    expect(outcome).toBeNull();
+    expect(ws.saved).toHaveLength(1);
+    expect(said).toEqual([]);
   });
 });

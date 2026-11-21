@@ -39,14 +39,10 @@ package datatable
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
-	"os"
 	"testing"
 
 	"github.com/artisoft-io/jetstore/jets/awsi"
-	"github.com/artisoft-io/jetstore/jets/schema"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // The tables RegisterFileKeys touches with NoAutomatedLoad set: the three case
@@ -66,14 +62,14 @@ var registerFileKeysTables = []string{
 	"session_registry",
 }
 
-// The multi-part source the three qc_* pipelines run against, as
-// cgt_workspace_init_db.sql registers it: is_part_files = 1, one domain key.
+// The multi-part source a client workspace's three quality-check pipelines run
+// against, as its init script registers it: is_part_files = 1, one domain key.
 const (
-	testClient     = "CGT"
+	testClient     = "CLIENT2"
 	testOrg        = "Parquet_Parts"
 	testObjectType = "Eligibility"
-	testTableName  = "cgt_parquet_parts_eligibility"
-	testFolder     = "client=CGT/org=Parquet_Parts/object_type=Eligibility/processing_ticket="
+	testTableName  = "client2_parquet_parts_eligibility"
+	testFolder     = "client=CLIENT2/org=Parquet_Parts/object_type=Eligibility/processing_ticket="
 	testSentinel   = "_COMPLETE"
 )
 
@@ -83,65 +79,26 @@ const (
 // one the deployment has — and seeds the registry rows.
 func registerFileKeysFixture(t *testing.T) *DataTableContext {
 	t.Helper()
-	dsn := os.Getenv("JETS_TEST_DSN")
-	if dsn == "" {
-		t.Skip("JETS_TEST_DSN is not set; see the header of this file")
-	}
 	// The folder listing is expected to fail and its failure is tolerated, but
 	// without this the AWS SDK spends five seconds asking EC2 IMDS for a role it
 	// will not find. The listing then fails on the empty bucket name instead,
 	// which is a client-side validation error and reaches no network at all.
 	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
 	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		t.Fatalf("connecting: %v", err)
-	}
-	t.Cleanup(pool.Close)
-
-	defs := make(map[string]*schema.TableDefinition)
-	buf, err := os.ReadFile("../jets_schema.json")
-	if err != nil {
-		t.Fatalf("reading ../jets_schema.json: %v", err)
-	}
-	var schemaDef []schema.TableDefinition
-	if err = json.Unmarshal(buf, &schemaDef); err != nil {
-		t.Fatalf("decoding ../jets_schema.json: %v", err)
-	}
-	for i := range schemaDef {
-		defs[schemaDef[i].TableName] = &schemaDef[i]
-	}
-	drop := func() {
-		for _, name := range registerFileKeysTables {
-			if _, err := pool.Exec(ctx, "DROP TABLE IF EXISTS jetsapi."+name+" CASCADE"); err != nil {
-				t.Logf("warning, while dropping jetsapi.%s: %v", name, err)
-			}
-		}
-	}
-	for _, name := range registerFileKeysTables {
-		def, ok := defs[name]
-		if !ok {
-			t.Fatalf("jets_schema.json carries no definition for jetsapi.%s", name)
-		}
-		// dropExisting, so the fixture owns the table whatever was there before
-		if err = def.UpdateTableSchema(pool, true); err != nil {
-			t.Fatalf("creating jetsapi.%s: %v", name, err)
-		}
-	}
-	t.Cleanup(drop)
+	pool := createTablesFromSchema(t, registerFileKeysTables...)
 
 	seed := []string{
 		`INSERT INTO jetsapi.client_registry (client) VALUES ('` + testClient + `')`,
 		`INSERT INTO jetsapi.client_org_registry (client, org) VALUES ('` + testClient + `', '` + testOrg + `')`,
 		`INSERT INTO jetsapi.object_type_registry (object_type, entity_rdf_type)
-			VALUES ('` + testObjectType + `', 'cgt:Eligibility')`,
+			VALUES ('` + testObjectType + `', 'ex:Eligibility')`,
 		`INSERT INTO jetsapi.source_config
 			(client, org, object_type, table_name, domain_keys, input_format, is_part_files, user_email)
 			VALUES ('` + testClient + `', '` + testOrg + `', '` + testObjectType + `',
 				'` + testTableName + `', '{` + testObjectType + `}', 'parquet_select', 1, 'system')`,
 	}
 	for _, stmt := range seed {
-		if _, err = pool.Exec(ctx, stmt); err != nil {
+		if _, err := pool.Exec(ctx, stmt); err != nil {
 			t.Fatalf("seeding: %v\n%s", err, stmt)
 		}
 	}
@@ -160,7 +117,7 @@ func schemaEventData(ticket string, size any, withFileKey bool) map[string]any {
 		"year":                 1970,
 		"month":                1,
 		"day":                  1,
-		"schema_provider_json": `{"key":"_main_input_","type":"default","client":"CGT"}`,
+		"schema_provider_json": `{"key":"_main_input_","type":"default","client":"CLIENT2"}`,
 	}
 	if withFileKey {
 		data["file_key"] = testFolder + ticket + "/" + testSentinel
@@ -204,7 +161,7 @@ func TestRegisterFileKeysSchemaEventWithSizeZero(t *testing.T) {
 	ctx := registerFileKeysFixture(t)
 	action := &RegisterFileKeyAction{
 		Action:          "register_file_key",
-		Data:            []map[string]any{schemaEventData("CGT0001", int64(0), true)},
+		Data:            []map[string]any{schemaEventData("T0001", int64(0), true)},
 		NoAutomatedLoad: true,
 		IsSchemaEvent:   true,
 	}
@@ -212,7 +169,7 @@ func TestRegisterFileKeysSchemaEventWithSizeZero(t *testing.T) {
 	if err != nil || status != http.StatusOK {
 		t.Fatalf("RegisterFileKeys: status %d, err %v", status, err)
 	}
-	folder := testFolder + "CGT0001"
+	folder := testFolder + "T0001"
 	// The sentinel branch strips the last path segment, so the registered key is
 	// the folder and not the key handed in.
 	if n, _ := countFileKeyStaging(t, ctx, folder); n != 1 {
@@ -234,7 +191,7 @@ func TestRegisterFileKeysSchemaEventWithSizeZero(t *testing.T) {
 func TestRegisterFileKeysSchemaEventWithSizeAbsent(t *testing.T) {
 	t.Setenv("JETS_SENTINEL_FILE_NAME", testSentinel)
 	ctx := registerFileKeysFixture(t)
-	data := schemaEventData("CGT0002", nil, true)
+	data := schemaEventData("T0002", nil, true)
 	if _, present := data["size"]; present {
 		t.Fatal("fixture error: this case is about size being absent")
 	}
@@ -248,7 +205,7 @@ func TestRegisterFileKeysSchemaEventWithSizeAbsent(t *testing.T) {
 	if err != nil || status != http.StatusOK {
 		t.Fatalf("RegisterFileKeys: status %d, err %v", status, err)
 	}
-	folder := testFolder + "CGT0002"
+	folder := testFolder + "T0002"
 	n, size := countFileKeyStaging(t, ctx, folder)
 	if n != 1 {
 		t.Errorf("file_key_staging rows for %q = %d, want 1", folder, n)
@@ -271,7 +228,7 @@ func TestRegisterFileKeysSchemaEventWithSizeAbsent(t *testing.T) {
 func TestRegisterFileKeysFileKeyAbsentIsSkipped(t *testing.T) {
 	t.Setenv("JETS_SENTINEL_FILE_NAME", testSentinel)
 	ctx := registerFileKeysFixture(t)
-	data := schemaEventData("CGT0003", int64(0), false)
+	data := schemaEventData("T0003", int64(0), false)
 	if _, present := data["file_key"]; present {
 		t.Fatal("fixture error: this case is about file_key being absent")
 	}
@@ -281,9 +238,14 @@ func TestRegisterFileKeysFileKeyAbsentIsSkipped(t *testing.T) {
 		NoAutomatedLoad: true,
 		IsSchemaEvent:   true,
 	}
-	_, status, err := ctx.RegisterFileKeys(action, "")
+	// RegisterFileKeys skips the row with a 200 and says why;
+	// RegisterSchemaEvent, whose one row this would be, makes that an error.
+	res, status, err := ctx.RegisterFileKeys(action, "")
 	if err != nil || status != http.StatusOK {
 		t.Fatalf("RegisterFileKeys: status %d, err %v", status, err)
+	}
+	if skipped, _ := (*res)["skipped"].([]fileKeySkip); len(skipped) != 1 || skipped[0].Reason != skipNoFileKey {
+		t.Errorf("skipped = %+v, want one row skipped as %s", (*res)["skipped"], skipNoFileKey)
 	}
 	var n int
 	if err := ctx.Dbpool.QueryRow(context.Background(),
@@ -304,7 +266,7 @@ func TestRegisterFileKeysFileKeyAbsentIsSkipped(t *testing.T) {
 	// is omitempty, so a spec that sets it to "" serialises without it, and one
 	// that reaches the map as "" asserts cleanly and registers a row naming the
 	// bucket root.
-	data = schemaEventData("CGT0004", int64(0), true)
+	data = schemaEventData("T0004", int64(0), true)
 	data["file_key"] = ""
 	action.Data = []map[string]any{data}
 	_, status, err = ctx.RegisterFileKeys(action, "")

@@ -1,7 +1,7 @@
 /**
  * @vitest-environment jsdom
  *
- * **C.10 driven end to end.** Everything below `ApiClient` is real; `fetch` is the
+ * **The rules configuration screen driven end to end.** Everything below `ApiClient` is real; `fetch` is the
  * only stub.
  *
  * The two things here that no earlier screen test covers:
@@ -60,8 +60,8 @@ function stubServer(options: { conflict?: boolean } = {}) {
       return new Response(
         JSON.stringify({
           token: "t0",
-          name: "Michel",
-          user_email: "michel@artisoft.io",
+          name: "Test User",
+          user_email: "user@example.com",
           is_admin: false,
           capabilities: ["client_config", "jetstore_read"],
         }),
@@ -112,7 +112,7 @@ function Banners() {
 async function mount(options: { conflict?: boolean } = {}) {
   const { fetchImpl, posts } = stubServer(options);
   const api = new ApiClient("", fetchImpl);
-  await api.login("michel@artisoft.io", "pw");
+  await api.login("user@example.com", "pw");
 
   render(
     <ApiProvider api={api}>
@@ -176,7 +176,7 @@ describe("the dialog", () => {
     const dialog = await screen.findByRole("dialog", { name: "Rule Configuration" });
 
     // The two dropdowns fill from their queries — the form-level `queries` and
-    // `itemsFrom` of I.2b, on a screen rather than on a flow.
+    // `itemsFrom`, on a screen rather than on a flow.
     const client = (await within(dialog).findByLabelText("Client")) as HTMLSelectElement;
     await waitFor(() => expect(within(client).getAllByRole("option").length).toBeGreaterThan(1));
     fireEvent.change(client, { target: { value: "globex" } });
@@ -195,7 +195,7 @@ describe("the dialog", () => {
     // **The escape's whole output.** `32` is column 1 of the `processes` query's
     // row for `loadMembers` — a value that is in no form field and in no route.
     expect(row["process_config_key"]).toBe("32");
-    expect(row["user_email"]).toBe("michel@artisoft.io");
+    expect(row["user_email"]).toBe("user@example.com");
   });
 
   it("updates with update/rule_configv2 when a row was selected, and locks its identity", async () => {
@@ -205,7 +205,7 @@ describe("the dialog", () => {
     const dialog = await screen.findByRole("dialog", { name: "Rule Configuration" });
 
     // **Both identifying fields arrive filled and locked.** `isReadOnlyWhenSet`,
-    // C.10's schema member: on an update the client and the process are what the
+    // a schema member added for this screen: on an update the client and the process are what the
     // `WHERE` matches, so editing either would move the record rather than edit it.
     const client = within(dialog).getByLabelText("Client") as HTMLSelectElement;
     const process = within(dialog).getByLabelText("Process") as HTMLSelectElement;
@@ -241,9 +241,10 @@ describe("the dialog", () => {
     // appends `error.message`, which is what makes a json failure say *where*.
     await within(dialog).findByText(/Rule configuration must be a valid json array\./);
     expect(inserts(posts, "rule_configv2")).toEqual([]);
-    // Still open — I-186. The Dart's own validator rejects the same input
-    // (`config_delegates.dart`, the `ruleConfigJson` case), and the `json` rule is
-    // one of S.5's two, so this is a rule rather than an escape.
+    // Still open: a failed `validate` does not close the dialog. The Dart's own
+    // validator rejects the same input (`config_delegates.dart`, the
+    // `ruleConfigJson` case), and `json` is one of the form schema's built-in
+    // rules, so this is a rule rather than an escape.
     expect(screen.queryByRole("dialog")).not.toBeNull();
   });
 });
@@ -261,7 +262,7 @@ describe("deleting a configuration", () => {
     await waitFor(() => expect(inserts(posts, "delete/rule_configv2")).toHaveLength(1));
     const row = (inserts(posts, "delete/rule_configv2")[0]!["data"] as Record<string, unknown>[])[0]!;
     expect(row["key"]).toBe("7");
-    expect(row["user_email"]).toBe("michel@artisoft.io");
+    expect(row["user_email"]).toBe("user@example.com");
   });
 
   it("sends nothing when the confirmation is refused", async () => {

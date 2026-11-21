@@ -1,28 +1,30 @@
 /**
  * @vitest-environment jsdom
  *
- * **C.7 and C.8's exit condition: the route parameter reaches the `WHERE`.**
+ * **The execution details screens' exit condition: the route parameter reaches
+ * the `WHERE`.**
  *
  * The claim these two screens make is one clause long — that `:session_id` from
  * the url becomes a predicate on the query — and **it is not observable from the
  * rows.** A `pipeline_execution_details` table with no `session_id` filter returns
  * every session's shards and renders perfectly; the screen looks right, the
  * columns are right, the label is right, and it is showing another user's run.
- * That is I-104's failure with a different field, so the assertions below are
+ * That is a contract tested from the end that cannot fail, with a different
+ * field, so the assertions below are
  * about **the request the table sent**.
  *
  * Everything below `ApiClient` is real, as in `FlowRunner.test.tsx`. The only
  * stub is `fetch`, dispatching on `fromClauses[0].table` the way the apiserver
  * dispatches on the statement it composes.
  *
- * **Rows are awaited, never labels** (I-104's flake): a table's rows arrive from
+ * **Rows are awaited, never labels**: a table's rows arrive from
  * an effect one tick after its label, so `findByText(label)` then `getByText(row)`
  * is racy and the failure surfaces somewhere else.
  */
 
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useNavigate, type NavigateFunction } from "react-router-dom";
 
 import { ApiClient } from "../api/client";
 import cpipesExecDetailsTable from "../datatable/tables/cpipesExecDetailsTable.tc.json";
@@ -60,8 +62,8 @@ function stubServer() {
       return new Response(
         JSON.stringify({
           token: "t0",
-          name: "Michel",
-          user_email: "michel@artisoft.io",
+          name: "Test User",
+          user_email: "user@example.com",
           // `anyUser` in the reachability corpus: both routes are `authRequired`
           // and gate on nothing further. The server still wants `read_data` for
           // the query itself, which is not a client-side check.
@@ -102,7 +104,7 @@ const screens = {
 async function mount(which: Screen, sessionId: string) {
   const { fetchImpl, posts } = stubServer();
   const api = new ApiClient("", fetchImpl);
-  await api.login("michel@artisoft.io", "pw");
+  await api.login("user@example.com", "pw");
   const config = screens[which];
 
   render(
@@ -143,10 +145,10 @@ describe("the route parameter reaches the where clause", () => {
 
   it("adds no implicit client filter, because neither table has a client column", async () => {
     // The measured negative. `makeQuery` appends `{column: "client"}` when
-    // `selectedClient` is set *and* the table has such a column; there is no
-    // `selectedClient` store in this app, and these two tables have no such
-    // column, so the clause count is exactly the configured one. C.6 is where
-    // that stops being true — `inputRegistryTable` has the column.
+    // `selectedClient` is set *and* the table has such a column; these two
+    // tables have no such column, so the clause count is exactly the configured
+    // one whatever the store holds. The home screen's `inputRegistryTable` is
+    // where that stops being true — it has the column.
     for (const which of ["status", "stats"] as const) {
       const { posts } = await mount(which, "sess-1");
       await waitFor(() => expect(reads(posts).length).toBeGreaterThan(0));
@@ -158,8 +160,8 @@ describe("the route parameter reaches the where clause", () => {
 
 describe("the document is what the request is built from", () => {
   it("selects run_duration as the SQL the document authors", async () => {
-    // The second and last `calculatedAs` in the corpus, and the one C.7 decided
-    // stays an authored fragment. It reaches the wire, which is the half of that
+    // The second and last `calculatedAs` in the corpus, and the one decided to
+    // stay an authored fragment. It reaches the wire, which is the half of that
     // decision a schema test cannot show.
     const { posts } = await mount("status", "sess-7");
     await screen.findByText("completed");
@@ -210,14 +212,18 @@ describe("the document is what the request is built from", () => {
 
 describe("maxLines, which nothing drew until this task", () => {
   it("clamps the error message and gives it the configured width", async () => {
-    // I-104's rule applied in advance: `maxLines` was authored and consumed in
-    // one change. `error_message` is 3 lines at 600px on this table and is the
+    // A field that validates and draws nothing is the failure to avoid, so
+    // `maxLines` was authored and consumed in one change. `error_message` is 3 lines at 600px on this table and is the
     // only column of either that sets anything.
     const { posts } = await mount("status", "sess-7");
     const cell = await screen.findByText("boom: the loader could not parse row 44");
+    // The text clamps in a span; the cell carries the width and wraps, so it
+    // stays a table cell and shrinks with the table.
     expect(cell.className).toContain("jets-datatable__clamped");
-    expect(cell.getAttribute("style")).toContain("width: 600px");
     expect(cell.getAttribute("style")).toContain("--jets-max-lines: 3");
+    const td = cell.closest("td")!;
+    expect(td.className).toContain("jets-datatable__wrapped");
+    expect(td.getAttribute("style")).toContain("width: 600px");
 
     // And the neighbours are untouched, so the class is per column rather than
     // per table.
@@ -231,5 +237,51 @@ describe("maxLines, which nothing drew until this task", () => {
     await mount("stats", "sess-1");
     const cell = await screen.findByText("reducing");
     expect(cell.className).not.toContain("jets-datatable__clamped");
+  });
+});
+
+describe("going straight from one route to the other", () => {
+  it("starts the second table from its own document, not the first table's state", async () => {
+    // Both routes render `TableScreen` at the same place in the tree, so without a
+    // key per table React keeps the first one's state: its columns, its sort, and a
+    // query of the second table sorted on the first table's column. The app's own
+    // links pass through Home, which unmounts the screen and hid this.
+    const { fetchImpl, posts } = stubServer();
+    const api = new ApiClient("", fetchImpl);
+    await api.login("user@example.com", "pw");
+    let navigate: NavigateFunction | undefined;
+    function Navigator() {
+      navigate = useNavigate();
+      return null;
+    }
+    render(
+      <MemoryRouter initialEntries={["/executionStatusDetails/sess-1"]}>
+        <Navigator />
+        <Routes>
+          {(["status", "stats"] as const).map((which) => (
+            <Route
+              key={which}
+              path={screens[which].path}
+              element={
+                <TableScreen api={api} tableKey={screens[which].tableKey} document={screens[which].document} />
+              }
+            />
+          ))}
+        </Routes>
+      </MemoryRouter>,
+    );
+    await screen.findByText("completed");
+
+    act(() => navigate!("/executionStatsDetails/sess-1"));
+    await screen.findByText("reducing");
+    const statsReads = reads(posts).filter(
+      (r) => (r["fromClauses"] as { table: string }[])[0]!.table === "cpipes_execution_status_details",
+    );
+    expect(statsReads.length).toBeGreaterThan(0);
+    for (const r of statsReads) {
+      expect(r).toMatchObject({ sortColumn: "total_input_files_size_mb", sortAscending: false });
+    }
+    // The second table's own columns are drawn, and none of the first's.
+    expect(screen.queryByText("completed")).toBeNull();
   });
 });

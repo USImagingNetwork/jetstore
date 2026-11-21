@@ -20,10 +20,10 @@ about deployment wiring goes stale without announcing it. Entries are appended, 
 
 | Package | Covers |
 |---|---|
-| `jets/compute_pipes/README.md` | How a compiled workspace reaches a running process, and the `JETS_VERSION` chain that decides whether it is fetched — including the cbooter/Lambda asymmetry and the Docker `ARG`/`ENV` resolution rule |
-| `jets/jetrules/rete/README.md` | Where the Go and C++ rule engines disagree — four measured divergences on the aggregate operators (two fixed in C++ on 2026-09-09), the double-literal quantisation, why adding an operator is exactly two registrations and the **six operator names only one factory has**, what `_0:no_truth_main_on_exist` turns off, why **a consequent aggregate is recomputed by neither engine**, which is what every use in `workspaces/` actually is, why **a minting consequent is retracted by replay** while two retraction defects are kept because `usi_ws`'s loop rules terminate only because of them (2026-10-09) |
-| `jets/compilerv2/symbolic/README.md` | JetRules written as JSON for a model to author (`compile_rule_file`'s `rules` argument) — why the suffix is `.jrs.json` and not the compiler's own `.jr.json` output name, why it renders to source rather than entering the compiler after the parser, and what the four-workspace round trip found: an ambiguous bare unary form, the compiler's generated `ci_` rules, and duplicate rule names the compiler accepts (2026-10-12) |
-| `jets/sqlscript/README.md` | How JetStore reads a SQL file — why a `;` is not a statement boundary, the three consumers and which two must not split, and the measured consequence: `Exec` with no bind arguments sends the **simple** protocol, so PostgreSQL parses the whole file and wraps it in **one implicit transaction**, which is what makes a `DELETE`-then-`INSERT` init script safe. Plus why an *explicit* transaction here would break a script that opens its own, and what the `.sql` save-hook row cost as the **first non-JSON file type**: a `.JSON` gate that would have made it unreachable, and a `Finding` that carried a JSON Pointer and no line |
+| `jets/compute_pipes/README.md`, now `docs/src/content/docs/developer/compute-pipes/notes/` | How a compiled workspace reaches a running process, and the `JETS_VERSION` chain that decides whether it is fetched — including the cbooter/Lambda asymmetry and the Docker `ARG`/`ENV` resolution rule |
+| `jets/rete/README.md`, now `docs/src/content/docs/developer/engine/rule-engine/index.md` | The C++ rule engine's semantics and their history, newest first — the Go engine's retirement (October 2026; tag `go-engine-final`) and what stays of it (the rule model), the differences between the two engines settled before it and the shared tables that are now C++'s specification, why every rule fires at the salience it declares, one specification for text read as a bool, why **a minting or graph-reading consequent is retracted by replay** and a withdrawn row erased, the one retraction behaviour since October 2026, when the LEGACY mode that kept two defects (2026-10-09) was deleted, and `_0:no_truth_main_on_exist` with it, and why **a consequent aggregate has no truth maintenance**, which is what every aggregate in the rule corpus is. Moved from `jets/jetrules/rete/` with the retirement |
+| `jets/compilerv2/symbolic/README.md`, now `docs/src/content/docs/developer/engine/compiler/symbolic-rules.md` | JetRules written as JSON for a model to author (`compile_rule_file`'s `rules` argument) — why the suffix is `.jrs.json` and not the compiler's own `.jr.json` output name, why it renders to source rather than entering the compiler after the parser, and what the four-workspace round trip found: an ambiguous bare unary form, the compiler's generated `ci_` rules, and duplicate rule names the compiler accepts (2026-10-12) |
+| `jets/sqlscript/README.md`, now `docs/src/content/docs/developer/engine/sql-scripts.md` | How JetStore reads a SQL file — why a `;` is not a statement boundary, the three consumers and which two must not split, and the measured consequence: `Exec` with no bind arguments sends the **simple** protocol, so PostgreSQL parses the whole file and wraps it in **one implicit transaction**, which is what makes a `DELETE`-then-`INSERT` init script safe. Plus why an *explicit* transaction here would break a script that opens its own, and what the `.sql` save-hook row cost as the **first non-JSON file type**: a `.JSON` gate that would have made it unreachable, and a `Finding` that carried a JSON Pointer and no line |
 
 **Put the entry where someone will be standing when they hit the symptom**, not where the mechanism
 happens to be implemented, and cross-reference by `file:line` rather than duplicating. A discovery
@@ -32,29 +32,54 @@ that spans several packages still gets one home; two copies drift.
 **System-wide deployment wiring stays here instead** — the *Infer Server* section below is the model
 for that: one place, describing how the pieces are wired rather than what one package does.
 
+## Documentation
+
+**A change to what a user sees, how JetStore is extended, or how it is deployed updates `docs/` in the
+same pull request**; the pull-request template asks which pages, or why none. `docs/` is an Astro
+Starlight site, served by an installation at `/docs/`; package notes above are for maintainers, `docs/`
+is for readers.
+
+- **Where pages go**: `docs/src/content/docs/` — `user/` (User Guide), `developer/` (Developer's Guide),
+  `install/` (Installation Guide). The sidebar is generated from the folders; adding a page edits no
+  configuration. `developer/reference/generated/` is written by `npm run gen` and is not in git.
+- **Front matter**: `title`, `description` and `kind` are required; `kind` is one of `tutorial`,
+  `how-to`, `reference`, `explanation`, or `overview` for a folder's `index.md`. One kind per page.
+- **Links** are absolute with the base and a trailing slash (`/docs/install/`). `npm run build` in
+  `docs/` fails on a missing `kind`, a broken link or anchor, or a relative link. Renaming a page the
+  *Help* button maps to means updating `jetsclient_ide/src/shell/helpTopics.ts` too.
+- **No client vocabulary**: this repository is public, so no page names a client, its workspace, its
+  rule vocabulary or its data. Examples use `jets_ws` or invented names. Cite code by path and
+  identifier, never by line number.
+- **A screen or a flow has a page and a screenshot spec**: `user/screens/` and `user/screens/flows/`,
+  and `docs/screenshots/specs/`. A change to a screen or a flow updates its page, its spec and its
+  images (`npm run shots` in `docs/screenshots/`), and a new route or titled flow gets a page and a row
+  in `helpTopics.ts`, whose test fails otherwise. A how-to's steps are its spec's steps, so a change
+  that breaks a spec owes the how-to an update.
+- How to write and preview a page: `docs/src/content/docs/developer/contributing/documentation.md`;
+  how to take its screenshots: `developer/contributing/screenshots.md`.
+
 ## Build Commands
 
 **All paths below are relative to this repository's root.** On the `jets_ai` branch this repo is
-normally checked out as a submodule of `jetstore_agentic_ai` (at `jetstore_ai/`), which carries its
-own `go.work` and its own CMake build tree over these same sources. Both build systems then resolve
+sometimes checked out as a submodule of a parent repository that carries its own `go.work` and its
+own CMake build tree over these same sources. Both build systems then resolve
 differently depending on whether your working directory is inside this repo or above it — see the
-notes under each. That parent repo's `CLAUDE.md` documents the arrangement; the commands here assume
-you are inside this repo.
+notes under each. The commands here assume you are inside this repo.
 
 ### C++ RETE Engine (CMake)
 ```bash
 cd build
 cmake -DCMAKE_BUILD_TYPE=Release -DJETS_VERSION=$JETS_VERSION ..
 make clean
-make objlib jets_static jets -j8
-# Run C++ tests
-ctest
-# Or directly: build/jets/jets_test
+make objlib jets_static jets jets_test -j8
+# Run C++ tests: they are registered in build/jets, so ctest in build/ finds none
+ctest --test-dir jets
+# Or directly, from its own directory (some tests open test_data by a relative path):
+(cd jets && ./jets_test)
 ```
 
-A parent checkout may configure a *second*, independent build tree over these sources (the
-`jetstore_agentic_ai` one is Debug, at its root `build/`, and is what its `.vscode` CMake integration
-uses). The two caches share no state, so an artifact staleness question has to name which tree.
+A parent checkout may configure a *second*, independent build tree over these sources (a Debug tree
+at the parent's root `build/`, for its editor's CMake integration, for one). The two caches share no state, so an artifact staleness question has to name which tree.
 
 ### Go Binaries
 ```bash
@@ -67,9 +92,8 @@ The repo uses a Go workspace (`go.work`) covering three modules: root `.`, `./cd
 
 Go selects a workspace by walking up from the current directory and stopping at the first `go.work`,
 so this file only governs commands run **from inside this repo**. Run from a parent that has its own
-`go.work` — as `jetstore_agentic_ai` does, where the workspace is `.`, `./jetstore_ai`, and
-`./workspaces/cedargate_ws` — and the CDK modules drop out of the build set while the cedargate
-workspace's Go lambdas enter it. Do CDK work from this directory.
+`go.work` — one listing the parent, this repository and a workspace with Go code, say — and the CDK
+modules drop out of the build set while that workspace's Go lambdas enter it. Do CDK work from this directory.
 
 ### Docker (full build)
 See `dockerfiles/Dockerfile.cpipes_builder` — multi-stage build that compiles C++ first, then cross-compiles Go binaries for `linux/amd64`.
@@ -78,9 +102,10 @@ See `dockerfiles/Dockerfile.cpipes_builder` — multi-stage build that compiles 
 
 ### C++ Tests (Google Test)
 ```bash
-cd build && ctest
-# Or: build/jets/jets_test
+ctest --test-dir build/jets        # the tests are registered in build/jets; `ctest` in build/ finds none
+(cd build/jets && ./jets_test)     # directly: run from build/jets, where test_data is copied
 ```
+`jets_test` run from any other directory fails the tests that open `test_data` by a relative path.
 Test files: `jets/**/*_test.cc` — covers RDF graph, RETE session, expression operators, and meta-store.
 
 ### Go Tests
@@ -89,42 +114,28 @@ go test ./...                  # all packages
 go test ./jets/compute_pipes/... # single package tree
 go test -run TestFooBar ./jets/datatable/  # single test
 ```
-Key test packages: `compute_pipes`, `datatable`, `workspace`, `jetrules`.
-
-### Flutter Tests (`jetsclient/`)
-
-**They only run on the chrome platform. Plain `flutter test` fails to load every
-test in the package**, with compile errors from `package:web` — a direct
-dependency at `jetsclient/pubspec.yaml:52`, and web-only by construction, so it
-does not build for the Dart VM that `flutter test` targets by default. The errors
-name `jsify`, `toJS` and `ProgressEvent` and look like a broken test rather than
-a broken target, which is why this is written down.
-
-```bash
-cd jetsclient
-CHROME_EXECUTABLE=/usr/bin/google-chrome flutter test --platform chrome
-```
-
-The consequence for test design: **there is no filesystem.** A test that wants to
-emit an artefact has to print it and be scraped, and a test that wants to detect
-drift has to compare a checksum rather than a file — which is what
-`test/table_config_corpus_test.dart` does, and its header explains why.
+Key test packages: `compute_pipes`, `datatable`, `workspace`, `compilerv2`; the rule engine's tests are C++ (`jets_test`, run by `ctest`). A Go test that runs rules links `libjets.so`: build with the cgo override in `docs/src/content/docs/developer/testing/go-and-cpp.md`.
 
 ### JavaScript Tests (`jetsclient_ide/`)
 
 ```bash
 cd jetsclient_ide
 npm ci
-npm test          # vitest, node environment, src/**/*.test.ts
-npm run typecheck # tsc --noEmit; `npm run build` runs it first
+npx vitest run    # the whole suite, once (`npm test` is the same); jsdom per file where a test renders
+npm run typecheck # tsc --noEmit
+npm run build     # typecheck, then the app bundle -> dist/ and the validator -> dist-validator/
 ```
+
+`npm ci` first in a fresh worktree: `node_modules/` is not shared between checkouts.
+`npm run build` is the real check, because the suite does not exercise every type.
+The Flutter app (`jetsclient/`) and its tests were deleted on 2026-08-26.
 
 ## Architecture
 
 ### Layer Overview
 
 ```
-UI (Flutter/jetsclient)
+UI (React/jetsclient_ide)
       │
 API Server (Go/Gorilla Mux, port 8443)
       │
@@ -134,7 +145,7 @@ API Server (Go/Gorilla Mux, port 8443)
       │
 ┌─────┴──────────────┐   ┌──────────────────────┐
 │  Compute Pipes      │   │  JetRules Engine      │
-│  (DAG execution)    │   │  (Go wrapper + CGO)   │
+│  (DAG execution)    │   │  (cgo bridge)         │
 └─────────────────────┘   └──────┬───────────────┘
                                   │
                          ┌────────┴────────┐
@@ -149,7 +160,8 @@ API Server (Go/Gorilla Mux, port 8443)
 |---------|------|----------------|
 | `apiserver` | `jets/apiserver/` | REST API gateway, JWT auth, UI backend |
 | `compute_pipes` | `jets/compute_pipes/` | DAG-based distributed pipeline execution |
-| `jetrules` | `jets/jetrules/` | Go RETE wrapper — rule execution, expression eval, RDF |
+| `jetrules` | `jets/jetrules/` | The rule model the compiler writes and the pipelines read (`rete_meta_store_model.go`, rdf literals); the Go engine that lived here was retired in October 2026 |
+| `bridge`, `jetrules_native_adaptor` | `jets/bridge/`, `jets/compute_pipes/jetrules_native_adaptor/` | cgo bridge to `libjets.so`, and the rule engine as `compute_pipes` sees it |
 | `datatable` | `jets/datatable/` | DB abstraction, pipeline coordinator, file key management |
 | `workspace` | `jets/workspace/` | Rule workspace compilation, versioning, S3 asset uploads |
 | `awsi` | `jets/awsi/` | AWS SDK wrappers (S3, Secrets Manager, SNS, Step Functions) |
@@ -162,7 +174,6 @@ API Server (Go/Gorilla Mux, port 8443)
 |--------|------|---------|
 | `apiserver` | `jets/apiserver/main.go` | REST API (port 8443/8080) |
 | `cbooter` | `jets/cmds/cbooter/main.go` | Docker init — runs as root, spawns services as non-root |
-| `cpipes_server` | `jets/cmds/cpipes_server/main.go` | Compute pipes cluster coordinator |
 | `cpipes_native_server` | `jets/cmds/cpipes_native_server/` | Native compute pipes execution |
 | `compile_workspace` | `jets/cmds/compile_workspace/main.go` | CLI: compile and upload workspace |
 | `compilerv2` | `jets/compilerv2/main.go` | JetRule file analyzer/compiler |
@@ -190,8 +201,8 @@ deployment that does not set it. It turns every workspace git operation into a l
 route to a source-control host, and local development.
 
 **The local reason is the one that costs you something if you skip it, and it is not the obvious
-one.** On a workstation this repo is normally checked out as a submodule of `jetstore_agentic_ai`,
-whose `workspaces/` is the natural `WORKSPACES_HOME` — so a workspace is a **submodule of the
+one.** On a workstation this repo may be checked out as a submodule of a parent repository whose
+`workspaces/` is the natural `WORKSPACES_HOME` — so a workspace is a **submodule of the
 repository you are working in**. Two consequences:
 
 - **The visible one.** An uninitialised submodule is a directory that exists and is not a
@@ -206,8 +217,8 @@ repository you are working in**. Two consequences:
   nothing happened.
 
 The apiserver states which way the switch went in its first lines of log output
-(`LogGitAccessMode`), which is the cheapest way to find out you forgot. `cdk/jetstore_one/doc/deploy_runbook.md`
-§8 carries the longer version.
+(`LogGitAccessMode`), which is the cheapest way to find out you forgot. `docs/src/content/docs/install/how-to/run-against-a-local-checkout.md`
+carries the longer version.
 
 ## Database
 
@@ -221,7 +232,7 @@ PostgreSQL is the primary database. Schema files:
 ## CDK / Infrastructure
 
 AWS CDK infrastructure is in `cdk/`:
-- `cdk/bootstrap_aws/` — bootstrap resources (S3, ECR, secrets)
+- `cdk/bootstrap_aws/` — the GitHub OIDC provider and the role a GitHub workflow deploys with (no S3, ECR or secrets; the CDK bootstrap and the ECR repositories are separate steps, see `docs/src/content/docs/install/how-to/bootstrap-an-account.md`)
 - `cdk/jetstore_one/` — main stack: ECS Fargate, Lambda, RDS, Step Functions, VPC
 - `cdk/vpc_peering/` — VPC peering utility
 
@@ -310,20 +321,21 @@ image that does not reset `CMD` gets `/bin/bash` appended to its arguments.
 - `vscode-jetrule/` — VS Code extension for the JetRules DSL (grammar and snippets, no TypeScript)
 - `sample_projects/` — example workspaces
 
-## Web UIs
+## Web UI
 
-Two web apps, served by the same apiserver on the same origin.
+One web app, `jetsclient_ide/`: React + TypeScript + vite, served by the apiserver at `/`. It holds
+every screen, the user flows' runner and the Workspace IDE's CodeMirror 6 editor; the directory is
+named for the editor it began as. Test and build commands are under *Test Commands* above; it has its
+own `README.md`, whose *Layout* section says what each directory under `src/` is for.
 
-`jetsclient/` is a Flutter/Dart web app for workspace management and pipeline administration. Build
-with standard Flutter tooling (`flutter build web`). Served at `/`.
+**The prefix is baked into the bundle.** It is written in three places that must agree:
+`appAssetPrefix` in `jets/apiserver/static_ide.go` and `base` in `jetsclient_ide/vite.config.ts`,
+both `/`, and `BASENAME` in `jetsclient_ide/src/base.ts`, the empty string (react-router's spelling
+of a root mount). Vite writes `base` into every asset url at build time, so
+the bundle cannot be served from another prefix without rebuilding it. It was `/ide/` until
+2026-08-26, when the Flutter app (`jetsclient/`, previously at `/`) was retired.
 
-`jetsclient_ide/` is a React + TypeScript + vite app — the Workspace IDE's CodeMirror 6 editor.
-Build with `npm ci && npm run build`. Served at `/ide/`, and that prefix is compiled into the asset
-urls by vite's `base`, so the bundle cannot be moved to another prefix without rebuilding it. It has
-its own `README.md`.
-
-Both are built into the `ui_service_ws` image (`dockerfiles/Dockerfile.ui_service_ws`) and land at
-`/usr/local/lib/web` and `/usr/local/lib/ide`, which are the defaults of the apiserver's
-`-WEB_APP_DEPLOYMENT_DIR` and `-IDE_APP_DEPLOYMENT_DIR` flags. The toolchains for both — Flutter and
-Node — are installed in `dockerfiles/Dockerfile.cpipes_base_builder`, each pinned to a release
-tarball rather than taken from the distro.
+It is built into the `ui_service_ws` image (`dockerfiles/Dockerfile.ui_service_ws`) and lands at
+`/usr/local/lib/ide`, the default of the apiserver's `-IDE_APP_DEPLOYMENT_DIR` flag
+(`jets/apiserver/main.go`). Node is installed in `dockerfiles/Dockerfile.cpipes_base_builder`, pinned
+to a release tarball rather than taken from the distro.

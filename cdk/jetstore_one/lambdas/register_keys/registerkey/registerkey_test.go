@@ -3,10 +3,15 @@ package registerkey
 import (
 	"context"
 	"errors"
+	"io"
 	"reflect"
+	"strings"
 	"testing"
 
+	"github.com/artisoft-io/jetstore/jets/compute_pipes"
 	"github.com/artisoft-io/jetstore/jets/datatable"
+	"github.com/aws/aws-lambda-go/events"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // The registerFileKeys seam, captured. Every test in this file goes through
@@ -43,15 +48,15 @@ func withHook(t *testing.T, h Hook) {
 	t.Cleanup(func() { siteHook = saved })
 }
 
-// The file key shape the cedargate deployment actually delivers: client, vendor,
+// A file key in the shape an ingest deployment delivers: client, vendor,
 // object_type and the three date components as path segments, then the file name.
-const testFileKey = "client=CGT/vendor=ACME/object_type=eligibility/" +
+const testFileKey = "client=CI/vendor=ACME/object_type=eligibility/" +
 	"year=2026/month=09/day=16/eligibility_20260916.csv"
 
 const testFileSize int64 = 4096
 
 // TestDoFileKeyNilHookRegistersTheStockAction is the check behind the claim that
-// extracting this package leaves register_keys_v2 unchanged (AC.4). It is the only
+// extracting this package leaves register_keys_v2 unchanged. It is the only
 // test in the change covering the path every object type in the deployment takes,
 // and it is spelled out by value rather than by re-calling
 // utils.SplitFileKeyIntoComponents, so that a change to what doFileKey puts in the
@@ -61,7 +66,7 @@ func TestDoFileKeyNilHookRegistersTheStockAction(t *testing.T) {
 	withHook(t, nil)
 
 	dtCtx := &datatable.DataTableContext{}
-	err := doFileKey(context.Background(), nil, dtCtx, testFileKey, testFileSize, "a-token")
+	err := doFileKey(context.Background(), nil, dtCtx, testFileKey, testFileSize, "a-token", eventResume{})
 	if err != nil {
 		t.Fatalf("doFileKey returned %v, want nil", err)
 	}
@@ -90,7 +95,7 @@ func TestDoFileKeyNilHookRegistersTheStockAction(t *testing.T) {
 	}
 
 	want := map[string]any{
-		"client":      "CGT",
+		"client":      "CI",
 		"vendor":      "ACME",
 		"org":         "ACME",
 		"object_type": "eligibility",
@@ -154,7 +159,7 @@ func (h *stubHook) BeforeRegister(ctx context.Context, dtCtx *datatable.DataTabl
 	return h.isSchemaEvent, h.done, h.err
 }
 
-// TestDoFileKeyHookDoneRegistersNothing is the first half of AC.5: done == true is
+// TestDoFileKeyHookDoneRegistersNothing is the first half of the hook contract: done == true is
 // the return, and there is no fall-through to a stock registration the hook has
 // already handled.
 func TestDoFileKeyHookDoneRegistersNothing(t *testing.T) {
@@ -163,7 +168,7 @@ func TestDoFileKeyHookDoneRegistersNothing(t *testing.T) {
 	withHook(t, hook)
 
 	err := doFileKey(context.Background(), nil, &datatable.DataTableContext{},
-		testFileKey, testFileSize, "a-token")
+		testFileKey, testFileSize, "a-token", eventResume{})
 	if err != nil {
 		t.Fatalf("doFileKey returned %v, want nil", err)
 	}
@@ -183,7 +188,7 @@ func TestDoFileKeyHookErrorRegistersNothing(t *testing.T) {
 	withHook(t, &stubHook{err: wantErr})
 
 	err := doFileKey(context.Background(), nil, &datatable.DataTableContext{},
-		testFileKey, testFileSize, "a-token")
+		testFileKey, testFileSize, "a-token", eventResume{})
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("doFileKey returned %v, want %v", err, wantErr)
 	}
@@ -192,7 +197,7 @@ func TestDoFileKeyHookErrorRegistersNothing(t *testing.T) {
 	}
 }
 
-// TestDoFileKeyHookSchemaEventCarriesAdditions is the second half of AC.5: the flag
+// TestDoFileKeyHookSchemaEventCarriesAdditions is the second half of the hook contract: the flag
 // reaches the action, and the entries a hook adds to components arrive in the Data
 // map unchanged and alongside -- not instead of -- the ones the stock path put
 // there.
@@ -209,7 +214,7 @@ func TestDoFileKeyHookSchemaEventCarriesAdditions(t *testing.T) {
 
 	ctx := context.Background()
 	dtCtx := &datatable.DataTableContext{}
-	err := doFileKey(ctx, nil, dtCtx, testFileKey, testFileSize, "a-token")
+	err := doFileKey(ctx, nil, dtCtx, testFileKey, testFileSize, "a-token", eventResume{})
 	if err != nil {
 		t.Fatalf("doFileKey returned %v, want nil", err)
 	}
@@ -252,7 +257,7 @@ func TestDoFileKeyHookSchemaEventCarriesAdditions(t *testing.T) {
 	}
 
 	want := map[string]any{
-		"client":               "CGT",
+		"client":               "CI",
 		"vendor":               "ACME",
 		"org":                  "ACME",
 		"object_type":          "eligibility",
@@ -266,5 +271,111 @@ func TestDoFileKeyHookSchemaEventCarriesAdditions(t *testing.T) {
 	}
 	if got := action.Data[0]; !reflect.DeepEqual(got, want) {
 		t.Errorf("Data[0] mismatch\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+// fakeSchemaObject replaces downloadSchemaEvent with an object whose body is
+// given, written in two parts and the second one first, as a multi-part download
+// may. It records the version each call asked for.
+func fakeSchemaObject(t *testing.T, body string) *[]string {
+	t.Helper()
+	saved := downloadSchemaEvent
+	versions := make([]string, 0, 1)
+	downloadSchemaEvent = func(fileKey, versionId string, w io.WriterAt) (int64, error) {
+		versions = append(versions, versionId)
+		half := len(body) / 2
+		if _, err := w.WriteAt([]byte(body[half:]), int64(half)); err != nil {
+			return 0, err
+		}
+		if _, err := w.WriteAt([]byte(body[:half]), 0); err != nil {
+			return 0, err
+		}
+		return int64(len(body)), nil
+	}
+	t.Cleanup(func() { downloadSchemaEvent = saved })
+	return &versions
+}
+
+// withCapturedSchemaEvents replaces registerSchemaEvent and returns what it got.
+func withCapturedSchemaEvents(t *testing.T) *[]*compute_pipes.SchemaProviderSpec {
+	t.Helper()
+	saved := registerSchemaEvent
+	got := make([]*compute_pipes.SchemaProviderSpec, 0, 1)
+	registerSchemaEvent = func(_ *datatable.DataTableContext, _ *pgxpool.Pool,
+		schemaInfo *compute_pipes.SchemaProviderSpec, _ string) error {
+		got = append(got, schemaInfo)
+		return nil
+	}
+	t.Cleanup(func() { registerSchemaEvent = saved })
+	return &got
+}
+
+// TestDoFileSchemaRegistersTheBodyItDownloaded: the S3 event's size is
+// what the object was when the event was raised, and an object overwritten since
+// is larger or smaller. Before the fix the body was a buffer of the event's size,
+// so a larger object was cut short and a smaller one was followed by zero bytes,
+// and neither unmarshalled.
+func TestDoFileSchemaRegistersTheBodyItDownloaded(t *testing.T) {
+	const eventSize int64 = 64
+	cases := []struct {
+		name    string
+		comment string
+	}{
+		{"larger than the event", strings.Repeat("x", 200)},
+		{"smaller than the event", "y"},
+		{"the event's size", strings.Repeat("z", int(eventSize)-len(`{"comment":""}`))},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			body := `{"comment":"` + c.comment + `"}`
+			versions := fakeSchemaObject(t, body)
+			got := withCapturedSchemaEvents(t)
+			if err := doFileSchema(nil, nil, "schema_triggers/event.json", "v-7", eventSize, "tok"); err != nil {
+				t.Fatalf("doFileSchema with a %d-byte object and a %d-byte event: %v", len(body), eventSize, err)
+			}
+			if len(*got) != 1 || (*got)[0].Comment != c.comment {
+				t.Fatalf("registered %+v, want the downloaded body's comment (%d bytes)", *got, len(c.comment))
+			}
+			if !reflect.DeepEqual(*versions, []string{"v-7"}) {
+				t.Errorf("downloaded versions %q, want the event's version", *versions)
+			}
+		})
+	}
+}
+
+// A slice of events goes through the same buffer, and a bucket without
+// versioning gives an event with no version, which downloads the current one.
+func TestDoFileSchemaRegistersASliceWithoutAVersion(t *testing.T) {
+	body := `[{"comment":"a"},{"comment":"` + strings.Repeat("b", 100) + `"}]`
+	versions := fakeSchemaObject(t, body)
+	got := withCapturedSchemaEvents(t)
+	if err := doFileSchema(nil, nil, "schema_triggers/events.json", "", 10, "tok"); err != nil {
+		t.Fatalf("doFileSchema: %v", err)
+	}
+	if len(*got) != 2 || (*got)[0].Comment != "a" || len((*got)[1].Comment) != 100 {
+		t.Fatalf("registered %+v, want both events of the slice", *got)
+	}
+	if !reflect.DeepEqual(*versions, []string{""}) {
+		t.Errorf("downloaded versions %q, want the current version", *versions)
+	}
+}
+
+// processMessage hands doFileSchema the version the S3 event names.
+func TestProcessMessagePassesTheEventVersion(t *testing.T) {
+	savedInput, savedSchema := s3InputPrefix, s3SchemaPrefix
+	s3InputPrefix, s3SchemaPrefix = "input/", "schema_triggers/"
+	t.Cleanup(func() { s3InputPrefix, s3SchemaPrefix = savedInput, savedSchema })
+	versions := fakeSchemaObject(t, `{"comment":"c"}`)
+	got := withCapturedSchemaEvents(t)
+
+	var record events.S3EventRecord
+	record.S3.Object.Key = "schema_triggers/event.json"
+	record.S3.Object.Size = 3
+	record.S3.Object.VersionID = "v-42"
+	if err := processMessage(context.Background(), nil, record); err != nil {
+		t.Fatalf("processMessage: %v", err)
+	}
+	if len(*got) != 1 || !reflect.DeepEqual(*versions, []string{"v-42"}) {
+		t.Fatalf("registered %d events from versions %q, want one from v-42", len(*got), *versions)
 	}
 }

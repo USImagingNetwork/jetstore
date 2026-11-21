@@ -27,7 +27,7 @@
 // The suite builds two databases: one with every table the classifier reads and
 // one with only the two the execution record needs. The second is not a
 // convenience — it is the state all four production environments measured on
-// 2026-08-25 were in (I-132), and it is the only way to test that a locus whose
+// 2026-08-25 were in, and it is the only way to test that a locus whose
 // table is absent reports not_evaluable rather than absent.
 //
 // Needs JETS_TEST_DSN; skipped otherwise. Locally:
@@ -38,7 +38,7 @@
 // Use `go test -p 1` when running this beside jets/agentic/observe or
 // jets/agentic/audit against one DSN: all three call audit.InstallSchema and two
 // sessions issuing the same CREATE TABLE / CREATE TRIGGER sequence deadlock on
-// catalogue locks (I-175). The separate databases below remove that for this
+// catalogue locks. The separate databases below remove that for this
 // package's own tests and not across packages.
 package triage
 
@@ -247,7 +247,7 @@ func processErrors(t *testing.T, pool *pgxpool.Pool, execKey int, session string
 // storeConfig puts a configuration where a run's configuration lives.
 //
 // **It named sharding_config_json and reducing_config_json until 2026-09-04, and
-// no longer needs to** — which was I-305 and was a defect in jets/schema rather
+// no longer needs to** — which was a defect in jets/schema rather
 // than a quirk of this fixture. Both columns are marked "deleted": true in
 // jets_schema.json and both are declared NOT NULL with no default;
 // TableDefinition.UpdateTable dropped a deleted column and
@@ -257,11 +257,11 @@ func processErrors(t *testing.T, pool *pgxpool.Pool, execKey int, session string
 // (`StartShardingComputePipes`, `jets/compute_pipes/actions_start_sharding_cp.go:385`)
 // names six columns, not these two, and failed with a not-null violation.
 //
-// **Fixed at AH.1**: CreateTable now skips a column or an index marked deleted
-// (`CreateTable`, `jets/schema/schema.go:277`), so one pass and two passes agree
+// **Fixed 2026-09-04**: CreateTable now skips a column or an index marked deleted
+// (`jets/schema/schema.go`'s `CreateTable`), so one pass and two passes agree
 // and this fixture names what the production writer names.
 //
-// The reason it took until AC.1 to find is worth keeping. Running the migration
+// The reason it took until triage to find is worth keeping. Running the migration
 // twice cleared it, so every environment migrated more than once was fine for
 // ever after and only a brand-new deployment's first run met it. observe's own
 // suite did not see it either, and by luck rather than by design: its testPool
@@ -279,13 +279,13 @@ func storeConfig(t *testing.T, pool *pgxpool.Pool, execKey int, session, config 
 	}
 }
 
-// TestFreshInstallCanWriteTheRunConfiguration is I-305 as an assertion, and the
+// TestFreshInstallCanWriteTheRunConfiguration is that defect as an assertion, and the
 // assertion is now the opposite of the one it was written as.
 //
-// **It was TestFreshInstallCannotWriteTheRunConfiguration until 2026-09-04.** AC.1
-// wrote it to require the insert to *fail*, skipping with an explanation the day
+// **It was TestFreshInstallCannotWriteTheRunConfiguration until 2026-09-04.** It was
+// written to require the insert to *fail*, skipping with an explanation the day
 // somebody fixed CreateTable, so that the suite would say which defect went away
-// rather than going quietly green. AH.1 fixed it, the skip fired, and the test is
+// rather than going quietly green. The fix landed, the skip fired, and the test is
 // inverted here rather than deleted: what was a reproduction is now a regression
 // guard over this suite's own fixture, and the two are the same statement run
 // against the same schema for opposite reasons.
@@ -303,13 +303,13 @@ func TestFreshInstallCanWriteTheRunConfiguration(t *testing.T) {
 		 cpipes_startup_json, input_row_columns_json)
 		VALUES (1, 'probe', '{}', '{}', '{}', '{}')`)
 	if err != nil {
-		t.Fatalf("the sharding start's own insert failed on a fresh schema, which is I-305 returning: %v", err)
+		t.Fatalf("the sharding start's own insert failed on a fresh schema, which is the deleted-column defect returning: %v", err)
 	}
 }
 
 // Two configurations in the shape cpipes_config_json holds: a list of PipeSpec.
 // The first is the corpus's ordinary state — a map_record with no error channel,
-// which is 243 of 243 instances across the four workspaces (F188). The second is
+// which is 243 of 243 instances across the four workspaces. The second is
 // the 9-of-12 jetrules case that does declare one.
 const configNoErrorChannel = `[{"type":"fan_out","input_channel":{"name":"input"},
   "apply":[{"type":"map_record","map_record_config":{},"output_channel":{"name":"mapped"}},
@@ -363,11 +363,11 @@ func TestPredicatesOnAMigratedDeployment(t *testing.T) {
 	// before every session below. Without it, locus run_not_started reports
 	// not_evaluable for the purge reason rather than firing — which is a real
 	// case and is tested separately.
-	oldKey := header(t, pool, "cgt", "loader", "claims", "old", "completed", now.Add(-72*time.Hour))
-	workerRow(t, pool, oldKey, "cgt", "loader", "old", "reducing00", 0, "completed", 5000, 5000, "", now.Add(-72*time.Hour))
+	oldKey := header(t, pool, "client2", "loader", "claims", "old", "completed", now.Add(-72*time.Hour))
+	workerRow(t, pool, oldKey, "client2", "loader", "old", "reducing00", 0, "completed", 5000, 5000, "", now.Add(-72*time.Hour))
 
 	t.Run("run_not_started", func(t *testing.T) {
-		header(t, pool, "cgt", "loader", "claims", "s-nostart", "failed", now.Add(-time.Hour))
+		header(t, pool, "client2", "loader", "claims", "s-nostart", "failed", now.Add(-time.Hour))
 		r := classify(t, pool, "s-nostart", 0)
 		f := wantVerdict(t, r, LocusRunNotStarted, Present)
 		if !strings.Contains(f.Basis, "no pipeline_execution_details row") {
@@ -382,9 +382,9 @@ func TestPredicatesOnAMigratedDeployment(t *testing.T) {
 
 	t.Run("run_not_started is not evaluable when the run predates the worker record", func(t *testing.T) {
 		// A header older than the oldest worker row anywhere: the purge takes
-		// the two on independent clocks (F54), so a run whose workers have been
+		// the two on independent clocks, so a run whose workers have been
 		// purged is indistinguishable from one that never started.
-		header(t, pool, "cgt", "loader", "claims", "s-purged", "completed", now.Add(-200*24*time.Hour))
+		header(t, pool, "client2", "loader", "claims", "s-purged", "completed", now.Add(-200*24*time.Hour))
 		r := classify(t, pool, "s-purged", 0)
 		f := wantVerdict(t, r, LocusRunNotStarted, NotEvaluable)
 		if !strings.Contains(f.Basis, "RETENTION_DAYS") {
@@ -393,13 +393,13 @@ func TestPredicatesOnAMigratedDeployment(t *testing.T) {
 	})
 
 	t.Run("worker_not_terminated", func(t *testing.T) {
-		k := header(t, pool, "cgt", "loader", "claims", "s-stall", "failed", now.Add(-time.Hour))
-		workerRow(t, pool, k, "cgt", "loader", "s-stall", "reducing01", 0, "completed", 1000, 1000, "", now.Add(-time.Hour))
-		workerRow(t, pool, k, "cgt", "loader", "s-stall", "reducing01", 1, "", 0, 0, "", now.Add(-time.Hour))
+		k := header(t, pool, "client2", "loader", "claims", "s-stall", "failed", now.Add(-time.Hour))
+		workerRow(t, pool, k, "client2", "loader", "s-stall", "reducing01", 0, "completed", 1000, 1000, "", now.Add(-time.Hour))
+		workerRow(t, pool, k, "client2", "loader", "s-stall", "reducing01", 1, "", 0, 0, "", now.Add(-time.Hour))
 		r := classify(t, pool, "s-stall", 0)
 		f := wantVerdict(t, r, LocusWorkerNotTerminated, Present)
 		if !strings.Contains(f.Basis, "cpipes_execution_status_details") {
-			t.Errorf("basis does not carry F193's finding that the step aggregate hides the row: %s", f.Basis)
+			t.Errorf("basis does not carry the finding that the step aggregate hides the row: %s", f.Basis)
 		}
 		// One stalled worker of two, so the finding localises to its shard.
 		if f.ShardRef == nil || *f.ShardRef != 1 {
@@ -408,7 +408,7 @@ func TestPredicatesOnAMigratedDeployment(t *testing.T) {
 		// And to no step, ever. cpipes_step_id is written only by
 		// UpdatePipelineExecutionStatus, and a worker that never terminated is
 		// exactly one the update never reached — so this locus cannot localise
-		// to a step by construction, whatever the configuration says (I-302).
+		// to a step by construction, whatever the configuration says.
 		// The worker was created with MainInputStepId "reducing01" and the row
 		// still carries an empty label.
 		if f.StepRef != "" {
@@ -421,14 +421,14 @@ func TestPredicatesOnAMigratedDeployment(t *testing.T) {
 	})
 
 	t.Run("worker_failed", func(t *testing.T) {
-		k := header(t, pool, "cgt", "loader", "claims", "s-fail", "failed", now.Add(-time.Hour))
-		workerRow(t, pool, k, "cgt", "loader", "s-fail", "reducing01", 0, "failed", 100, 0,
+		k := header(t, pool, "client2", "loader", "claims", "s-fail", "failed", now.Add(-time.Hour))
+		workerRow(t, pool, k, "client2", "loader", "s-fail", "reducing01", 0, "failed", 100, 0,
 			"while reading file s3://b/k, unexpected EOF,while writing to jetsapi.claims, deadlock detected",
 			now.Add(-time.Hour))
 		r := classify(t, pool, "s-fail", 0)
 		f := wantVerdict(t, r, LocusWorkerFailed, Present)
 		// The comma count is reported as the upper bound it is: the message
-		// holds three commas and two errors, which is the whole of F191.
+		// holds three commas and two errors, which is the whole point.
 		if !strings.Contains(f.Basis, "4 comma-separated segments is an upper bound") {
 			t.Errorf("basis does not report the comma count as an upper bound: %s", f.Basis)
 		}
@@ -436,8 +436,8 @@ func TestPredicatesOnAMigratedDeployment(t *testing.T) {
 	})
 
 	t.Run("rows_lost_silently", func(t *testing.T) {
-		k := header(t, pool, "cgt", "loader", "claims", "s-collapse", "completed", now.Add(-time.Hour))
-		workerRow(t, pool, k, "cgt", "loader", "s-collapse", "reducing01", 0, "completed", 10000, 12, "", now.Add(-time.Hour))
+		k := header(t, pool, "client2", "loader", "claims", "s-collapse", "completed", now.Add(-time.Hour))
+		workerRow(t, pool, k, "client2", "loader", "s-collapse", "reducing01", 0, "completed", 10000, 12, "", now.Add(-time.Hour))
 		storeConfig(t, pool, k, "s-collapse", configNoErrorChannel)
 		r := classify(t, pool, "s-collapse", 0)
 		f := wantVerdict(t, r, LocusRowsLostSilently, Present)
@@ -450,8 +450,8 @@ func TestPredicatesOnAMigratedDeployment(t *testing.T) {
 	})
 
 	t.Run("rows_lost_silently is absent on a healthy ratio", func(t *testing.T) {
-		k := header(t, pool, "cgt", "loader", "claims", "s-clean", "completed", now.Add(-time.Hour))
-		workerRow(t, pool, k, "cgt", "loader", "s-clean", "reducing01", 0, "completed", 10000, 9800, "", now.Add(-time.Hour))
+		k := header(t, pool, "client2", "loader", "claims", "s-clean", "completed", now.Add(-time.Hour))
+		workerRow(t, pool, k, "client2", "loader", "s-clean", "reducing01", 0, "completed", 10000, 9800, "", now.Add(-time.Hour))
 		storeConfig(t, pool, k, "s-clean", configWithErrorChannel)
 		r := classify(t, pool, "s-clean", 0)
 		wantVerdict(t, r, LocusRowsLostSilently, Absent)
@@ -463,8 +463,8 @@ func TestPredicatesOnAMigratedDeployment(t *testing.T) {
 	})
 
 	t.Run("per_record_failures_reported", func(t *testing.T) {
-		k := header(t, pool, "cgt", "loader", "claims", "s-perr", "completed", now.Add(-time.Hour))
-		workerRow(t, pool, k, "cgt", "loader", "s-perr", "reducing01", 0, "completed", 1000, 1000, "", now.Add(-time.Hour))
+		k := header(t, pool, "client2", "loader", "claims", "s-perr", "completed", now.Add(-time.Hour))
+		workerRow(t, pool, k, "client2", "loader", "s-perr", "reducing01", 0, "completed", 1000, 1000, "", now.Add(-time.Hour))
 		processErrors(t, pool, k, "s-perr", 20, 7)
 		r := classify(t, pool, "s-perr", 0)
 		f := wantVerdict(t, r, LocusPerRecordFailuresReported, Present)
@@ -477,8 +477,8 @@ func TestPredicatesOnAMigratedDeployment(t *testing.T) {
 	})
 
 	t.Run("per_record_failures_unreportable", func(t *testing.T) {
-		k := header(t, pool, "cgt", "loader", "claims", "s-unrep", "completed", now.Add(-time.Hour))
-		workerRow(t, pool, k, "cgt", "loader", "s-unrep", "reducing01", 0, "completed", 1000, 1000, "", now.Add(-time.Hour))
+		k := header(t, pool, "client2", "loader", "claims", "s-unrep", "completed", now.Add(-time.Hour))
+		workerRow(t, pool, k, "client2", "loader", "s-unrep", "reducing01", 0, "completed", 1000, 1000, "", now.Add(-time.Hour))
 		storeConfig(t, pool, k, "s-unrep", configNoErrorChannel)
 		r := classify(t, pool, "s-unrep", 0)
 		f := wantVerdict(t, r, LocusPerRecordFailuresUnreportable, Present)
@@ -496,8 +496,8 @@ func TestPredicatesOnAMigratedDeployment(t *testing.T) {
 	})
 
 	t.Run("per_record_failures_unreportable is not evaluable with no stored config", func(t *testing.T) {
-		k := header(t, pool, "cgt", "loader", "claims", "s-noconf", "failed", now.Add(-time.Hour))
-		workerRow(t, pool, k, "cgt", "loader", "s-noconf", "reducing01", 0, "failed", 10, 0, "boom", now.Add(-time.Hour))
+		k := header(t, pool, "client2", "loader", "claims", "s-noconf", "failed", now.Add(-time.Hour))
+		workerRow(t, pool, k, "client2", "loader", "s-noconf", "reducing01", 0, "failed", 10, 0, "boom", now.Add(-time.Hour))
 		r := classify(t, pool, "s-noconf", 0)
 		f := wantVerdict(t, r, LocusPerRecordFailuresUnreportable, NotEvaluable)
 		if !strings.Contains(f.Basis, "sharding validation") {
@@ -506,8 +506,8 @@ func TestPredicatesOnAMigratedDeployment(t *testing.T) {
 	})
 
 	t.Run("sink_failed_under_completed_worker", func(t *testing.T) {
-		k := header(t, pool, "cgt", "loader", "claims", "s-sink", "completed", now.Add(-time.Hour))
-		w := workerRow(t, pool, k, "cgt", "loader", "s-sink", "reducing01", 0, "completed", 1000, 1000, "", now.Add(-time.Hour))
+		k := header(t, pool, "client2", "loader", "claims", "s-sink", "completed", now.Add(-time.Hour))
+		w := workerRow(t, pool, k, "client2", "loader", "s-sink", "reducing01", 0, "completed", 1000, 1000, "", now.Add(-time.Hour))
 		// Two sinks on one edge, one of which failed: AggregateChannelResults
 		// folds them and blanks output_entity, which is the thing the locus
 		// cannot see and which this writes through the production code.
@@ -536,19 +536,19 @@ func TestPredicatesOnAMigratedDeployment(t *testing.T) {
 		// Four prior runs with two steps each, then a run with only one.
 		for i := 4; i >= 1; i-- {
 			s := fmt.Sprintf("s-hist-%d", i)
-			k := header(t, pool, "usi", "qc", "members", s, "completed", now.Add(-time.Duration(i*24)*time.Hour))
-			workerRow(t, pool, k, "usi", "qc", s, "reducing00", 0, "completed", 100, 100, "", now.Add(-time.Duration(i*24)*time.Hour))
-			workerRow(t, pool, k, "usi", "qc", s, "reducing01", 0, "completed", 100, 100, "", now.Add(-time.Duration(i*24)*time.Hour))
+			k := header(t, pool, "client1", "qc", "members", s, "completed", now.Add(-time.Duration(i*24)*time.Hour))
+			workerRow(t, pool, k, "client1", "qc", s, "reducing00", 0, "completed", 100, 100, "", now.Add(-time.Duration(i*24)*time.Hour))
+			workerRow(t, pool, k, "client1", "qc", s, "reducing01", 0, "completed", 100, 100, "", now.Add(-time.Duration(i*24)*time.Hour))
 		}
-		k := header(t, pool, "usi", "qc", "members", "s-missing", "completed", now)
-		workerRow(t, pool, k, "usi", "qc", "s-missing", "reducing00", 0, "completed", 100, 100, "", now)
+		k := header(t, pool, "client1", "qc", "members", "s-missing", "completed", now)
+		workerRow(t, pool, k, "client1", "qc", "s-missing", "reducing00", 0, "completed", 100, 100, "", now)
 		r := classify(t, pool, "s-missing", 30*24*time.Hour)
 		f := wantVerdict(t, r, LocusStepNeverStarted, Present)
 		if f.StepRef != "reducing01" {
 			t.Errorf("step_ref is %q, want reducing01", f.StepRef)
 		}
 		if !strings.Contains(f.Basis, "workspace version") {
-			t.Errorf("basis does not carry F196: %s", f.Basis)
+			t.Errorf("basis does not carry the workspace-version limit: %s", f.Basis)
 		}
 		// The invariant: a finding naming a step carries step_label_ambiguous.
 		// assertAllValid has already refused it otherwise; this says why.
@@ -558,9 +558,9 @@ func TestPredicatesOnAMigratedDeployment(t *testing.T) {
 	})
 
 	t.Run("step_never_started is absent when every step ran", func(t *testing.T) {
-		k := header(t, pool, "usi", "qc", "members", "s-complete", "completed", now.Add(time.Hour))
-		workerRow(t, pool, k, "usi", "qc", "s-complete", "reducing00", 0, "completed", 100, 100, "", now.Add(time.Hour))
-		workerRow(t, pool, k, "usi", "qc", "s-complete", "reducing01", 0, "completed", 100, 100, "", now.Add(time.Hour))
+		k := header(t, pool, "client1", "qc", "members", "s-complete", "completed", now.Add(time.Hour))
+		workerRow(t, pool, k, "client1", "qc", "s-complete", "reducing00", 0, "completed", 100, 100, "", now.Add(time.Hour))
+		workerRow(t, pool, k, "client1", "qc", "s-complete", "reducing01", 0, "completed", 100, 100, "", now.Add(time.Hour))
 		r := classify(t, pool, "s-complete", 30*24*time.Hour)
 		wantVerdict(t, r, LocusStepNeverStarted, Absent)
 	})
@@ -578,8 +578,8 @@ func TestPredicatesOnAMigratedDeployment(t *testing.T) {
 		// hard-coded six months while the worker record follows RETENTION_DAYS,
 		// and in three of four measured environments the worker rows outlive
 		// their headers.
-		k := header(t, pool, "cgt", "loader", "claims", "s-orphan", "completed", now.Add(-time.Hour))
-		workerRow(t, pool, k, "cgt", "loader", "s-orphan", "reducing01", 0, "", 0, 0, "", now.Add(-time.Hour))
+		k := header(t, pool, "client2", "loader", "claims", "s-orphan", "completed", now.Add(-time.Hour))
+		workerRow(t, pool, k, "client2", "loader", "s-orphan", "reducing01", 0, "", 0, 0, "", now.Add(-time.Hour))
 		if _, err := pool.Exec(context.Background(),
 			`DELETE FROM jetsapi.pipeline_execution_status WHERE session_id = 's-orphan'`); err != nil {
 			t.Fatalf("purging the header: %v", err)
@@ -592,7 +592,7 @@ func TestPredicatesOnAMigratedDeployment(t *testing.T) {
 			}
 		}
 		// But the loci that need no header still answer, which is the point of
-		// the worker row being self-keying (F98).
+		// the worker row being self-keying.
 		wantVerdict(t, r, LocusWorkerFailed, Absent)
 	})
 }
@@ -600,14 +600,14 @@ func TestPredicatesOnAMigratedDeployment(t *testing.T) {
 // --- the same nine, on a deployment that has not been migrated ---------------
 
 // This is the test the three-valued verdict exists for. All four production
-// environments measured on 2026-08-25 lacked pipeline_execution_channel_details
-// (I-132), and a boolean classifier would report "no sink failed" and "nothing
+// environments measured on 2026-08-25 lacked pipeline_execution_channel_details,
+// and a boolean classifier would report "no sink failed" and "nothing
 // was written and lost" on every one of them.
 func TestUnmigratedDeploymentReportsNotEvaluableRatherThanAbsent(t *testing.T) {
 	pool := freshDB(t, "triage_unmigrated", unmigratedTables)
 
-	k := header(t, pool, "cgt", "loader", "claims", "s-1", "completed", now.Add(-time.Hour))
-	workerRow(t, pool, k, "cgt", "loader", "s-1", "reducing01", 0, "completed", 1000, 1000, "", now.Add(-time.Hour))
+	k := header(t, pool, "client2", "loader", "claims", "s-1", "completed", now.Add(-time.Hour))
+	workerRow(t, pool, k, "client2", "loader", "s-1", "reducing01", 0, "completed", 1000, 1000, "", now.Add(-time.Hour))
 
 	ev, err := Gather(context.Background(), pool, "s-1", 0)
 	if err != nil {
@@ -660,17 +660,17 @@ func TestCensusHasADenominatorForEveryLocus(t *testing.T) {
 	pool := freshDB(t, "triage_census", migratedTables)
 
 	// One run per shape, deliberately overlapping: s-multi exhibits three loci
-	// at once, which is the case Q-30 asks about and which a single-valued
+	// at once, which is the case of what splits a session and which a single-valued
 	// incident_locus cannot represent in one row.
-	k1 := header(t, pool, "cgt", "loader", "claims", "s-multi", "failed", now.Add(-time.Hour))
-	workerRow(t, pool, k1, "cgt", "loader", "s-multi", "reducing01", 0, "failed", 5000, 0, "boom,bang", now.Add(-time.Hour))
-	workerRow(t, pool, k1, "cgt", "loader", "s-multi", "reducing01", 1, "", 0, 0, "", now.Add(-time.Hour))
-	workerRow(t, pool, k1, "cgt", "loader", "s-multi", "reducing01", 2, "completed", 8000, 40, "", now.Add(-time.Hour))
+	k1 := header(t, pool, "client2", "loader", "claims", "s-multi", "failed", now.Add(-time.Hour))
+	workerRow(t, pool, k1, "client2", "loader", "s-multi", "reducing01", 0, "failed", 5000, 0, "boom,bang", now.Add(-time.Hour))
+	workerRow(t, pool, k1, "client2", "loader", "s-multi", "reducing01", 1, "", 0, 0, "", now.Add(-time.Hour))
+	workerRow(t, pool, k1, "client2", "loader", "s-multi", "reducing01", 2, "completed", 8000, 40, "", now.Add(-time.Hour))
 	processErrors(t, pool, k1, "s-multi", 20, 0)
 	storeConfig(t, pool, k1, "s-multi", configNoErrorChannel)
 
-	k2 := header(t, pool, "cgt", "loader", "claims", "s-ok", "completed", now.Add(-time.Hour))
-	workerRow(t, pool, k2, "cgt", "loader", "s-ok", "reducing01", 0, "completed", 5000, 4900, "", now.Add(-time.Hour))
+	k2 := header(t, pool, "client2", "loader", "claims", "s-ok", "completed", now.Add(-time.Hour))
+	workerRow(t, pool, k2, "client2", "loader", "s-ok", "reducing01", 0, "completed", 5000, 4900, "", now.Add(-time.Hour))
 	storeConfig(t, pool, k2, "s-ok", configWithErrorChannel)
 
 	sessions := []string{"s-multi", "s-ok"}
@@ -702,7 +702,7 @@ func TestCensusHasADenominatorForEveryLocus(t *testing.T) {
 	if multi == 0 {
 		t.Error("no session fired more than one locus; the fixture was meant to build one that does")
 	}
-	// s-multi is the concrete case for Q-30: a failed worker, a stalled worker
+	// s-multi is the concrete case of what splits a session: a failed worker, a stalled worker
 	// and a volume collapse in one session, which incident_locus cannot hold in
 	// one row.
 	for _, l := range []string{LocusWorkerFailed, LocusWorkerNotTerminated, LocusRowsLostSilently,
@@ -718,9 +718,9 @@ func TestCensusHasADenominatorForEveryLocus(t *testing.T) {
 // string. Two classifications of one run must be identical.
 func TestClassificationIsStable(t *testing.T) {
 	pool := freshDB(t, "triage_stable", migratedTables)
-	k := header(t, pool, "cgt", "loader", "claims", "s-1", "failed", now.Add(-time.Hour))
-	workerRow(t, pool, k, "cgt", "loader", "s-1", "reducing01", 0, "failed", 100, 0, "a,b", now.Add(-time.Hour))
-	workerRow(t, pool, k, "cgt", "loader", "s-1", "reducing02", 1, "completed", 9000, 3, "", now.Add(-time.Hour))
+	k := header(t, pool, "client2", "loader", "claims", "s-1", "failed", now.Add(-time.Hour))
+	workerRow(t, pool, k, "client2", "loader", "s-1", "reducing01", 0, "failed", 100, 0, "a,b", now.Add(-time.Hour))
+	workerRow(t, pool, k, "client2", "loader", "s-1", "reducing02", 1, "completed", 9000, 3, "", now.Add(-time.Hour))
 	storeConfig(t, pool, k, "s-1", configNoErrorChannel)
 
 	first := classify(t, pool, "s-1", 0)
@@ -740,14 +740,14 @@ func TestClassificationIsStable(t *testing.T) {
 // The confounders a finding carries must be writable into jetsapi.incident.
 // This is the assertion that the Go vocabulary and the database's agree in the
 // direction that matters — an insert rather than a string comparison — and it
-// is the F68 lesson applied to a column rather than to a table.
+// is the same lesson applied to a column rather than to a table.
 func TestFindingConfoundersAreAcceptedByTheIncidentTable(t *testing.T) {
 	pool := freshDB(t, "triage_confounders", migratedTables)
 	ctx := context.Background()
 
-	k := header(t, pool, "cgt", "loader", "claims", "s-1", "failed", now.Add(-time.Hour))
-	workerRow(t, pool, k, "cgt", "loader", "s-1", "reducing01", 0, "", 0, 0, "", now.Add(-time.Hour))
-	workerRow(t, pool, k, "cgt", "loader", "s-1", "", 1, "failed", 10, 0, "x", now.Add(-time.Hour))
+	k := header(t, pool, "client2", "loader", "claims", "s-1", "failed", now.Add(-time.Hour))
+	workerRow(t, pool, k, "client2", "loader", "s-1", "reducing01", 0, "", 0, 0, "", now.Add(-time.Hour))
+	workerRow(t, pool, k, "client2", "loader", "s-1", "", 1, "failed", 10, 0, "x", now.Add(-time.Hour))
 	r := classify(t, pool, "s-1", 0)
 
 	written := 0
@@ -757,7 +757,7 @@ func TestFindingConfoundersAreAcceptedByTheIncidentTable(t *testing.T) {
 		if conf == nil {
 			conf = []string{}
 		}
-		// The classifier does not write incidents — that is AC.3 — so this
+		// The classifier does not write incidents — that is the shadow writer — so this
 		// insert exists only to prove the vocabularies agree. It uses the
 		// finding's own locus and confounders and nothing else of its own.
 		_, err := pool.Exec(ctx, `INSERT INTO jetsapi.incident

@@ -35,8 +35,9 @@ func TestEncodeRdfTypeToTxt(t *testing.T) {
 	if err != nil {
 		t.Fatal("ParseDate err", err)
 	}
-	if encodeRdfTypeToTxt(*d) != "2006-01-02T00:00:00" {
-		t.Error("2006-01-02T00:00:00")
+	// A date (no time of day) encodes without a time, since cc054de9
+	if encodeRdfTypeToTxt(*d) != "2006-01-02" {
+		t.Error("2006-01-02, got", encodeRdfTypeToTxt(*d))
 	}
 	dt, err := rdf.ParseDatetime("2006-01-02T15:04:05")
 	if err != nil {
@@ -157,7 +158,7 @@ func TestCastToRdfTypeFromTxt(t *testing.T) {
 	}
 }
 
-// A bool cell read from text (I-45): the accepted spellings become 1 or 0,
+// A bool cell read from text: the accepted spellings become 1 or 0,
 // empty is null (nil), and anything else is an error the caller turns into its
 // own policy -- map_record's on_error, or a failed read of a typed file.
 func TestCastBoolFromText(t *testing.T) {

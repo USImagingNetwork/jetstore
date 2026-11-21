@@ -1,15 +1,15 @@
 /**
  * @vitest-environment jsdom
  *
- * The file loader status screen. Task D.10, from **I-260**.
+ * The file loader status screen.
  *
  * **Three of these five cases are `Home.test.tsx`'s, moved rather than written.**
  * The table came off that screen and its properties came with it: the two display
  * filters that the translation once conflated, and the client filter that reaches
  * a table with a `client` column. **A table that leaves a screen with a filter is
  * a table that can arrive on the next one without it**, and nothing about the move
- * would have said so — `useTableBinding` supplies the client store by default
- * (D.3), so the assertion is the only thing that distinguishes *supplied* from
+ * would have said so — `useTableBinding` supplies the client store by default,
+ * so the assertion is the only thing that distinguishes *supplied* from
  * *never asked for*.
  *
  * On `Home.test.tsx`'s shape, which is on `WorkspaceRegistry.test.tsx`'s:
@@ -60,8 +60,8 @@ function stubServer() {
       return new Response(
         JSON.stringify({
           token: "t0",
-          name: "Michel",
-          user_email: "michel@artisoft.io",
+          name: "Test User",
+          user_email: "user@example.com",
           is_admin: false,
           capabilities: ["run_pipelines"],
         }),
@@ -85,7 +85,7 @@ function stubServer() {
 async function mount() {
   const { fetchImpl, posts } = stubServer();
   const api = new ApiClient("", fetchImpl);
-  await api.login("michel@artisoft.io", "pw");
+  await api.login("user@example.com", "pw");
   render(
     <ApiProvider api={api}>
       <NotificationsProvider>
@@ -102,7 +102,7 @@ async function mount() {
     </ApiProvider>,
   );
   // A visible row value rather than the caption: a caption is drawn before the
-  // rows arrive, so awaiting it and then querying a cell is racy (I-104's flake).
+  // rows arrive, so awaiting it and then querying a cell is racy.
   await screen.findByText("acme_org");
   return { posts, api };
 }
@@ -136,8 +136,8 @@ describe("the screen the loader tab became", () => {
 
   it("splices the shell's selected client into the query", async () => {
     // **The claim that had to travel with the table.** Nothing on this screen
-    // passes `selectedClient`; `useTableBinding` reads the store, which is D.3's
-    // decision precisely because a forgotten context yields a filter that is
+    // passes `selectedClient`; `useTableBinding` reads the store, which was
+    // decided precisely because a forgotten context yields a filter that is
     // quietly off and returns *more* rows rather than an error.
     setSelectedClient("acme");
     const { posts } = await mount();
@@ -166,10 +166,10 @@ describe("the screen the loader tab became", () => {
     await screen.findByText("domain table viewer");
   });
 
-  it("refreshes rather than throwing, which is the bar's half of D.10", async () => {
-    // `refreshTable` is one of the two actions A.5 returned to the widget, and
-    // `requestFor` throws `UnsupportedActionType` for it by design. Until D.10
-    // nothing caught that: pressing *Refresh* raised out of an event handler and
+  it("refreshes rather than throwing", async () => {
+    // `refreshTable` is one of the two actions returned to the widget, and
+    // `requestFor` throws `UnsupportedActionType` for it by design. Until this
+    // screen was built nothing caught that: pressing *Refresh* raised out of an event handler and
     // the button looked inert. See `ActionBar`'s `WidgetActions`.
     const { posts } = await mount();
     const before = posts.filter((p) => p.body["action"] === "read").length;

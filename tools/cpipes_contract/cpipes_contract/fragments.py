@@ -2,26 +2,34 @@
 
 **What a part is.** A JSON value that binds to exactly one `$defs` entry and can be
 authored and validated standing alone — a channel spec, a mapping expression, an
-evaluator subtree, a per-operator config body. Decision 9 calls this the parts library
-and gives it a second consumer in the analysis's §6.1(3) compositional synthesis;
-decision 14 puts it here, keyed by `defs_name`, and says it must be *curated* rather
-than proportional. **This module does the extraction. It does not curate** - that is
-F.2, and the distinction matters because the two answer different questions: what does
+evaluator subtree, a per-operator config body. This is the parts library, with a
+second consumer in compositional synthesis; it lives here, keyed by `defs_name`, and
+must be *curated* rather than proportional. **This module does the extraction. It does
+not curate** - that is the curation step, and the distinction matters because the two answer different questions: what does
 the corpus contain, and what belongs in front of a model.
 
 **Why the walk is schema-guided rather than structural.** A part's identity is the
 `$defs` entry it binds to, and nothing in a `.pc.json` says which that is: the same
 object shape means different things in different positions, and a discriminated union
 is resolved by a sibling field. So the walk descends the schema and the value together,
-resolving `$ref`, nullable `anyOf`, and `oneOf` + `discriminator` as it goes. A
-structural walk would have to guess, and I-31 and I-32 are two records of what guessing
+resolving `$ref`, nullable `anyOf`, `oneOf` + `discriminator` (its complement branch
+included), and an untagged `anyOf` whose members differ by their keys as it goes. A
+structural walk would have to guess, and two earlier wrong walks record what guessing
 at corpus structure costs.
 
 **Identical values collapse; provenance does not.** A part appearing in forty configs is
 one part with forty citations, because the library is a catalogue of *distinct*
-material. The count is what F.2 curates on - decision 14's rule is that every operator
+material. The count is what curation works on - the rule is that every operator
 with four or fewer instances contributes all of them - so losing it would remove the
 only property that made the approach worth taking.
+
+**Free text for a human reader does not enter the library.** A property the schema
+declares as free text (`comment`, "Free text for the reader; ignored by JetStore") is
+removed from every value before the walk, so no part carries it at any depth. Such a
+value is prose a workspace's author wrote for colleagues, not configuration: JetStore
+ignores it, and the library is published with the tooling while the corpus is not. It is
+stripped *before* parts are keyed, so two parts that differed only by a comment are one
+part, which is what they are to the engine.
 """
 
 from __future__ import annotations
@@ -34,6 +42,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import aliases
 from .corpus import config_files, is_production
 
 
@@ -147,7 +156,76 @@ def _pick_variant(
     if isinstance(target, str) and target.startswith("#/$defs/"):
         name = target.split("/")[-1]
         return defs.get(name, {}), name
+    if isinstance(tag, str) and tag:
+        # A complement branch (`unlisted(type)`, the site operator) has no literal to
+        # be keyed by, so it is in the union's `oneOf` and not in its mapping. The
+        # schema states it as a discriminator property that is `not` one of the listed
+        # tokens (`schema.splice_complement_branches`); a tag outside the mapping
+        # binds to the member that says so, and to nothing else.
+        for member in node.get("oneOf", []):
+            ref = member.get("$ref") if isinstance(member, dict) else None
+            if not (isinstance(ref, str) and ref.startswith("#/$defs/")):
+                continue
+            name = ref.split("/")[-1]
+            prop = defs.get(name, {}).get("properties", {}).get(key, {})
+            excluded = prop.get("not", {}).get("enum") if isinstance(prop, dict) else None
+            if isinstance(excluded, list) and tag not in excluded:
+                return defs.get(name, {}), name
     return node, None
+
+
+def _pick_by_keys(node: dict, value: object, defs: dict) -> tuple[dict, str | None]:
+    """Resolve an untagged `anyOf` of `$ref`s by which member the value's keys fit.
+
+    `Element` is the case: a paragraph and a group differ by which key is present
+    (`present(text)`, `present(elements)` in the matrix) and carry no tag, so the
+    schema states them as an `anyOf` whose members differ by `required`. A member
+    binds when the value has all its required keys and no key it does not declare;
+    the value binds only when exactly one member fits, and is otherwise left as the
+    walk found it.
+    """
+    branches = node.get("anyOf")
+    if not isinstance(branches, list) or not isinstance(value, dict):
+        return node, None
+    fits: list[str] = []
+    for member in branches:
+        ref = member.get("$ref") if isinstance(member, dict) else None
+        if not (isinstance(ref, str) and ref.startswith("#/$defs/")):
+            return node, None
+        name = ref.split("/")[-1]
+        entry = defs.get(name, {})
+        props = entry.get("properties", {})
+        if set(entry.get("required", [])) <= value.keys() and value.keys() <= props.keys():
+            fits.append(name)
+    if len(fits) != 1:
+        return node, None
+    return defs.get(fits[0], {}), fits[0]
+
+
+# How the schema marks a property as prose for a human reader. The description is the
+# matrix's own (`fields.csv`), carried into the model and the schema unchanged.
+FREE_TEXT = "Free text for the reader"
+
+ROOT = {"$ref": "#/$defs/ComputePipesConfig"}
+
+
+def is_free_text(prop: object) -> bool:
+    """Does this property schema declare free text for a human reader?"""
+    if not isinstance(prop, dict):
+        return False
+    return str(prop.get("description", "")).startswith(FREE_TEXT)
+
+
+def free_text_properties(schema: dict) -> dict[str, list[str]]:
+    """`defs_name` -> the properties of that entry the schema declares as free text."""
+    out: dict[str, list[str]] = {}
+    for name, entry in schema["$defs"].items():
+        props = entry.get("properties") if isinstance(entry, dict) else None
+        if isinstance(props, dict):
+            found = sorted(k for k, v in props.items() if is_free_text(v))
+            if found:
+                out[name] = found
+    return out
 
 
 class Extractor:
@@ -159,6 +237,60 @@ class Extractor:
         self.parts: dict[tuple[str, str], Part] = {}
         self.unresolved: list[str] = []
         self.stale: list[str] = []
+        # Free-text values removed, by property name. Counted so a regeneration can
+        # say what the strip took, rather than leave it to a diff.
+        self.stripped: dict[str, int] = defaultdict(int)
+
+    def _resolve(self, value: object, node: dict, bound: str | None) -> tuple[dict, str | None, bool]:
+        """The schema node a value sits at, the `$defs` entry it binds to, and whether
+        a union at this node was resolved. Shared by `walk` and `strip` so the two can
+        never disagree about where a value is."""
+        node = _unwrap_nullable(node)
+        node, name = _deref(node, self.defs)
+        if name:
+            bound = name
+        node2, variant = _pick_variant(node, value, self.defs, bound, self.defaults)
+        if not variant:
+            node2, variant = _pick_by_keys(node, value, self.defs)
+        if variant:
+            return node2, variant, True
+        return node, bound, False
+
+    def strip(self, value: object, node: dict) -> object:
+        """`value` with every property the schema declares as free text removed.
+
+        Schema-guided like `walk`, so a key is removed only where the schema says that
+        key, at that position, is prose for a human reader; a `comment` key inside a
+        map of scalars or a site operator's own config is data and is left alone. A
+        free-text property is optional everywhere today, so it is removed; were one
+        ever required, it would be kept as an empty string so the part still validates.
+        Returns a new value and leaves the argument as it was.
+        """
+        node, _, _ = self._resolve(value, node, None)
+        if isinstance(value, dict):
+            props = node.get("properties")
+            if not isinstance(props, dict):
+                return value
+            required = set(node.get("required", []))
+            out: dict = {}
+            for key, sub in value.items():
+                child = props.get(key)
+                if is_free_text(child):
+                    self.stripped[key] += 1
+                    if key in required:
+                        out[key] = ""
+                    continue
+                out[key] = self.strip(sub, child) if isinstance(child, dict) else sub
+            return out
+        if isinstance(value, list):
+            items = _unwrap_nullable(node).get("items")
+            if isinstance(items, dict):
+                return [self.strip(item, items) for item in value]
+        return value
+
+    def add(self, config: object, file: str) -> None:
+        """Strip a whole configuration's free text, then walk it from the root."""
+        self.walk(self.strip(config, ROOT), ROOT, file, "")
 
     def _record(self, name: str, value: object, file: str, path: str) -> None:
         key = (name, json.dumps(value, sort_keys=True, separators=(",", ":")))
@@ -169,14 +301,8 @@ class Extractor:
         part.citations.append(Citation(file=file, path=path, production=is_production(Path(file))))
 
     def walk(self, value: object, node: dict, file: str, path: str, bound: str | None = None) -> None:
-        node = _unwrap_nullable(node)
-        node, name = _deref(node, self.defs)
-        if name:
-            bound = name
-        node2, variant = _pick_variant(node, value, self.defs, bound, self.defaults)
-        if variant:
-            node, bound = node2, variant
-        elif node.get("discriminator") and isinstance(value, dict):
+        node, bound, resolved = self._resolve(value, node, bound)
+        if not resolved and node.get("discriminator") and isinstance(value, dict):
             # A union we could not resolve is a defect, not a shape without a part.
             self.unresolved.append(f"{file}:{path or '<root>'}")
 
@@ -206,11 +332,11 @@ class Extractor:
 
 
 def describe(part: Part, defs: dict) -> str:
-    """A mechanical first description, to be replaced by an authored one at F.2.
+    """A mechanical first description, to be replaced by an authored one at curation.
 
     Deliberately not clever. It names the type and the value's distinguishing fields,
     which is enough to tell two parts of the same type apart in a listing and **not**
-    enough to satisfy criterion 22 - that asks for fragments authored from an English
+    enough to satisfy the authoring test - that asks for fragments authored from an English
     description of what a part *accomplishes*, which is a claim about intent that
     nothing here can recover from a value. `description_source` records which kind a
     part currently carries so the two are never confused.
@@ -231,12 +357,15 @@ def describe(part: Part, defs: dict) -> str:
 def extract(schema: dict, root: Path, model: Path | None = None) -> Extractor:
     live, _ = config_files(root)
     ex = Extractor(schema, tag_defaults(model) if model else {})
+    names = aliases.load()
     for path in live:
         # Cite as `workspaces/<ws>/...`, which is how every other document in this
         # project names a corpus file; the walk's own root is not part of the fact.
+        # The citation and the value are both recorded under neutral names.
         parts = path.parts
         rel = str(Path(*parts[parts.index("workspaces"):])) if "workspaces" in parts else str(path)
-        ex.walk(json.loads(path.read_text()), {"$ref": "#/$defs/ComputePipesConfig"}, rel, "")
+        value = names.anonymise_json(json.loads(path.read_text()))
+        ex.add(value, names.anonymise(rel))
     for part in ex.parts.values():
         part.description = describe(part, ex.defs)
     return ex
@@ -247,7 +376,7 @@ def to_jsonl(parts: list[Part]) -> str:
 
     A single indented document would be 8 MB and would rewrite wholesale whenever any
     part moved; one compact object per line keeps a re-extraction's diff to the parts
-    that actually changed, which is what makes F.2's curation reviewable.
+    that actually changed, which is what makes the curation reviewable.
     """
     lines = []
     for p in parts:
@@ -272,7 +401,7 @@ def to_jsonl(parts: list[Part]) -> str:
 def check_against_matrix(parts: list[Part], types_csv: Path) -> list[str]:
     """Every recorded `corpus_instances` must equal what the extraction found.
 
-    This is the guard I-31 and I-32 both argue for, at the grain each of them missed.
+    This is the guard two earlier wrong walks both argue for, at the grain each of them missed.
     A corpus walk cannot be validated by reading the code that produced it - both wrong
     walks were plausible, and one would have shipped - so it is checked against a
     figure measured independently and earlier, by `cpipes-contract corpus` over the
@@ -304,14 +433,14 @@ def check_against_matrix(parts: list[Part], types_csv: Path) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# F.2 - curation
+# Curation
 # ---------------------------------------------------------------------------
 
 # `ComputePipesConfig` holds three fields that can carry pipes, and which one is
-# populated depends on the lifecycle stage rather than on the author's choice (I-14).
+# populated depends on the lifecycle stage rather than on the author's choice.
 # `pipes_config` is written by JetStore and never by an author, so a part carrying it
 # validates and cannot be authored; `reducing_pipes_config` is the author's but
-# deprecated (MATRIX_SCHEMA.md:175). Neither may reach the library.
+# deprecated (docs/src/content/docs/developer/tools/cpipes-contract/matrix.md). Neither may reach the library.
 ROOT_TYPE = "ComputePipesConfig"
 RUNTIME_ONLY = "pipes_config"
 DEPRECATED = "reducing_pipes_config"
@@ -320,11 +449,11 @@ DEPRECATED = "reducing_pipes_config"
 # field of the same name holding the authored steps of one stage, and 88 parts carry it
 # legitimately. Scoping this to the root is the difference between a guard and a bug.
 #
-# In fact the guard cannot fire today: B.13 removed `pipes_config` from
-# `ComputePipesConfig`'s properties when I-14 was raised, so the schema-guided walk has
+# In fact the guard cannot fire today: `pipes_config` was removed from
+# `ComputePipesConfig`'s properties as a runtime-only field, so the schema-guided walk has
 # no path to it and the library could not contain one if the corpus did. It is kept as
 # a backstop that fails loudly if that upstream decision is ever reversed, which is
-# cheaper than rediscovering I-14 from a model that has learnt to emit the runtime
+# cheaper than rediscovering the runtime shape from a model that has learnt to emit the runtime
 # shape.
 
 
@@ -359,12 +488,12 @@ def shape(value: object) -> str:
 
 
 def curate(parts: list[Part], thin_at: int = 4, per_shape: int = 2) -> tuple[list[Part], dict]:
-    """Decision 14's rule: curated, not proportional.
+    """The library rule: curated, not proportional.
 
     Three things happen, in order, and only the third is a judgement.
 
     **Excluded outright**: any part containing a deprecated field at any depth, and any
-    root-type part carrying the runtime-only shape. Criterion 24 admits no exceptions.
+    root-type part carrying the runtime-only shape. The curation rule admits no exceptions.
 
     **Kept whole**: every part of a type with `thin_at` or fewer distinct parts. This is
     the rule the criterion names, and it is the reason the library is not proportional -
@@ -401,7 +530,7 @@ def curate(parts: list[Part], thin_at: int = 4, per_shape: int = 2) -> tuple[lis
         by_name[part.defs_name].append(part)
 
     for name, group in sorted(by_name.items()):
-        # Thin by **corpus instances**, which is what criterion 24 says and is not the
+        # Thin by **corpus instances**, which is what the curation rule says and is not the
         # same as thin by distinct parts: a type can have three instances that are
         # three different parts, or ten that are two. The criterion is about how little
         # the corpus has to teach, so citations are the measure.
@@ -428,7 +557,7 @@ def criterion_24(before: list[Part], after: list[Part], types_csv: Path) -> list
     """Every type with four or fewer corpus instances kept every part it had.
 
     The criterion in one function, checked rather than argued. It is the half of
-    decision 14 that a plausible-looking curation quietly breaks: trimming by count
+    the library rule that a plausible-looking curation quietly breaks: trimming by count
     looks reasonable everywhere and is wrong exactly where the corpus is thinnest,
     which is where the differentiator lives.
     """
@@ -471,7 +600,7 @@ def recovered_parts(schema: dict, matrix: Path, corpus_root: Path, model: Path) 
     - its `clustering_config` is exactly what went stale.
 
     But a valid instance does exist, in a different file than either search started
-    from. Validating every `clustering_config` in `cedargate_ws`'s whole history found
+    from. Validating every `clustering_config` in one workspace's whole history found
     17 distinct, of which 3 validate against the current spec, all in
     `anonymize_file.pc.json` - a config that is still live today and simply lost its
     clustering step. That is production material, not authored, and it is the strongest
@@ -486,11 +615,12 @@ def recovered_parts(schema: dict, matrix: Path, corpus_root: Path, model: Path) 
     import jsonschema
 
     ex = Extractor(schema, tag_defaults(model))
+    names = aliases.load()
     rows = _read(matrix / "recovered_sources.csv")
     for row in rows:
-        repo = corpus_root / "workspaces" / row["workspace"]
+        repo = names.path(corpus_root / "workspaces", row["workspace"])
         blob = subprocess.run(
-            ["git", "-C", str(repo), "show", f"{row['commit']}:{row['path']}"],
+            ["git", "-C", str(repo), "show", f"{row['commit']}:{names.resolve(row['path'])}"],
             capture_output=True,
             text=True,
         )
@@ -500,7 +630,8 @@ def recovered_parts(schema: dict, matrix: Path, corpus_root: Path, model: Path) 
             )
             continue
         cite = f"workspaces/{row['workspace']}@{row['commit']}/{row['path']}"
-        ex.walk(json.loads(blob.stdout), {"$ref": "#/$defs/ComputePipesConfig"}, cite, "")
+        value = names.anonymise_json(json.loads(blob.stdout))
+        ex.add(value, cite)
 
     validators: dict[str, object] = {}
     kept: dict[tuple[str, str], Part] = {}

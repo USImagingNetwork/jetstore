@@ -46,6 +46,12 @@ type JetRuleListener struct {
 	inProgressExpr *stack.Stack[rete.ExpressionNode]
 	// Collected temp var nodes, collected from currentRuleVarByValue
 	collectedTempVarNodes []*rete.ResourceNode
+	// The files the main rule file includes, directly or through another
+	// included file, in the order the reader put them in the buffer: each
+	// source_file directive names one, and a name other than the main rule
+	// file's is appended the first time it is seen. workspace.db records them
+	// in main_support_files.
+	includedFiles []string
 
 	// Logs
 	parseLog *strings.Builder
@@ -61,6 +67,14 @@ type JetRuleListener struct {
 	// compiled directly.
 	ruleFileReader *RuleFileReader
 	currentLine    int
+
+	// The cost order (jet_rule_listener_cost_order.go). statisticsFile is empty
+	// when the workspace has no statistics; statistics is nil when it has them
+	// and not for this rule set. Either way rules are ordered by score.
+	statisticsFile string
+	statistics     RuleSetStatistics
+	costTrace      bool
+	costReport     costOrderReport
 }
 
 func NewJetRuleListener(basePath string, mainRuleFileName string) *JetRuleListener {

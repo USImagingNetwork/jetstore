@@ -1,7 +1,7 @@
 /**
  * The data table, rendered.
  *
- * Task A.4b, and the last piece of it. Everything with a decision in it lives in
+ * Everything with a decision in it lives in
  * `model.ts` and `useDataTable.ts`; this file is markup and event wiring, which
  * is the split that let the logic be tested without a DOM.
  *
@@ -12,15 +12,15 @@
  * library's column/sort/pagination models would be adapters over values that
  * already exist, and its row model is keyed where every consumer of this table is
  * positional (`keyColumnIdx`, `columnIdx`, a `boolean[]` of selections). What is
- * left is a `<table>`. See issue I-6; revisit if Phase 3 wants column resizing,
+ * left is a `<table>`. Revisit if a screen wants column resizing,
  * virtualisation for long pages, or client-side sorting for the nine static
  * tables.
  *
- * **The action row is not here.** It belongs to S.2, which owns the action
- * grammar; the widget renders a slot and the interpreter fills it.
+ * **The action row is not here.** It belongs to the action bar, which owns the
+ * action grammar; the widget renders a slot and the interpreter fills it.
  */
 
-import { type CSSProperties, type ReactNode, useId } from "react";
+import { type CSSProperties, type ReactNode, useEffect, useId, useRef } from "react";
 
 import "./datatable.css";
 import {
@@ -40,12 +40,11 @@ export interface DataTableProps {
   config: TableConfig;
   state: DataTableState;
   /**
-   * Where S.2's action buttons go, **one entry per row, top to bottom**. The
+   * Where the action bar's buttons go, **one entry per row, top to bottom**. The
    * first row is rendered beside the label, which is where the Flutter app puts
    * them (`data_table.dart:151`); every later row is a line of its own beneath.
    *
-   * **A list of rows rather than one node since 2026-10-01** (`jetstore_maintenance_02`,
-   * `D03`). This was `actions?: ReactNode`, and `TableView` passed both of its
+   * **A list of rows rather than one node since 2026-10-01.** This was `actions?: ReactNode`, and `TableView` passed both of its
    * `ActionBar`s in one fragment, which this component wrapped in a flex row —
    * so the "second row" was a second flex item on the first row's line, and both
    * were pushed right by `margin-left: auto`. Rows are a structural fact, so the
@@ -59,11 +58,11 @@ export interface DataTableProps {
    * action that flips it.
    *
    * **Optional, and the fallback is the honest one**: without it the table reads
-   * `isCheckboxVisible` straight from the configuration, which is what A.4b did
-   * and is correct for a table with no mode buttons. A.5 added this because the
-   * toggle turned out to be the widget's rather than S.2's.
+   * `isCheckboxVisible` straight from the configuration, which is what the table
+   * first did and is correct for a table with no mode buttons. This was added
+   * because the toggle turned out to be the widget's rather than the action bar's.
    *
-   * **Copy-on-click is no longer part of this**, since D.6: it is unconditional
+   * **Copy-on-click is no longer part of this**, since 2026-08-27: it is unconditional
    * and so needs nothing passed in to enable it.
    */
   modes?: TableModes;
@@ -77,13 +76,13 @@ export interface DataTableProps {
    * the table configuration has no word for it. The default reads *Make a
    * selection above*, which is true of every blocked table in the corpus bar one
    * — the Query Tool blocks on an unsubmitted statement, not on a selection, and
-   * told the user to select something that is not on the screen. D.11.
+   * told the user to select something that is not on the screen.
    */
   blockedMessage?: string;
 }
 
 /**
- * Columns are keyed by `index`, not by `name`. Task C.3.
+ * Columns are keyed by `index`, not by `name`.
  *
  * **A column name is not unique within a table and four of the corpus's tables
  * prove it.** `wsDataPropertyTable` selects `domain_classes.name` beside
@@ -101,17 +100,17 @@ export interface DataTableProps {
  */
 
 /**
- * A cell's class, which is the numeric alignment plus the line clamp. Task C.7.
+ * A cell's class, which is the numeric alignment plus the line clamp.
  *
- * **`maxLines` was in no document until C.7 and is drawn by nothing until now**,
- * which is the pair I-104 warns about: a schema field and the widget that reads
- * it are two halves, and the corpus can only tell you about the first. It is
- * added here in the same change that authors it rather than in the one after.
+ * **`maxLines` was in no document and was drawn by nothing until the same
+ * change**, which is a pair worth watching: a schema field and the widget that
+ * reads it are two halves, and the corpus can only tell you about the first. It
+ * is added here in the same change that authors it rather than in the one after.
  */
 function cellClassName(column: ColumnConfig): string | undefined {
   const names = [
     column.isNumeric ? "jets-datatable__numeric" : "",
-    column.maxLines > 0 ? "jets-datatable__clamped" : "",
+    column.maxLines > 0 ? "jets-datatable__wrapped" : "",
   ].filter((n) => n !== "");
   return names.length > 0 ? names.join(" ") : undefined;
 }
@@ -130,15 +129,35 @@ function cellClassName(column: ColumnConfig): string | undefined {
  * transcribing an implementation rather than a behaviour.
  */
 function cellStyle(column: ColumnConfig): CSSProperties | undefined {
-  if (column.columnWidth <= 0 && column.maxLines <= 0) return undefined;
-  return {
-    ...(column.columnWidth > 0 ? { width: column.columnWidth } : {}),
-    ...(column.maxLines > 0 ? ({ "--jets-max-lines": column.maxLines } as CSSProperties) : {}),
-  };
+  if (column.columnWidth <= 0) return undefined;
+  return { width: column.columnWidth };
 }
 
 /**
- * The band a data row is drawn in, when the configuration declares one. Task C.3.
+ * A cell's text, clamped to the column's line budget when it has one.
+ *
+ * **The clamp is on a span inside the cell, not on the cell** (2026-11-11). It
+ * was on the `<td>`, and `-webkit-line-clamp` needs `display: -webkit-box`, which
+ * takes the element out of table layout: the browser wraps it in an anonymous
+ * cell that does not shrink, so the text never wrapped to fit and a table in a
+ * dialog ran past its edge (the *Update User Profile* dialog cut *Last Updated*
+ * off). On a span the cell stays a cell, wraps its text and shrinks with the
+ * table, and the span clamps what wrapped.
+ */
+function cellBody(column: ColumnConfig, text: string): ReactNode {
+  if (column.maxLines <= 0) return text;
+  return (
+    <span
+      className="jets-datatable__clamped"
+      style={{ "--jets-max-lines": column.maxLines } as CSSProperties}
+    >
+      {text}
+    </span>
+  );
+}
+
+/**
+ * The band a data row is drawn in, when the configuration declares one.
  *
  * **One configuration in either corpus sets it** — `wsJetRulesTable`, 64 to 90 —
  * and it is the table whose `authored_label` column carries `maxLines: 5`: a rule
@@ -150,7 +169,7 @@ function cellStyle(column: ColumnConfig): CSSProperties | undefined {
  * the band is enforced. What actually bounds the row is the `-webkit-line-clamp`
  * on the one column that can overflow, which is why the two fields travel
  * together in the corpus. Written in the same change that authored the field
- * rather than in the one after, per I-104.
+ * rather than in the one after, for the reason `cellClassName` gives.
  */
 function rowStyle(config: TableConfig): CSSProperties | undefined {
   if (config.dataRowMinHeight === undefined && config.dataRowMaxHeight === undefined) {
@@ -160,6 +179,44 @@ function rowStyle(config: TableConfig): CSSProperties | undefined {
     ...(config.dataRowMinHeight !== undefined ? { height: config.dataRowMinHeight } : {}),
     ...(config.dataRowMaxHeight !== undefined ? { maxHeight: config.dataRowMaxHeight } : {}),
   };
+}
+
+/**
+ * The select-all box in the checkbox column's heading. Added 2026-11-12, asked
+ * for on the Session Registry: set a filter, then act on every row it lists.
+ *
+ * **It selects the rows of the page**, which are the rows on screen, and is
+ * mixed when some of them are selected. A selection is kept in form state
+ * across pages, so selecting all on each page in turn selects the whole list.
+ */
+function SelectAllCheckbox({
+  selection,
+  rowCount,
+  disabled,
+  onChange,
+}: {
+  selection: readonly boolean[];
+  rowCount: number;
+  disabled: boolean;
+  onChange(value: boolean): void;
+}): React.JSX.Element {
+  const ref = useRef<HTMLInputElement>(null);
+  const selected = selection.slice(0, rowCount).filter(Boolean).length;
+  const all = rowCount > 0 && selected === rowCount;
+  const some = selected > 0 && !all;
+  useEffect(() => {
+    if (ref.current) ref.current.indeterminate = some;
+  }, [some]);
+  return (
+    <input
+      ref={ref}
+      type="checkbox"
+      checked={all}
+      disabled={disabled || rowCount === 0}
+      aria-label="Select all rows on this page"
+      onChange={(e) => onChange(e.target.checked)}
+    />
+  );
 }
 
 export function DataTable({
@@ -185,7 +242,7 @@ export function DataTable({
 
   /**
    * **The footer is paging apparatus, and a table that does not page has none.**
-   * D.11, from the report: one page of rows drew *Rows per page*, a range that
+   * Reported: one page of rows drew *Rows per page*, a range that
    * read `1–1 of 1`, and four dead buttons.
    *
    * `lastPage === 0` and not `totalRowCount <= rowsPerPage`, because the two
@@ -203,7 +260,7 @@ export function DataTable({
 
   /**
    * **A one-column picker says the same thing twice, so it stops saying it.**
-   * D.11, reported on `clientRegistryUF`'s first step: the caption reads *Select
+   * Reported on `clientRegistryUF`'s first step: the caption reads *Select
    * one of the following options:* and the single column header beneath it reads
    * *Select one of the following option* — the same sentence, one letter shorter.
    *
@@ -228,7 +285,7 @@ export function DataTable({
 
   return (
     <div className="jets-datatable">
-      {/* A column of action rows, the label inline with the first — `D03`. Each
+      {/* A column of action rows, the label inline with the first. Each
           row is its own line; `datatable.css` says why there is no auto margin. */}
       <div className="jets-datatable__header">
         <div className="jets-datatable__header-row">
@@ -254,7 +311,21 @@ export function DataTable({
         <table className="jets-datatable__table">
           <thead className={captionRepeatedByHeader ? "jets-datatable__head--silent" : undefined}>
             <tr>
-              {checkboxes && <th scope="col" className="jets-datatable__checkbox-col" />}
+              {checkboxes && (
+                <th scope="col" className="jets-datatable__checkbox-col">
+                  {/* Not on a single-select table, where it means nothing, nor
+                      on a one-column picker, whose heading is silent: selecting
+                      every choice of a filter is choosing none. */}
+                  {!config.isCheckboxSingleSelect && !captionRepeatedByHeader && (
+                    <SelectAllCheckbox
+                      selection={state.selection}
+                      rowCount={state.rows.length}
+                      disabled={config.isReadOnly}
+                      onChange={state.setAllSelected}
+                    />
+                  )}
+                </th>
+              )}
               {columns.map((column, i) => {
                 const sorted = state.sort.sortColumnIndex === i;
                 return (
@@ -318,7 +389,7 @@ export function DataTable({
                     key={column.index}
                     className={cellClassName(column)}
                     style={cellStyle(column)}
-                    // Unconditional since D.6 (I-262). It was gated on a mode a
+                    // Unconditional since 2026-08-27. It was gated on a mode a
                     // button switched; the button is gone and the gate with it,
                     // so the *unfiltered* cell text reaches the clipboard from
                     // any table. Selecting text inside a cell still wins: the
@@ -327,7 +398,7 @@ export function DataTable({
                     // own behaviour and not something this widget arbitrates.
                     onClick={() => void navigator.clipboard?.writeText(cellFullText(row, column))}
                   >
-                    {cellContent(row, column)}
+                    {cellBody(column, cellContent(row, column))}
                   </td>
                 ))}
               </tr>

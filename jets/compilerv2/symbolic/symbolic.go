@@ -1,11 +1,11 @@
 // Package symbolic is an authoring form for JetRules written as JSON, for an
-// author that reproduces JSON and not JetRules (jetstore_agentic_ai I-250).
+// author that reproduces JSON and not JetRules.
 //
 // **The measurement it answers.** On granite4.1:3b, over two runs, the
 // compile_rule_file tool's content arm carried a rule file intact 6 and 4 times
 // in 18, while validate_cpipes_config's carried a whole cpipes config intact 17
 // and 16 times — same model, same run — and every fragment dropped was a
-// JetRules construct: a rule label, an import line (jetstore_agentic_ai F176).
+// JetRules construct: a rule label, an import line.
 // The variable is the notation.
 //
 // **The form is the compiler's own JSON form with the keys inlined.** A
@@ -25,7 +25,7 @@
 // from the grammar produces text the parser refuses, loudly, where a second
 // entry point would have accepted it quietly.
 //
-// **The suffix is .jrs.json and not .jr.json**, which is what I-250 proposed:
+// **The suffix is .jrs.json and not .jr.json**, as first proposed:
 // .jr.json is the name the compiler writes its output to, and every workspace
 // .gitignore lists *.jr.json. An authored file of that name would be ignored by
 // git and overwritten by the next compile of a main file with the same stem.
@@ -101,9 +101,11 @@ type Term struct {
 
 // Literal is a resource with no id: a value written in place.
 //
-// Value is the literal's text exactly as the compiler stores it, which for a
-// text, date, datetime or bool literal is the text between the quotes, not
-// unescaped.
+// Value is the literal's text exactly as the compiler stores it. For a text,
+// date, datetime or bool literal that is the string the quotes enclose with its
+// escapes read (\" is a quote, \\ a backslash, \t \n \r a tab, line feed and
+// carriage return; any other backslash is kept), and Render writes it back
+// escaped (compiler.QuoteString).
 type Literal struct {
 	Type  string `json:"type"`
 	Value string `json:"value"`

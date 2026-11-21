@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/artisoft-io/jetstore/jets/awsi"
@@ -19,6 +20,7 @@ import (
 	"github.com/artisoft-io/jetstore/jets/datatable/wsfile"
 	"github.com/artisoft-io/jetstore/jets/migratedb"
 	"github.com/artisoft-io/jetstore/jets/schema"
+	"github.com/artisoft-io/jetstore/jets/sessionpurge"
 	"github.com/artisoft-io/jetstore/jets/user"
 	"github.com/artisoft-io/jetstore/jets/workspace"
 	"github.com/gorilla/mux"
@@ -32,9 +34,85 @@ type Server struct {
 	Router             *mux.Router
 	AuditLogger        *zap.Logger
 	LastSecretRotation *time.Time
+	// userDeletions is the single flight of runUserDeletions.
+	userDeletions singleFlight
 }
 
 var server = Server{}
+
+// singleFlight runs one function at a time per process. A trigger while it runs
+// does not start a second run beside it: it makes the running one go round once
+// more when it ends, however many triggers arrived meanwhile.
+type singleFlight struct {
+	mu             sync.Mutex
+	running, again bool
+	wg             sync.WaitGroup // the running goroutine, for tests
+}
+
+// trigger runs fn in a goroutine of its own, or, when a run is going, asks it to
+// run once more. It never blocks on fn.
+func (s *singleFlight) trigger(fn func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.running {
+		s.again = true
+		return
+	}
+	s.running = true
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		for {
+			fn()
+			s.mu.Lock()
+			if !s.again {
+				s.running = false
+				s.mu.Unlock()
+				return
+			}
+			s.again = false
+			s.mu.Unlock()
+		}
+	}()
+}
+
+// wait returns when no run is going.
+func (s *singleFlight) wait() { s.wg.Wait() }
+
+// userDeletionsTimeout is how long one run of the executor started by the
+// apiserver may go on starting sessions: it stops
+// starting new ones after it, and leaves the rest queued for the next trigger.
+const userDeletionsTimeout = 10 * time.Minute
+
+// runUserDeletions starts this process's executor of the user deletions queued in
+// jetsapi.session_deletion, without waiting for it: after a delete_sessions, in
+// any mode, and from the hourly loop, which does not run in dev mode. It is
+// single-flight per process; across processes, and against the purge lambda, the
+// executor's claim (FOR UPDATE SKIP LOCKED) keeps two executors off one session.
+//
+// Only user rows are taken (Options.Reasons), so a Delete does not wait behind a
+// retention backlog. PURGE_DRY_RUN does not apply: a Delete is explicit.
+func (server *Server) runUserDeletions() {
+	server.userDeletions.trigger(server.executeUserDeletions)
+}
+
+// executeUserDeletions is one run of the executor, on a context of its own: a
+// request that triggered it has been answered by the time it runs.
+func (server *Server) executeUserDeletions() {
+	ctx, cancel := context.WithTimeout(context.Background(), userDeletionsTimeout+5*time.Minute)
+	defer cancel()
+	report, err := sessionpurge.Execute(ctx, server.dbpool, sessionpurge.Options{
+		Reasons:  []sessionpurge.Reason{sessionpurge.ReasonUser},
+		Deadline: time.Now().Add(userDeletionsTimeout),
+	})
+	if err != nil {
+		log.Printf("runUserDeletions: %v; %s", err, report.Summary())
+		return
+	}
+	if report.Done+report.Failed+report.Refused+report.NotReached+report.Skipped > 0 {
+		log.Printf("runUserDeletions: %s", report.Summary())
+	}
+}
 
 // Middleware Function for json header
 func jsonh(next http.HandlerFunc) http.HandlerFunc {
@@ -94,7 +172,7 @@ func (optionConfig OptionConfig) options(w http.ResponseWriter, r *http.Request)
 	// for key, value := range r.Header {
 	// 	log.Println("OptionConfig: ",key,value)
 	// }
-	
+
 	// write cors headers
 	// Check that origin is what we expect
 	origin := sanitizeOrigin(r.Header.Get("Origin"))
@@ -183,8 +261,8 @@ func (server *Server) checkJetStoreSchema() error {
 // silently instead of stopping the start; that constraint is older than the
 // current schema file and nothing has made it fire, which is exactly why it would
 // not be noticed. workspace_changes is the third and is not exposed at all:
-// UpdateTableSchema skips it by name once it exists (`UpdateTableSchema`,
-// `jets/schema/schema.go:189`), so no migration reaches it in either order.
+// UpdateTableSchema skips it by name once it exists (`jets/schema/schema.go`'s
+// `UpdateTableSchema`), so no migration reaches it in either order.
 //
 // **Gated on the release, not on the workspace version.** This is the same gate
 // checkDomainTablesVersion applies, deliberately: a workspace version changes on
@@ -219,7 +297,7 @@ func (server *Server) checkSystemTablesVersion() error {
 
 // sweepInterruptedWork runs datatable.SweepInterruptedWork with this start taken
 // from the database's clock, the clock every last_update it compares is written
-// by. Rules unit tests project, AC.7 and I-5.
+// by.
 func (server *Server) sweepInterruptedWork() {
 	var startedAt time.Time
 	if err := server.dbpool.QueryRow(context.Background(), "SELECT now()").Scan(&startedAt); err != nil {
@@ -579,6 +657,16 @@ func listenAndServe() error {
 		return fmt.Errorf("while calling checkSystemTablesVersion: %v", err)
 	}
 
+	// The two logins the SQL a user sends runs on (datatable.ReaderRole for
+	// reads, datatable.IDERole for the Query Tool, Submit DDL and runbook ddl
+	// steps), with their grants brought up to date for the tables the migration
+	// may have added, and their pools opened. Fatal: without them every read
+	// fails, and the cause is clearer here than on the first screen.
+	if err = datatable.EnsureRestrictedLogins(context.Background(), server.dbpool); err != nil {
+		return fmt.Errorf("while setting up the restricted database logins: %v", err)
+	}
+	defer datatable.CloseRestrictedLogins()
+
 	// What a stopped apiserver left running is recorded as interrupted: rules unit
 	// test runs queued or executing, and a workspace compile or client config load
 	// still "in progress". It needs the tables checkSystemTablesVersion migrates,
@@ -587,8 +675,23 @@ func listenAndServe() error {
 	server.sweepInterruptedWork()
 
 	// One rules unit test executor pool for this process, installed after the
-	// sweep so nothing it starts can be swept. Rules unit tests project, AC.3.
+	// sweep so nothing it starts can be swept.
 	datatable.SetRulesUnitTestExecutor(datatable.NewRulesUnitTestPool(datatable.RulesUnitTestPoolConfigFromEnv()))
+
+	// The workspace runbook executor (runbooks project, AB), installed after its
+	// own start-up sweep: a step left running by a stopped apiserver is marked
+	// interrupted and its run paused, and nothing reruns on its own. The sweep
+	// leaves alone a run another live apiserver task is driving.
+	runbookExec := datatable.NewRunbookExecutor(server.dbpool,
+		datatable.RunbookDataTableOps{Ctx: datatable.NewDataTableContext(server.dbpool, globalDevMode, *usingSshTunnel, unitTestDir, adminEmail)},
+		nil)
+	if n, err := runbookExec.SweepInterrupted(context.Background()); err != nil {
+		log.Println("Warning: while sweeping interrupted runbook steps:", err)
+	} else if n > 0 {
+		log.Printf("Swept interrupted work: %d runbook step(s) interrupted, their runs paused", n)
+	}
+	datatable.SetRunbookExecutor(runbookExec)
+	runbookExec.Start(context.Background())
 
 	// Check workspace version, compile workspace if needed
 	err = server.checkWorkspaceVersion()
@@ -640,7 +743,7 @@ func listenAndServe() error {
 	// server.Router.HandleFunc("/", audit(jsonh(server.Home))).Methods("GET")
 
 	// The web app is served last, after every api route — see the tail of this
-	// function. Task X.1 moved it there; the reason is written where it now sits.
+	// function. It was moved there; the reason is written where it now sits.
 
 	// Health Check
 	healthCheckOptions := OptionConfig{Origin: "",
@@ -695,7 +798,7 @@ func listenAndServe() error {
 	server.Router.HandleFunc("/inferServer", jsonh(corsh(authh(server.DoInferServerAction)))).Methods("POST")
 
 	// Agentic supervision route — proposal staging, approval decisions and run
-	// transcripts for the Workspace IDE (task K.3, gap 11).
+	// transcripts for the Workspace IDE.
 	// Note: authh validates the token only; the agent_supervision capability is
 	// checked inside DoAgenticAction, following the InferServer route above.
 	agenticOptions := OptionConfig{Origin: "",
@@ -703,6 +806,31 @@ func listenAndServe() error {
 		AllowedHeaders: "Content-Type, Authorization"}
 	server.Router.HandleFunc("/agentic", agenticOptions.options).Methods("OPTIONS")
 	server.Router.HandleFunc("/agentic", jsonh(corsh(authh(server.DoAgenticAction)))).Methods("POST")
+
+	// Workspace runbooks (runbooks project, AB): list, run and control the
+	// active workspace's runbooks. authh validates the token only; the
+	// runbook_execute capability is checked inside DoRunbookAction, and each
+	// step checks its own capability when it runs.
+	runbookOptions := OptionConfig{Origin: "",
+		AllowedMethods: "POST, OPTIONS",
+		AllowedHeaders: "Content-Type, Authorization"}
+	server.Router.HandleFunc("/runbook", runbookOptions.options).Methods("OPTIONS")
+	server.Router.HandleFunc("/runbook", jsonh(corsh(authh(server.DoRunbookAction)))).Methods("POST")
+
+	// Documentation session: sets the cookie that /docs/ requires (static_docs.go).
+	// Answers 204 with no body; jsonh is kept for authh's 401 body.
+	docsSessionOptions := OptionConfig{Origin: "",
+		AllowedMethods: "POST, OPTIONS",
+		AllowedHeaders: "Content-Type, Authorization"}
+	server.Router.HandleFunc("/docsSession", docsSessionOptions.options).Methods("OPTIONS")
+	server.Router.HandleFunc("/docsSession", jsonh(corsh(authh(docsSession)))).Methods("POST")
+
+	// Documentation site: /docs and everything under /docs/, cookie-protected.
+	// Must stay above the web app's catch-all below, which would otherwise
+	// answer these paths with the app shell.
+	server.Router.MatcherFunc(isDocsPath).
+		Handler(docsHandler(*docsDir)).
+		Methods("GET")
 
 	// //* Currently not used
 	// //* TODO add options and corrs check - Users routes
@@ -725,7 +853,7 @@ func listenAndServe() error {
 	//
 	// `static_ide.go` predicted this exact change and declined to make it early:
 	// *"a change worth making on its own when the Flutter app is retired, not as a
-	// rider on this one"*. This is that task (X.1).
+	// rider on this one"*. This is that task.
 	//
 	// **A catch-all was not needed before and is required now**, which is the part
 	// worth knowing. `jetsclient` never called `setPathUrlStrategy`, so Flutter web
@@ -778,6 +906,10 @@ func listenAndServe() error {
 					log.Println("Warning: while StartPendingTasks:", err)
 					err = nil
 				}
+
+				// The user deletions a run kept waiting, or that an earlier trigger
+				// left queued at its deadline.
+				server.runUserDeletions()
 			}
 		}()
 	}
@@ -790,7 +922,7 @@ func listenAndServe() error {
 		Handler:           server.Router,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      120 * time.Second,
+		WriteTimeout:      datatable.ApiServerWriteTimeout, // the query tool's statement timeout ends 10 s before it
 		IdleTimeout:       120 * time.Second,
 	}
 	if *usingSshTunnel {
@@ -835,6 +967,13 @@ func (server *Server) GetLastSecretRotation() (tm *time.Time, err error) {
 				server.dbpool, err = pgxpool.New(context.Background(), *dsn)
 				if err != nil {
 					err = fmt.Errorf("while re-opening db connection in GetLastSecretRotation: %v", err)
+					log.Println(err)
+					return nil, err
+				}
+				// The restricted logins' pools copy this pool's connection
+				// settings, so they are reopened with it.
+				if err = datatable.EnsureRestrictedLogins(context.Background(), server.dbpool); err != nil {
+					err = fmt.Errorf("while re-opening the restricted database logins: %v", err)
 					log.Println(err)
 					return nil, err
 				}

@@ -49,9 +49,10 @@ func (jsComp *JetStoreStackComponents) BuildCpipesLambdas(scope constructs.Const
 	//
 	//   - CpipesNativeNodeLambda is a NewDockerImageFunction reading an image out of ECR,
 	//     not a NewGoFunction, so DockerImageFunctionProps has no Entry to redirect. Its
-	//     binary is the `bootstrap` built by dockerfiles/Dockerfile.cpipes_builder:66 from
-	//     cdk/jetstore_one/lambdas/compute_pipes/cp_node_native, under CGO_ENABLED=1
-	//     (Dockerfile.cpipes_builder:23) and linked against the libjets.so built in that
+	//     binary is the `bootstrap` built by dockerfiles/Dockerfile.cpipes_builder (its
+	//     `go build ... -o bootstrap` step) from
+	//     cdk/jetstore_one/lambdas/compute_pipes/cp_node_native, under that image's
+	//     `ENV CGO_ENABLED=1`, and linked against the libjets.so built in that
 	//     same image. A host-built binary cannot be copied in, so pointing this one at a
 	//     site main is an image concern rather than a synth concern.
 	//   - CpipesStartShardingLambda and CpipesStartReducingLambda call
@@ -92,10 +93,9 @@ func (jsComp *JetStoreStackComponents) BuildCpipesLambdas(scope constructs.Const
 			GoBuildFlags: &[]*string{jsii.String(`-buildvcs=false -ldflags "-s -w"`)},
 		},
 		Environment: &map[string]*string{
-			"DEPLOY_CPIPES_NATIVE":                     jsii.String("0"),
+			"JETS_IDE_CODE_GUARD":                      jsii.String(os.Getenv("JETS_IDE_CODE_GUARD")), // runs dblogin.Ensure when a restricted login is missing; "off" keeps the guard off
 			"JETS_BUCKET":                              jsComp.SourceBucket.BucketName(),
 			"JETS_DSN_SECRET":                          jsComp.RdsSecret.SecretName(),
-			"JETS_INVALID_CODE":                        jsii.String(os.Getenv("JETS_INVALID_CODE")),
 			"CPIPES_DB_POOL_SIZE":                      jsii.String(os.Getenv("CPIPES_DB_POOL_SIZE")),
 			"JETS_REGION":                              jsii.String(os.Getenv("AWS_REGION")),
 			"JETS_PIVOT_YEAR_TIME_PARSING":             jsii.String(os.Getenv("JETS_PIVOT_YEAR_TIME_PARSING")),
@@ -116,7 +116,6 @@ func (jsComp *JetStoreStackComponents) BuildCpipesLambdas(scope constructs.Const
 			"JETS_DOMAIN_KEY_SEPARATOR":                jsii.String(os.Getenv("JETS_DOMAIN_KEY_SEPARATOR")),
 			"JETS_DOMAIN_KEY_HASH_ALGO":                jsii.String(os.Getenv("JETS_DOMAIN_KEY_HASH_ALGO")),
 			"JETS_DOMAIN_KEY_HASH_SEED":                jsii.String(os.Getenv("JETS_DOMAIN_KEY_HASH_SEED")),
-			"JETS_INPUT_ROW_JETS_KEY_ALGO":             jsii.String(os.Getenv("JETS_INPUT_ROW_JETS_KEY_ALGO")),
 			//NOTE: SET WORKSPACES_HOME HERE - lambda function uses a local temp
 			"WORKSPACES_HOME": jsii.String("/tmp/workspaces"),
 			"WORKSPACE":       jsii.String(os.Getenv("WORKSPACE")),
@@ -159,10 +158,9 @@ func (jsComp *JetStoreStackComponents) BuildCpipesLambdas(scope constructs.Const
 			MemorySize:           jsii.Number(memLimit),
 			EphemeralStorageSize: awscdk.Size_Mebibytes(jsii.Number(10240)),
 			Environment: &map[string]*string{
-				"DEPLOY_CPIPES_NATIVE":                     jsii.String("1"),
+				"JETS_IDE_CODE_GUARD":                      jsii.String(os.Getenv("JETS_IDE_CODE_GUARD")), // runs dblogin.Ensure when a restricted login is missing; "off" keeps the guard off
 				"JETS_BUCKET":                              jsComp.SourceBucket.BucketName(),
 				"JETS_DSN_SECRET":                          jsComp.RdsSecret.SecretName(),
-				"JETS_INVALID_CODE":                        jsii.String(os.Getenv("JETS_INVALID_CODE")),
 				"CPIPES_DB_POOL_SIZE":                      jsii.String(os.Getenv("CPIPES_DB_POOL_SIZE")),
 				"JETS_REGION":                              jsii.String(os.Getenv("AWS_REGION")),
 				"JETS_PIVOT_YEAR_TIME_PARSING":             jsii.String(os.Getenv("JETS_PIVOT_YEAR_TIME_PARSING")),
@@ -183,11 +181,14 @@ func (jsComp *JetStoreStackComponents) BuildCpipesLambdas(scope constructs.Const
 				"JETS_DOMAIN_KEY_SEPARATOR":                jsii.String(os.Getenv("JETS_DOMAIN_KEY_SEPARATOR")),
 				"JETS_DOMAIN_KEY_HASH_ALGO":                jsii.String(os.Getenv("JETS_DOMAIN_KEY_HASH_ALGO")),
 				"JETS_DOMAIN_KEY_HASH_SEED":                jsii.String(os.Getenv("JETS_DOMAIN_KEY_HASH_SEED")),
-				"JETS_INPUT_ROW_JETS_KEY_ALGO":             jsii.String(os.Getenv("JETS_INPUT_ROW_JETS_KEY_ALGO")),
 				"WORKSPACES_HOME":                          jsii.String("/tmp/workspaces"),
 				"WORKSPACE":                                jsii.String(os.Getenv("WORKSPACE")),
 				"LOG_LEVEL":                                jsii.String("INFO"),
 				"LD_LIBRARY_PATH":                          jsii.String("/usr/local/lib"),
+				// jemalloc, installed by dockerfiles/Dockerfile.cpipes_native_lambda, which
+				// sets it too; set here because Lambda documents the environment it passes
+				// from the function's configuration, not from the image's.
+				"LD_PRELOAD": jsii.String("/usr/lib64/libjemalloc.so.2"),
 			},
 			Timeout:        awscdk.Duration_Minutes(jsii.Number(15)),
 			Role:           jsComp.LambdaExecutionRole,
@@ -208,7 +209,7 @@ func (jsComp *JetStoreStackComponents) BuildCpipesLambdas(scope constructs.Const
 	}
 	if jsComp.DeployCpipesPython {
 
-		// Define the Python cpipes node lambda (P9-T14, P9-T15)
+		// Define the Python cpipes node lambda
 		//
 		// The container image built by dockerfiles/Dockerfile.cpipes_python_lambda, reached
 		// from ECR the way CpipesNativeNodeLambda is and for the same reason: a Python
@@ -254,7 +255,7 @@ func (jsComp *JetStoreStackComponents) BuildCpipesLambdas(scope constructs.Const
 			// resolve. Carrying them would say the switch is read somewhere it is not, which
 			// is the rule the start-sharding lambda's own comment block states about
 			// JETS_DEFAULT_ERROR_REPORTING and INFER_BACKEND. A Python operator needing one
-			// of them receives it as a `site_config` on its own step (I-766), not as an
+			// of them receives it as a `site_config` on its own step, not as an
 			// environment variable on a shared function.
 			Environment: &map[string]*string{
 				"JETS_BUCKET":         jsComp.SourceBucket.BucketName(),
@@ -303,7 +304,6 @@ func (jsComp *JetStoreStackComponents) BuildCpipesLambdas(scope constructs.Const
 		Environment: &map[string]*string{
 			"JETS_BUCKET":                              jsComp.SourceBucket.BucketName(),
 			"JETS_DSN_SECRET":                          jsComp.RdsSecret.SecretName(),
-			"JETS_INVALID_CODE":                        jsii.String(os.Getenv("JETS_INVALID_CODE")),
 			"JETS_REGION":                              jsii.String(os.Getenv("AWS_REGION")),
 			"JETS_PIVOT_YEAR_TIME_PARSING":             jsii.String(os.Getenv("JETS_PIVOT_YEAR_TIME_PARSING")),
 			"JETS_s3_INPUT_PREFIX":                     jsii.String(os.Getenv("JETS_s3_INPUT_PREFIX")),
@@ -323,7 +323,6 @@ func (jsComp *JetStoreStackComponents) BuildCpipesLambdas(scope constructs.Const
 			"JETS_DOMAIN_KEY_SEPARATOR":                jsii.String(os.Getenv("JETS_DOMAIN_KEY_SEPARATOR")),
 			"JETS_DOMAIN_KEY_HASH_ALGO":                jsii.String(os.Getenv("JETS_DOMAIN_KEY_HASH_ALGO")),
 			"JETS_DOMAIN_KEY_HASH_SEED":                jsii.String(os.Getenv("JETS_DOMAIN_KEY_HASH_SEED")),
-			"JETS_INPUT_ROW_JETS_KEY_ALGO":             jsii.String(os.Getenv("JETS_INPUT_ROW_JETS_KEY_ALGO")),
 			// Built-in error reporting (gap 26). Both are read by
 			// SynthesizeDefaultErrorChannels, which runs in the two starter lambdas and
 			// nowhere else: the node reads the synthesised configuration back out of
@@ -388,7 +387,6 @@ func (jsComp *JetStoreStackComponents) BuildCpipesLambdas(scope constructs.Const
 		Environment: &map[string]*string{
 			"JETS_BUCKET":                              jsComp.SourceBucket.BucketName(),
 			"JETS_DSN_SECRET":                          jsComp.RdsSecret.SecretName(),
-			"JETS_INVALID_CODE":                        jsii.String(os.Getenv("JETS_INVALID_CODE")),
 			"JETS_REGION":                              jsii.String(os.Getenv("AWS_REGION")),
 			"JETS_PIVOT_YEAR_TIME_PARSING":             jsii.String(os.Getenv("JETS_PIVOT_YEAR_TIME_PARSING")),
 			"JETS_s3_INPUT_PREFIX":                     jsii.String(os.Getenv("JETS_s3_INPUT_PREFIX")),
@@ -408,7 +406,6 @@ func (jsComp *JetStoreStackComponents) BuildCpipesLambdas(scope constructs.Const
 			"JETS_DOMAIN_KEY_SEPARATOR":                jsii.String(os.Getenv("JETS_DOMAIN_KEY_SEPARATOR")),
 			"JETS_DOMAIN_KEY_HASH_ALGO":                jsii.String(os.Getenv("JETS_DOMAIN_KEY_HASH_ALGO")),
 			"JETS_DOMAIN_KEY_HASH_SEED":                jsii.String(os.Getenv("JETS_DOMAIN_KEY_HASH_SEED")),
-			"JETS_INPUT_ROW_JETS_KEY_ALGO":             jsii.String(os.Getenv("JETS_INPUT_ROW_JETS_KEY_ALGO")),
 			// Built-in error reporting (gap 26). Both are read by
 			// SynthesizeDefaultErrorChannels, which runs in the two starter lambdas and
 			// nowhere else: the node reads the synthesised configuration back out of

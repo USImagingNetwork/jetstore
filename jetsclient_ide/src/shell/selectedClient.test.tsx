@@ -1,11 +1,11 @@
 /**
  * @vitest-environment jsdom
  *
- * The client picker, task C.6.
+ * The client picker.
  *
  * **In its own file rather than in `AppShell.test.tsx`**, because the thing under
  * test is a store that outlives the component and a request that fires on mount,
- * and because three other track C sessions are editing the shell this week.
+ * and because the shell itself changes often.
  *
  * The cases are about the two states a reader would assume away: a failed
  * registry query, which is deliberately silent, and a selection that reaches the
@@ -34,8 +34,8 @@ function stub(clients: (payload: Record<string, unknown>) => Response) {
       return new Response(
         JSON.stringify({
           token: "t0",
-          name: "Michel",
-          user_email: "michel@artisoft.io",
+          name: "Test User",
+          user_email: "user@example.com",
           is_admin: false,
           capabilities: [],
         }),
@@ -50,11 +50,11 @@ function stub(clients: (payload: Record<string, unknown>) => Response) {
 async function mount(clients: (payload: Record<string, unknown>) => Response) {
   const { fetchImpl, posts } = stub(clients);
   const api = new ApiClient("", fetchImpl);
-  await api.login("michel@artisoft.io", "pw");
+  await api.login("user@example.com", "pw");
   render(
     <MemoryRouter>
-      {/* The client filter is a nav *entry* since D.3, not a fixed position
-          after the row (I-259 puts it second, between Home and Workspaces), so a
+      {/* The client filter is a nav *entry*, not a fixed position
+          after the row (the order puts it second, between Home and Workspaces), so a
           nav without the slot renders no picker. Passing the slot alone is what
           this file is about; the ordering is `App.tsx`'s. */}
       <AppShell api={api} nav={[{ kind: "client-filter" }]} />
@@ -104,7 +104,7 @@ describe("the client picker", () => {
 });
 
 /**
- * D.3's two shell changes: where the filter sits, and what the brand became.
+ * The two shell changes: where the filter sits, and what the brand became.
  *
  * **In this file rather than in `AppShell.test.tsx`** for the same reason the
  * header gives for the picker: what is under test is the navigation surface the
@@ -112,11 +112,11 @@ describe("the client picker", () => {
  */
 describe("the navigation surface that replaced the left panel", () => {
   it("renders the client filter where the nav array puts it, not after the row", async () => {
-    // I-259 orders the row Home | Filter Client | Workspaces. The slot is an
+    // The row is ordered Home | Filter Client | Workspaces. The slot is an
     // entry, so the array is the order and this asserts exactly that.
     const { fetchImpl } = stub(ok);
     const api = new ApiClient("", fetchImpl);
-    await api.login("michel@artisoft.io", "pw");
+    await api.login("user@example.com", "pw");
     render(
       <MemoryRouter>
         <AppShell
@@ -137,11 +137,11 @@ describe("the navigation surface that replaced the left panel", () => {
   });
 
   it("turns the brand into the flow menu when one is given, and leaves it alone when not", async () => {
-    // I-261: the flows lost their entry points when X.1 retired the left panel's
+    // The flows lost their entry points when the Flutter app retired the left panel's
     // menu tree. The brand is where they came back.
     const { fetchImpl } = stub(ok);
     const api = new ApiClient("", fetchImpl);
-    await api.login("michel@artisoft.io", "pw");
+    await api.login("user@example.com", "pw");
     const { unmount } = render(
       <MemoryRouter>
         <AppShell
@@ -156,7 +156,7 @@ describe("the navigation surface that replaced the left panel", () => {
     );
     const menu = await screen.findByLabelText("Open a configuration flow");
     expect(menu.tagName).toBe("SUMMARY");
-    // `/ruleConfig` is in the list and is not a flow — I-268. A launcher keyed on
+    // `/ruleConfig` is in the list and is not a flow. A launcher keyed on
     // flow ids would have had to special-case it, which is why `to` is a route.
     expect(screen.getByText("Rules Config").getAttribute("href")).toContain("/ruleConfig");
     expect(screen.getByText("Clients & Vendors").getAttribute("href")).toContain(
@@ -174,12 +174,12 @@ describe("the navigation surface that replaced the left panel", () => {
   });
 
   it("tells a flow it opens where the user was, and tells a screen nothing", async () => {
-    // **D.8, I-265.** The menu is reachable from every screen and launches four
-    // of the eleven flows, so without this the four exit to the same place
+    // The menu is reachable from every screen and launches four
+    // flows (`FLOW_MENU`; "four of the eleven" until 2026-10-27), so without this the four exit to the same place
     // wherever they were started. `/ruleConfig` is a screen and reads nothing.
     const { fetchImpl } = stub(ok);
     const api = new ApiClient("", fetchImpl);
-    await api.login("michel@artisoft.io", "pw");
+    await api.login("user@example.com", "pw");
     render(
       <MemoryRouter initialEntries={["/workspaces"]}>
         <AppShell
@@ -199,8 +199,8 @@ describe("the navigation surface that replaced the left panel", () => {
   });
 
   /**
-   * The two dismissals `<details>` does not have. D.11, from the second report
-   * on I-261.
+   * The two dismissals `<details>` does not have. From the second report
+   * on the launcher.
    *
    * **The comment on `FlowMenu` claimed the element supplied both** — *"it
    * closes on `Escape` and on outside click for free"* — and it supplies
@@ -212,7 +212,7 @@ describe("the navigation surface that replaced the left panel", () => {
   async function openMenu() {
     const { fetchImpl } = stub(ok);
     const api = new ApiClient("", fetchImpl);
-    await api.login("michel@artisoft.io", "pw");
+    await api.login("user@example.com", "pw");
     render(
       <MemoryRouter>
         <AppShell

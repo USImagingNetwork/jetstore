@@ -1,11 +1,11 @@
 /**
  * The Workspace IDE, as a screen.
  *
- * This is Phase 1's `App.tsx` with three things lifted out into the shell — the
+ * This is the original editor app's `App.tsx` with three things lifted out into the shell — the
  * session gate, the theme toggle and the banner region — and nothing else
  * changed. The editor, the tab model, the dirty tracking and the save path are
- * the code that has been deployed since Phase 1; A.1 moved it, it did not
- * rewrite it.
+ * the code that has been deployed since the editor was first ported; moving it
+ * here did not rewrite it.
  *
  * **Screens own their own toolbar.** The shell's top bar carries what is true of
  * the whole application — who is signed in, where they can go, the theme. The
@@ -20,7 +20,13 @@ import { useNavigate, useParams } from "react-router-dom";
 
 import type { ApiClient } from "../api/client";
 import { SessionExpiredError } from "../api/client";
-import { WorkspaceApi, fileNameOf, type WorkspaceNode, type WorkspaceSummary } from "../api/workspace";
+import {
+  WorkspaceApi,
+  describeSaveWarnings,
+  fileNameOf,
+  type WorkspaceNode,
+  type WorkspaceSummary,
+} from "../api/workspace";
 import { FileTree } from "../components/FileTree";
 import { Editor } from "../editor/Editor";
 import { isServerValidatedJson, languageNameFor } from "../editor/language";
@@ -28,6 +34,12 @@ import { BuildInfoText, useBuildInfoInScreenBar } from "../shell/buildInfoFooter
 import { ActionButton } from "../shell/capabilities";
 import { useNotifications } from "../shell/notifications";
 import { usePrompts } from "../shell/prompts";
+import {
+  WORKSPACE_GUIDE_LABEL,
+  describesWorkspace,
+  openWorkspaceGuide,
+  useWorkspaceManifest,
+} from "../shell/workspaceGuide";
 import { CompiledView } from "./CompiledView";
 import { WorkspaceChanges } from "./WorkspaceChanges";
 import { WorkspaceToolbar } from "./WorkspaceToolbar";
@@ -80,13 +92,13 @@ export function defaultWorkspace(
 }
 
 /**
- * An open tab. Task C.3 made this a union of two.
+ * An open tab: a union of two kinds.
  *
  * **The Flutter screen has had two kinds since it was written** — its
  * `TabBarView` renders a `JetsForm` for a file and a `JetsFormWithTabs` for a
  * compiled view (`jetsclient/lib/screens/screen_tab_form.dart`,
- * `ScreenWithTabsWithForm`) — and this app carried only the first, because Phase
- * 1 ported the editor and nothing had ported the view. The discriminant is
+ * `ScreenWithTabsWithForm`) — and this app carried only the first, because the
+ * editor was ported first and nothing had ported the view. The discriminant is
  * explicit rather than inferred from which fields are present: a file tab is
  * identified by its escaped path and a view tab by the compiled view it shows,
  * and neither key can be mistaken for the other.
@@ -100,6 +112,12 @@ type Tab =
       saved: string;
       current: string;
       size: number;
+      /**
+       * The node's `read_only` (`wsfile.IsReadOnly`): shown, never saved. It is
+       * set on a `.md` or `.mdx` file outside `docs/`, other than the
+       * workspace's root README.
+       */
+      readOnly: boolean;
     }
   | {
       kind: "view";
@@ -122,9 +140,9 @@ export function WorkspaceIde({ api }: { api: ApiClient }) {
   const { setError, setStatus } = useNotifications();
   const prompts = usePrompts();
   /**
-   * The workspace named by the route, when there is one. Task C.3.
+   * The workspace named by the route, when there is one.
    *
-   * **Two routes, one screen**: `/workspace` is Phase 1's, where the picker
+   * **Two routes, one screen**: `/workspace` is the original editor's, where the picker
    * chooses; `/workspaces/:workspace_name/home` is the Flutter path, where the
    * url chooses and the picker follows. The parameter is the source of truth when
    * it is present, so a back button and a bookmark both work — which is the
@@ -140,8 +158,15 @@ export function WorkspaceIde({ api }: { api: ApiClient }) {
   const [tabs, setTabs] = useState<Tab[]>([]);
   const [activeKey, setActiveKey] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  /** The shell's footer text, drawn in this screen's status bar instead (D05). */
+  /** The shell's footer text, drawn in this screen's status bar instead. */
   const buildInfo = useBuildInfoInScreenBar();
+  /**
+   * The installation's workspace guide, when its image was built with one. The
+   * *Workspace guide* button is shown only when it describes the workspace open
+   * here (`workspaceGuide.ts`).
+   */
+  const guideManifest = useWorkspaceManifest(api, workspace);
+  const hasGuide = describesWorkspace(guideManifest, workspace);
 
   const canEdit = api.can(WORKSPACE_IDE);
   const activeTab = useMemo(
@@ -225,7 +250,7 @@ export function WorkspaceIde({ api }: { api: ApiClient }) {
   }, [workspace]);
 
   /**
-   * Re-read the tree without touching the tabs. Task C.3b.
+   * Re-read the tree without touching the tabs.
    *
    * **The effect above cannot serve this and the difference is the two lines it
    * opens with.** Changing workspace closes every tab, because the open ones
@@ -278,6 +303,7 @@ export function WorkspaceIde({ api }: { api: ApiClient }) {
             saved: file.content,
             current: file.content,
             size: node.size,
+            readOnly: node.read_only === true,
           },
         ]);
         setActiveKey(`file:${file.fileName}`);
@@ -287,7 +313,7 @@ export function WorkspaceIde({ api }: { api: ApiClient }) {
   );
 
   /**
-   * Open a section's compiled view. Task C.3.
+   * Open a section's compiled view.
    *
    * **No fetch here, which is the difference from `openFile`.** A file tab has
    * to read the file before it can be drawn; a compiled view is a bundled
@@ -308,7 +334,7 @@ export function WorkspaceIde({ api }: { api: ApiClient }) {
   );
 
   /**
-   * Change workspace, closing every tab in the same update. Task C.3.
+   * Change workspace, closing every tab in the same update.
    *
    * **The effect below already does this and doing it here as well is not
    * redundant**, which is worth a sentence because it looks it. An effect runs
@@ -345,8 +371,7 @@ export function WorkspaceIde({ api }: { api: ApiClient }) {
     async (key: string) => {
       const tab = tabs.find((t) => tabKey(t) === key);
       if (tab && isDirty(tab)) {
-        // The app's own confirmation (jetstore_maintenance_02 `I-39`,
-        // 2026-10-02): the browser's is never shown in the embedded pane.
+        // The app's own confirmation (2026-10-02): the browser's is never shown in the embedded pane.
         const ok = await prompts.confirm(`${tab.label} has unsaved changes. Close it anyway?`);
         if (!ok) return;
       }
@@ -366,7 +391,7 @@ export function WorkspaceIde({ api }: { api: ApiClient }) {
     // A compiled view is read-only by construction: it shows what the compiler
     // produced, and the way to change it is to edit the sources below the
     // heading. Save is disabled on it rather than silently doing nothing.
-    if (!tab || tab.kind !== "file" || tab.current === tab.saved || !canEdit) return;
+    if (!tab || tab.kind !== "file" || tab.current === tab.saved || !canEdit || tab.readOnly) return;
 
     // The server parses .json before writing, so catch it here and point at the
     // problem rather than surfacing a bare 400.
@@ -386,15 +411,36 @@ export function WorkspaceIde({ api }: { api: ApiClient }) {
     setBusy(true);
     setError(null);
     void guard(async () => {
-      await workspaceApi.saveFile(workspace, tab.fileName, tab.current);
+      const { warnings } = await workspaceApi.saveFile(workspace, tab.fileName, tab.current);
       setTabs((prev) =>
         prev.map((t) =>
           t.kind === "file" && t.fileName === tab.fileName ? { ...t, saved: t.current } : t,
         ),
       );
-      setStatus(`Saved ${tab.label}`);
+      // The file is saved either way; warnings are what its validator found
+      // and did not refuse, shown in the warning colours until dismissed.
+      if (warnings.length > 0) {
+        setStatus(describeSaveWarnings(tab.label, warnings), "warn");
+      } else {
+        setStatus(`Saved ${tab.label}`);
+      }
     }).finally(() => setBusy(false));
   }, [activeKey, canEdit, guard, setError, setStatus, tabs, workspace, workspaceApi]);
+
+  /**
+   * Opens the guide's page for the file in the editor, else its landing page, in
+   * the documentation tab *Help* uses. A failure goes to the banner, as *Help*'s
+   * does.
+   */
+  const openGuide = useCallback(() => {
+    void openWorkspaceGuide({
+      workspace,
+      fileName: activeFile,
+      openDocsSession: () => api.openDocsSession(),
+    }).then((message) => {
+      if (message !== null) setError(message);
+    });
+  }, [activeFile, api, setError, workspace]);
 
   const onChange = useCallback(
     (value: string) => {
@@ -428,11 +474,39 @@ export function WorkspaceIde({ api }: { api: ApiClient }) {
         {busy && <span className="pill">Working…</span>}
         {!canEdit && <span className="pill pill-warn">Read only — no {WORKSPACE_IDE}</span>}
 
+        {/*
+          Beside Save rather than in the toolbar below: the toolbar's buttons are
+          registry actions authored in a table document (WorkspaceToolbar.tsx),
+          and this one is not; and it belongs to what this bar already holds, the
+          workspace picked and the file open. Not gated on workspace_ide, since
+          the guide is readable by every signed-in user.
+        */}
+        {hasGuide && (
+          <button
+            type="button"
+            className="btn btn-secondary"
+            onClick={openGuide}
+            title={
+              activeFile !== null
+                ? "Open this file's page in the workspace's guide"
+                : "Open the workspace's guide"
+            }
+          >
+            {WORKSPACE_GUIDE_LABEL}
+          </button>
+        )}
+
         <ActionButton
           capability={WORKSPACE_IDE}
           className="btn btn-primary"
           onClick={save}
-          disabled={!activeTab || activeTab.kind !== "file" || activeTab.current === activeTab.saved || busy}
+          disabled={
+            !activeTab ||
+            activeTab.kind !== "file" ||
+            activeTab.readOnly ||
+            activeTab.current === activeTab.saved ||
+            busy
+          }
         >
           Save
         </ActionButton>
@@ -487,11 +561,19 @@ export function WorkspaceIde({ api }: { api: ApiClient }) {
               onFilesChanged={refreshTree}
             />
           ) : activeTab ? (
+            /*
+              `content` is the tab's current text, not its saved text: the editor
+              makes a fresh state for each file it is shown (2026-10-27),
+              so switching back to a tab must show the edits it still holds.
+              Until then it was `saved`, and the switch's replace transaction
+              reset `current` to it through `onChange`, so unsaved edits were
+              dropped silently by leaving the tab and coming back.
+            */
             <Editor
               docKey={activeTab.fileName}
               fileName={activeTab.label}
-              content={activeTab.saved}
-              readOnly={!canEdit}
+              content={activeTab.current}
+              readOnly={!canEdit || activeTab.readOnly}
               onChange={onChange}
               onSave={save}
             />
@@ -522,7 +604,7 @@ export function WorkspaceIde({ api }: { api: ApiClient }) {
           )}
 
           {/*
-            The status bar, and since D05 (jetstore_maintenance_02 AC.3) the
+            The status bar, and since 2026-10-01 the
             build information as its last entry: this screen claims the shell's
             footer, so it has one bottom bar rather than two. **It is drawn
             whatever the tab**, where it used to follow the editor only, because
@@ -536,6 +618,7 @@ export function WorkspaceIde({ api }: { api: ApiClient }) {
                   <span title={activeTab.label}>{activeTab.label}</span>
                   <span className="spacer" />
                   <span>{languageNameFor(activeTab.label)}</span>
+                  {activeTab.readOnly && <span>Read only</span>}
                   <span>{activeTab.current.length.toLocaleString()} chars</span>
                   <span>{activeTab.current !== activeTab.saved ? "Modified" : "Saved"}</span>
                 </>

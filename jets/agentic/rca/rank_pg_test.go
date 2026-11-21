@@ -16,7 +16,7 @@
 //     a real fold rather than a blank string a test typed.
 //   - Anomalies are written by observe.InsertAnomaly, the detectors' own writer,
 //     and read by observe.ReadAnomalies rather than by a query composed here.
-//     **That is deliberate and it is I-147's lesson**: a fixture shaped like the
+//     **That is deliberate, and it is an earlier lesson**: a fixture shaped like the
 //     caller agrees with the caller by construction, and the read path this
 //     package depends on had no consumer before this task.
 //   - Run headers, process_errors rows and cpipes_execution_status rows are
@@ -32,8 +32,8 @@
 //
 // Use `go test -p 1` when running this beside jets/agentic/{observe,triage,audit}
 // against one DSN: they all call audit.InstallSchema and two sessions issuing the
-// same CREATE TABLE / CREATE TRIGGER sequence deadlock on catalogue locks (I-175,
-// I-291). This package's own database is created per run, which removes it here
+// same CREATE TABLE / CREATE TRIGGER sequence deadlock on catalogue locks.
+// This package's own database is created per run, which removes it here
 // and not across packages.
 package rca
 
@@ -199,7 +199,7 @@ func processErrors(t *testing.T, pool *pgxpool.Pool, execKey int, session string
 }
 
 // A configuration with one map_record instance and no error channel, which is
-// what 243 of the corpus's 243 instances look like (F188).
+// what 243 of the corpus's 243 instances look like.
 const configNoErrorChannel = `{"pipes_config":[{"type":"fan_out","input_channel":{"name":"input"},
   "transformation_pipes":[{"type":"map_record","column_evaluators":[],
     "output_channel":{"name":"output"}}]}], "on_error":"drop"}`
@@ -240,12 +240,12 @@ func TestRankingOverARealRecord(t *testing.T) {
 	pool := freshDB(t, "rca_e2e")
 	ctx := context.Background()
 
-	k := header(t, pool, "cgt", "loader", "claims", "s-multi", "failed", now.Add(-time.Hour))
-	workerRow(t, pool, k, "cgt", "loader", "s-multi", "reducing01", 0, "failed", 5000, 12, 0,
+	k := header(t, pool, "client2", "loader", "claims", "s-multi", "failed", now.Add(-time.Hour))
+	workerRow(t, pool, k, "client2", "loader", "s-multi", "reducing01", 0, "failed", 5000, 12, 0,
 		"download failed,rules pool exhausted", now.Add(-time.Hour))
-	workerRow(t, pool, k, "cgt", "loader", "s-multi", "reducing01", 1, "", 0, 0, 0, "",
+	workerRow(t, pool, k, "client2", "loader", "s-multi", "reducing01", 1, "", 0, 0, 0, "",
 		now.Add(-time.Hour))
-	workerRow(t, pool, k, "cgt", "loader", "s-multi", "reducing01", 2, "completed", 8000, 3, 40, "",
+	workerRow(t, pool, k, "client2", "loader", "s-multi", "reducing01", 2, "completed", 8000, 3, 40, "",
 		now.Add(-time.Hour))
 	processErrors(t, pool, k, "s-multi", 20, 6)
 	storeConfig(t, pool, k, "s-multi", configNoErrorChannel)
@@ -305,7 +305,7 @@ func TestRankingOverARealRecord(t *testing.T) {
 		t.Error("no benign_variation hypothesis over a present rows_lost_silently")
 	}
 
-	// The corroborators §9.5 names as the record's instruments are read off the
+	// The corroborators the gate's table names as the record's instruments are read off the
 	// evidence rather than asserted: input_bad_records_count for parse_failure,
 	// the rete-session and input_column counts for the two classes that have
 	// one, failure_details for infrastructure_failure.
@@ -327,7 +327,7 @@ func TestRankingOverARealRecord(t *testing.T) {
 			}
 		}
 		if !found {
-			t.Errorf("no %s hypothesis carries the corroborator %q that §9.5 names as its instrument",
+			t.Errorf("no %s hypothesis carries the corroborator %q that the gate's table names as its instrument",
 				class, want)
 		}
 	}
@@ -349,17 +349,17 @@ func LocusOf(h *Hypothesis) string {
 // bears on a column the two Go types cannot check between them: both evidence
 // columns are jsonb rather than text[], because an Evidence is a value object
 // with three fields and text[] — the emitter's unmapped-type fall-through —
-// would have stored three fields as one opaque string per item (I-287).
+// would have stored three fields as one opaque string per item.
 //
-// **Writing rows here is not AC.3.** Nothing in this package writes; the test
+// **Writing rows here is not the shadow writer.** Nothing in this package writes; the test
 // composes the insert to establish that what the ranker emits fits the column,
-// which is the F68 lesson applied to a payload rather than to a table name.
+// which is an earlier lesson applied to a payload rather than to a table name.
 func TestHypothesesAreWritableAndReadBackWholeAlbeitByATest(t *testing.T) {
 	pool := freshDB(t, "rca_writeback")
 	ctx := context.Background()
 
-	k := header(t, pool, "usi", "qc", "members", "s-w", "failed", now.Add(-time.Hour))
-	workerRow(t, pool, k, "usi", "qc", "s-w", "reducing01", 0, "failed", 100, 4, 0, "boom",
+	k := header(t, pool, "client1", "qc", "members", "s-w", "failed", now.Add(-time.Hour))
+	workerRow(t, pool, k, "client1", "qc", "s-w", "reducing01", 0, "failed", 100, 4, 0, "boom",
 		now.Add(-time.Hour))
 	storeConfig(t, pool, k, "s-w", configNoErrorChannel)
 	_, r := rank(t, pool, "s-w")
@@ -377,8 +377,8 @@ func TestHypothesesAreWritableAndReadBackWholeAlbeitByATest(t *testing.T) {
 		if err != nil {
 			t.Fatalf("marshalling contradicting evidence: %v", err)
 		}
-		// hypothesis_locus and basis are columns as of AC.3 (Q-46, answered by
-		// the user 2026-09-04). This test wrote its rows before they existed;
+		// hypothesis_locus and basis are columns as of the user's decision of
+		// 2026-09-04. This test wrote its rows before they existed;
 		// it now writes the locus the ranker actually derived from and a basis
 		// computed from the two slices being marshalled above, which is what
 		// the shadow writer does one package over.
@@ -459,8 +459,8 @@ func TestAnUnaskedLocusIsNotAnAbsentOne(t *testing.T) {
 	pool := freshDB(t, "rca_unmigrated")
 	ctx := context.Background()
 
-	k := header(t, pool, "cgt", "loader", "claims", "s-u", "failed", now.Add(-time.Hour))
-	workerRow(t, pool, k, "cgt", "loader", "s-u", "reducing01", 0, "failed", 100, 0, 0, "boom",
+	k := header(t, pool, "client2", "loader", "claims", "s-u", "failed", now.Add(-time.Hour))
+	workerRow(t, pool, k, "client2", "loader", "s-u", "reducing01", 0, "failed", 100, 0, 0, "boom",
 		now.Add(-time.Hour))
 
 	// Take away the two tables an ordinary deployment lacks, after the rows are

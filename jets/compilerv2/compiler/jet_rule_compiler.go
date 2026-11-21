@@ -39,6 +39,10 @@ func NewCompiler(basePath string, mainRuleFileName string, saveJson, trace, auto
 }
 
 func (c *Compiler) Compile() error {
+	// The cost order's statistics, when the workspace has them
+	if err := c.loadOptimizerStatistics(); err != nil {
+		return err
+	}
 	// Read all rule files and imports
 	ruleFileReader := NewRuleFileReader(c.listener.basePath, c.listener.mainRuleFileName, readRuleFile)
 	// Keep it: CompileBuffer resolves diagnostics through it at the end of the
@@ -81,6 +85,8 @@ func (c *Compiler) CompileBuffer(combinedContent string) error {
 	// Finally walk the tree
 	var hasError bool
 	antlr.ParseTreeWalkerDefault.Walk(c.listener, tree)
+	// What the cost order did, when the workspace has statistics
+	c.listener.writeCostOrderReport()
 	if c.Trace() {
 		log.Println("** Compilation successful")
 	}
@@ -153,6 +159,7 @@ func (c *Compiler) SaveModel() error {
 		log.Println("** ERROR creating workspace.db:", err.Error())
 		return fmt.Errorf("while creating workspace.db: %w", err)
 	}
+	wDb.SetIncludedFiles(c.IncludedFiles())
 	err = wDb.SaveJetRuleModel(context.TODO(), c.listener.jetRuleModel)
 	if err != nil {
 		log.Println("** ERROR saving to workspace.db:", err.Error())
@@ -185,6 +192,13 @@ func (c *Compiler) Diagnostics() []Diagnostic {
 		return nil
 	}
 	return c.listener.diagnostics.diagnostics
+}
+
+// IncludedFiles are the files the main rule file includes, directly or through
+// another included file, in the order the compiler read them. The main rule
+// file is not among them.
+func (c *Compiler) IncludedFiles() []string {
+	return c.listener.includedFiles
 }
 
 // RuleFileReader exposes the reader retained by Compile, so a caller holding a

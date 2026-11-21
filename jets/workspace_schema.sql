@@ -76,7 +76,7 @@ CREATE TABLE IF NOT EXISTS domain_tables (
   UNIQUE (name)
 );
 
--- expressions (for filters and object expressions
+-- expressions (for filters and object expressions)
 CREATE TABLE IF NOT EXISTS expressions (
   key INTEGER PRIMARY KEY,
   type TEXT NOT NULL,
@@ -91,6 +91,11 @@ CREATE TABLE IF NOT EXISTS expressions (
 );
 
 -- jet_rules
+-- source_file_key is the main rule file whose network holds the rule
+-- (workspace_control.key), so a rule in a file that two main rule files
+-- include is a row under each. authored_file_key is the file the rule is
+-- written in: the main rule file itself or a file it includes. It is NULL
+-- only when the compiler had no file name for the rule.
 CREATE TABLE IF NOT EXISTS jet_rules (
   key INTEGER PRIMARY KEY,
   name TEXT NOT NULL,
@@ -99,7 +104,8 @@ CREATE TABLE IF NOT EXISTS jet_rules (
   authored_label TEXT,
   normalized_label TEXT,
   label TEXT,
-  source_file_key INTEGER NOT NULL
+  source_file_key INTEGER NOT NULL,
+  authored_file_key INTEGER
 );
 
 -- jetstore_config
@@ -142,6 +148,10 @@ CREATE TABLE IF NOT EXISTS main_rule_sets (
 );
 
 -- main_support_files
+-- Every file a main rule file includes, directly or through another included
+-- file, one row each, in the order the compiler read them (rowid order).
+-- Both keys refer to workspace_control.key; an included file is recorded in
+-- workspace_control with is_main = 0 unless it is a main rule file itself.
 CREATE TABLE IF NOT EXISTS main_support_files (
   main_file_key INTEGER NOT NULL,
   support_file_key INTEGER NOT NULL,
@@ -190,7 +200,11 @@ CREATE TABLE IF NOT EXISTS rule_properties (
   value TEXT
 );
 
--- reule_sequences
+-- rule_sequences
+-- The rule sequences of workspace_control.json. source_file_key is the file the
+-- sequence is declared in (workspace_control.key): workspace_control.json,
+-- recorded in workspace_control with is_main = 0 when the workspace has a rule
+-- sequence. main_rule_sets lists the main rule files each sequence runs.
 CREATE TABLE IF NOT EXISTS rule_sequences (
   key INTEGER PRIMARY KEY,
   name TEXT NOT NULL,
@@ -199,8 +213,8 @@ CREATE TABLE IF NOT EXISTS rule_sequences (
   UNIQUE (name)
 );
 
--- unit_tests: the rules unit tests the compile found under jet_rules/unit_tests/
--- (rules_unit_test_harness, task AD.1). path is relative to the workspace root.
+-- unit_tests: the rules unit tests the compile found under jet_rules/unit_tests/.
+-- path is relative to the workspace root.
 -- findings is NULL for a test that may be started, else the JSON array of the
 -- error findings that refuse it; warnings are not recorded here, so a test with
 -- warnings alone stays runnable. An invalid test is recorded, not fatal.
@@ -213,7 +227,7 @@ CREATE TABLE IF NOT EXISTS unit_tests (
   findings TEXT
 );
 
--- rule_terms (antecedents and consequents
+-- rule_terms (antecedents and consequents)
 CREATE TABLE IF NOT EXISTS rule_terms (
   rule_key INTEGER NOT NULL,
   rete_node_key INTEGER NOT NULL,

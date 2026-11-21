@@ -644,7 +644,7 @@ type TransformationSpec struct {
 // UnmarshalComputePipesConfig, which is a plain json.Unmarshal with no
 // DisallowUnknownFields anywhere in this package. A configuration block that is
 // not a JSON-tagged field of TransformationSpec is dropped with no error and no
-// log line (`I-777`).
+// log line.
 //
 // The error channel is a *named field* rather than something the site buries
 // inside Config, and that is not a style preference: errorChannelConfig is the
@@ -848,6 +848,10 @@ type InputChannelConfig struct {
 	// object type cumulative (source_config.is_cumulative), the read keeps only the
 	// latest delivery across the lookback rather than every delivery. Empty: every
 	// delivery is read. Env vars are substituted. See cumulative_source.go.
+	// LatestSessionOnly, for a stage channel read through file_key: keep, in each
+	// period folder of the read, only the latest session whose run completed, and
+	// skip the other session folders (duplicates and sessions mapped before a model
+	// change). For a feed with one delivery per period only. See latest_session.go.
 	FileConfig
 	Type                 string               `json:"type,omitempty"`
 	Name                 string               `json:"name"`
@@ -859,6 +863,7 @@ type InputChannelConfig struct {
 	SamplingMaxCount     int                  `json:"sampling_max_count,omitzero"`
 	HasGroupedRows       bool                 `json:"has_grouped_rows,omitzero"`
 	SourceObjectType     string               `json:"source_object_type,omitempty"`
+	LatestSessionOnly    bool                 `json:"latest_session_only,omitzero"`
 	MergeChannels        []InputChannelConfig `json:"merge_channels,omitempty"`
 	NbrNodesAny          any                  `json:"nbr_nodes,omitzero"`
 	NbrRowsAny           any                  `json:"nbr_rows,omitzero"`
@@ -1224,11 +1229,9 @@ type SortSpec struct {
 
 // JetrulesSpec configuration
 // ProcessName is the jetrules process name to use.
-// UseJetRulesNative when true use the jetrules native engine.
-// UseJetRulesGo when true use the jetrules go engine.
-// Note: only one of UseJetRulesNative or UseJetRulesGo can be true.
-// When both are false, the default is to use the jetrules native engine when
-// available.
+// UseJetRulesNative names the C++ engine, the only one; set or not, it is used.
+// UseJetRulesGo asked for the Go engine, retired in October 2026: true is refused
+// when the pipeline starts (validateNoGoEngine), false is accepted.
 // InputRdfType is the rdf type (class name) of the input records.
 // MaxInputCount is the max nbr of input records to process.
 // PoolSize is the nbr of worker pool size.
@@ -1272,6 +1275,16 @@ type JetrulesSpec struct {
 	OnError       string               `json:"on_error,omitempty"`
 	MaxErrorCount int                  `json:"max_error_count,omitzero"`
 	ErrorChannel  *OutputChannelConfig `json:"error_channel,omitzero"`
+	// OptimizerStatistics counts the rule optimizer's statistics (jets/optstats)
+	// over the step's sessions: after each rule set of each session, the graph the
+	// rule set ended with, for the predicates and constants of its antecedents.
+	// Each node writes one partial file under its session's stage folder,
+	// <stage>/process_name=<process>/session_id=<session>/optimizer_statistics/,
+	// when its sessions are done; the run_reports function
+	// merge_optimizer_statistics merges them into the workspace. Off by default,
+	// and free when off: nothing is loaded, allocated or counted. It is for a
+	// statistics process run on demand, not for every production run.
+	OptimizerStatistics bool `json:"optimizer_statistics,omitzero"`
 }
 
 // PromptTemplateSpec is a named prompt template, defined at the ComputePipesConfig level
@@ -1296,13 +1309,12 @@ type PromptTemplateSpec struct {
 // Key is the name used by RenderSpec.TemplateName. The rest is the document:
 // Width is the column each paragraph is wrapped to, Elements are emitted in
 // array order, and Empty is what the document says when no element said
-// anything. The notation is specified in agentic_ai's Phase 8 plan §10 and
-// implemented in jets/agentic/template; RenderSpec is its only consumer here.
+// anything. The notation is implemented in jets/agentic/template; RenderSpec is its only consumer here.
 //
 // **The array is `text_templates` rather than `templates`, and the word is doing
 // work.** `prompt_templates` is the only other template array in this
 // configuration and it is qualified; a bare `templates` would be the sole
-// unqualified one, and it is the one that collides with gap 20's *configuration*
+// unqualified one, and it is the one that collides with the *configuration*
 // templates (`tools/cpipes_contract/templates/`). The operator renders; what it
 // applies is a text template.
 //
@@ -1620,8 +1632,11 @@ type EmbedSpec struct {
 // (/v1/completions). SystemPrompt requires chat, the completions api having no message
 // roles; asking for both is a build time error rather than a silent fold into the prompt.
 // StructuredOutput chooses how the promoted ResponseFormat reaches the server:
-//   - guided_json (default) sends the schema in vLLM's own `guided_json` parameter;
-//   - json_schema sends it in the OpenAI-compatible `response_format`, named and strict.
+//   - json_schema (default) sends it in the OpenAI-compatible `response_format`, named and strict;
+//   - guided_json sends the schema in vLLM's own `guided_json` parameter.
+//
+// The default is json_schema because the pinned vLLM image accepts `guided_json` and
+// discards it (applyVllmDefaults says what was measured).
 //
 // Which one a server accepts is a property of its vLLM version, not of the pipeline,
 // which is why this is configurable at all. The promoted ResponseFormat keeps ollama's

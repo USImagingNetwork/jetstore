@@ -1,12 +1,12 @@
 /**
  * @vitest-environment jsdom
  *
- * The Query Tool. Task C.4.
+ * The Query Tool.
  *
  * **Driven through a stubbed `fetch` with everything below `ApiClient` real**, so
  * these assert the request that leaves the browser rather than the payload a
- * builder returns. That is I-104's rule, and this screen is the case it was
- * written for: `columnDef` — the mechanism the whole screen rests on — appears in
+ * builder returns. A document-level check passes on a field nothing draws, and
+ * this screen is the case that rule was written for: `columnDef` — the mechanism the whole screen rests on — appears in
  * `model.test.ts` and in `live.test.ts` and in **no test that renders**, so the
  * table's ability to draw columns it learned from a response has never been
  * observed on a screen.
@@ -100,7 +100,7 @@ describe("the query tool", () => {
     // The blocking clause: `query.ready` is unset, so the table has nothing to
     // ask. Typing is not submitting, and the Dart's `WhereClause(column: '',
     // formStateKey: FSK.queryReady)` is what says so.
-    // D.11: the Query Tool blocks on an unsubmitted statement, not a selection.
+    // The Query Tool blocks on an unsubmitted statement, not a selection.
     await waitFor(() => expect(screen.getByText("Submit a query above to see rows.")).toBeTruthy());
     expect(sent).toEqual([]);
   });
@@ -139,13 +139,58 @@ describe("the query tool", () => {
       .getAllByRole("columnheader")
       .map((th) => (th.textContent ?? "").replace(/[▲▼]/g, "").trim());
     expect(headers).toEqual(["client", "n"]);
-    // Sorted on the first column of what came back, which is what
-    // `state.setSortingColumn(columnIndex: 0)` does in the Dart once a columnDef
-    // arrives — the document names no `sortColumn` and could not.
-    expect(within(table).getAllByRole("columnheader")[0]!.getAttribute("aria-sort")).toBe(
-      "descending",
-    );
+    // ~~Sorted on the first column of what came back~~ **Not sorted, since
+    // 2026-11-11.** The arrow claimed a sort on column 0 that nothing applied: the
+    // server runs the statement as written and the rows came in its order. The
+    // rows keep the statement's order (its own `ORDER BY`) until a heading is
+    // pressed, and then sort in the browser; see the next case.
+    for (const th of within(table).getAllByRole("columnheader")) {
+      expect(th.getAttribute("aria-sort")).toBe("none");
+    }
     expect(within(table).getByText("3")).toBeTruthy();
+  });
+
+  it("sorts the rows by a pressed heading, in the browser, and keeps it on a resubmit", async () => {
+    // The statement's rows, in its own order. The request carries no sort column
+    // (asserted above), so a heading press used to move the arrow and nothing else.
+    const { api, sent } = await clientWith({
+      reply: {
+        body: {
+          rows: [
+            ["acme", "3"],
+            ["globex", "10"],
+            ["initech", null],
+            ["hooli", "2"],
+          ],
+          columnDef: COLUMN_DEF,
+        },
+      },
+    });
+    renderScreen(api);
+    typeQuery(SQL);
+    fireEvent.click(screen.getByRole("button", { name: "Submit Query" }));
+    await screen.findByText("acme");
+    const firstColumn = () =>
+      within(screen.getByRole("table"))
+        .getAllByRole("row")
+        .slice(1)
+        .map((tr) => within(tr).getAllByRole("cell")[0]!.textContent);
+    expect(firstColumn()).toEqual(["acme", "globex", "initech", "hooli"]);
+
+    // `n` is numeric: 2, 3, 10 rather than 10, 2, 3, and the null last.
+    fireEvent.click(screen.getByRole("button", { name: /^n/ }));
+    await waitFor(() => expect(firstColumn()).toEqual(["hooli", "acme", "globex", "initech"]));
+    fireEvent.click(screen.getByRole("button", { name: /^n/ }));
+    await waitFor(() => expect(firstColumn()).toEqual(["globex", "acme", "hooli", "initech"]));
+
+    // A resubmit returns the same columns, so the sort the user chose is kept.
+    const before = sent.length;
+    fireEvent.click(screen.getByRole("button", { name: "Submit Query" }));
+    await waitFor(() => expect(sent.length).toBe(before + 1));
+    await waitFor(() => expect(firstColumn()).toEqual(["globex", "acme", "hooli", "initech"]));
+    expect(
+      within(screen.getByRole("table")).getByRole("columnheader", { name: /^n/ }).getAttribute("aria-sort"),
+    ).toBe("descending");
   });
 
   it("switches the action to exec_ddl for the DDL button, and clears the other key", async () => {
@@ -190,7 +235,7 @@ describe("the query tool", () => {
     fireEvent.click(screen.getByRole("button", { name: "Submit Query" }));
     await waitFor(() => expect(sent).toHaveLength(1));
 
-    // **The regression guard for I-165.** `useFormField` notifies on every
+    // **The regression guard for re-querying on every keystroke.** `useFormField` notifies on every
     // keystroke, and `useTableBinding` used to ask `FormState.isKeyUpdated`,
     // which latches: nothing clears the set once a watched key has changed. So
     // every character typed here re-executed the previous statement against the
@@ -233,7 +278,7 @@ describe("the query tool", () => {
       // **Both, which is the divergence from the Flutter form.** There
       // `queryToolOk` declares the capability and `queryToolDdlOk` declares none,
       // so the SELECT button is disabled for a user the DDL button is offered to.
-      // The server refuses either way; this does not offer the wrong one. I-166.
+      // The server refuses either way; this does not offer the wrong one.
       expect(button.disabled, name).toBe(true);
       expect(button.getAttribute("title"), name).toContain("workspace_ide");
     }

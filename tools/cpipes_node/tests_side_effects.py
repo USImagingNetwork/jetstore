@@ -216,7 +216,7 @@ def test_the_sink_kinds_are_the_go_constants():
         assert f'{name}       = "{value}"' in source or f'{name} = "{value}"' in source
 
 
-# --- the measurement P9-I01 asks for ----------------------------------------
+# --- the measurement of the side-effect list ---------------------------------
 
 
 def test_the_side_effect_set_is_the_four_writes_and_no_others():
@@ -224,7 +224,7 @@ def test_the_side_effect_set_is_the_four_writes_and_no_others():
 
     **Derived from the tree rather than listed here.** The subject is every such
     statement in the package, so a fifth write added on the other side of the
-    seam makes this red — which is exactly what P9-I01 asks for: the list is
+    seam makes this red — which is exactly what was asked for: the list is
     measured once and a later one is a conformance failure rather than a feature
     request.
 
@@ -234,8 +234,8 @@ def test_the_side_effect_set_is_the_four_writes_and_no_others():
     is reached from nowhere at all.
 
     **The manifest write is the first time this guard has fired, 2026-09-21, and
-    it fired correctly.** `jetstore_maintenance_01`'s track `AC` built `D-255`'s
-    run manifest, whose UPDATE lands in `run_manifest.go`. It is not this node's
+    it fired correctly.** The run manifest built that day has its UPDATE in
+    `run_manifest.go`. It is not this node's
     for the same reason the starters' are not: it is written from
     `StatusUpdate.CoordinateWork`, once per run, after the run's five-way status
     has been computed, by something that knows every node finished. A worker
@@ -272,9 +272,9 @@ def test_the_side_effect_set_is_the_four_writes_and_no_others():
         "actions_start_reducing_cp.go",
         "actions_start_sharding_cp.go",
         "compute_pipes.go",
-        # The run manifest (D-255), written from StatusUpdate.CoordinateWork
+        # The run manifest, written from StatusUpdate.CoordinateWork
         # rather than from a worker. Added 2026-09-21 when this assertion went
-        # red on jetstore_maintenance_01's track AC -- the guard working, not a
+        # red on the run-manifest work -- the guard working, not a
         # guard being widened to keep quiet.
         "run_manifest.go",
     }
@@ -317,7 +317,7 @@ def test_domain_keys_registry_is_neither_the_nodes_nor_the_starters():
 
 
 def test_cpipes_results_is_written_by_nothing_and_so_this_node_writes_it_too():
-    """**P9-I62.** `SaveResultsContext.Save` is reached from nowhere.
+    """`SaveResultsContext.Save` is reached from nowhere.
 
     Its five call sites are commented out in `actions_process_file.go` and have
     been since 2024-07-18. The assertion is in both directions: the method exists
@@ -338,14 +338,14 @@ def test_cpipes_results_is_written_by_nothing_and_so_this_node_writes_it_too():
 
 
 def test_the_execution_status_update_is_behind_two_conditions_this_node_refuses():
-    """**P9-I63**, and the brief named one of the two conditions.
+    """The guard is two conditions, and the brief named one of them.
 
     `if cpCtx.NodeId == 0` is the inner guard. It sits inside
     `if inputSchemaCh != nil`, and `inputSchemaCh` is non-nil only when the input
     format is parquet **and** the mode is `sharding`. This node refuses both —
     a non-generator channel by the scope gate and sharding mode by name — so no
     document it accepts can reach the Go write, and implementing it would be a
-    path no document can take (P4-I43's class).
+    path no document can take (a known class).
 
     Both halves are read out of the Go source rather than asserted from memory,
     because the whole value of the finding is that the second condition was not
@@ -377,18 +377,202 @@ def test_the_execution_status_update_is_behind_two_conditions_this_node_refuses(
         _file_keys(sharding, NodeArgs(id=0, pe=1))
 
 
-def test_the_error_path_writes_nothing_and_this_node_adds_nothing(monkeypatch):
-    """**P9-I64.** The `gotError:` label logs and returns, carrying a TODO.
+def test_a_refusal_at_the_start_records_a_failed_row_as_the_go_error_path_does(
+    tmp_path,
+):
+    """Go's `gotError:` label records a `failed` row, and so does this node.
 
-    Filling it in would diverge in the direction that looks like an improvement,
-    which is the hardest kind to argue back out — so the TODO's presence is
-    asserted, and so is the fact that this node's failure path writes the
-    *status* row and no error row of its own.
+    The label used to log and return, carrying a TODO. Since 2026-10-05 it calls
+    `RegisterNodeError`, which inserts the `in progress` row and updates it to
+    `failed` with the error's text and six zero counts, so that an error raised
+    before the files are processed reaches the pipeline status.
+
+    This node resolves its file keys before `effects.begin()`, and until
+    2026-11-19 a refusal there left no row; this test asserted that divergence.
+    It now asserts agreement, in both directions: the Go side is read from its
+    source, and this node is run to a refusal at its start against a recording
+    connection. A sharding-mode generator is the refusal, raised by
+    `_file_keys`, the same point at which Go's `GetFileKeys` would fail.
     """
+    import inspect
+
+    from cpipes_node import node
+    from cpipes_node.config import FileConfigSource
+    from cpipes_node.errors import StartupError
+    from cpipes_node.node import coordinate
+
+    # The Go side: the label calls it, and it is the INSERT then the UPDATE to
+    # failed, with zero counts, the main input step id and the error's text.
     source = go_source("jets/compute_pipes/actions_coordinate_cp.go")
-    assert "//*TODO insert error in pipeline_execution_details" in source
     tail = source[source.index("gotError:") :]
-    assert "INSERT" not in tail and "UPDATE" not in tail
+    assert "args.RegisterNodeError(" in tail
+    process = go_source(PROCESS_FILE_GO)
+    register = process.split(
+        "func (args *ComputePipesNodeArgs) RegisterNodeError(", 1
+    )[1].split("\n}\n", 1)[0]
+    assert register.index("InsertPipelineExecutionStatus(") < register.index(
+        "UpdatePipelineExecutionStatus("
+    )
+    update_call = re.sub(
+        r"\s+", " ", register[register.index("UpdatePipelineExecutionStatus(") :]
+    )
+    assert (
+        "UpdatePipelineExecutionStatus(dbpool, key, 0, 0, 0, 0, 0, 0, "
+        'cpCtx.MainInputStepId, "failed", nodeErr.Error())'
+    ) in update_call
+    assert "InsertChannelExecutionDetails" not in register
+
+    # The order is still Go's: the file keys are resolved before the row the
+    # run itself opens, so the refusal is recorded by the error path.
+    coordinate_source = inspect.getsource(node.coordinate)
+    assert coordinate_source.index("_file_keys(") < coordinate_source.index(
+        "effects.begin()"
+    )
+
+    # This node: run it to the refusal.
+    connection = FakeConnection(returning=[(42,)])
+    document = runtime_document([], mode="sharding")
+    document["common_runtime_args"].update(
+        {
+            "pipeline_config_key": 3,
+            "client": "acme",
+            "process_name": "corpus",
+            "input_session_id": "in1",
+            "source_period_key": 22,
+            "user_email": "a@b.c",
+            "read_step_id": "reducing01",
+        }
+    )
+    config = tmp_path / "pipeline.pc.json"
+    config.write_text(_json(document))
+    with pytest.raises(StartupError, match="generator input channel") as raised:
+        coordinate(
+            NodeArgs(id=4, pe=11, jp="0004P"),
+            FileConfigSource(config),
+            connection=connection,
+        )
+
+    statements = connection.statements()
+    assert len(statements) == 2, statements
+    assert "INSERT INTO jetsapi.pipeline_execution_details" in statements[0]
+    assert "UPDATE jetsapi.pipeline_execution_details" in statements[1]
+    assert connection.calls[0][1] == (
+        3, 11, "acme", "corpus", "in1", "s1", 22, 4, "0004P", "a@b.c"
+    )
+    assert connection.calls[1][1] == (
+        "reducing01", "failed", str(raised.value), 0, 0, 0, 0, 0, 0, 42
+    )
+    assert connection.commits == 2
+    assert "_register_node_error(" in coordinate_source
+
+
+def test_a_document_the_scope_gate_refuses_records_a_failed_row(tmp_path):
+    """The scope gate's refusal is a refusal at the start, and is recorded.
+
+    Until 2026-11-19 this test asserted the opposite: that a document the scope
+    gate refuses writes no row, because the run never started. The Go node
+    records a `failed` row for every error after its config is read, a document
+    defect such as a missing `main_input` provider included, so this node now
+    records one too, and the error reaches the pipeline status's node error
+    message.
+    """
+    from conftest import out_of_scope_step
+    from cpipes_node.config import FileConfigSource
+    from cpipes_node.errors import OperatorOutOfScope
+    from cpipes_node.node import coordinate
+
+    connection = FakeConnection()
+    config = tmp_path / "pipeline.pc.json"
+    config.write_text(_json(runtime_document([out_of_scope_step()])))
+    with pytest.raises(OperatorOutOfScope) as raised:
+        coordinate(
+            NodeArgs(id=0, pe=1),
+            FileConfigSource(config),
+            connection=connection,
+        )
+    assert len(connection.statements()) == 2
+    parameters = connection.parameters_for("UPDATE jetsapi")
+    assert parameters[1] == "failed"
+    assert parameters[2] == str(raised.value)
+    assert parameters[3:9] == (0, 0, 0, 0, 0, 0)
+
+
+def test_a_document_that_cannot_be_parsed_records_no_row(tmp_path):
+    """Go's rule: without the config there is no run identity to write against.
+
+    `gotError:` returns the error unrecorded when `cpConfig` or its
+    `CommonRuntimeArgs` is nil, and this node does the same for a document it
+    cannot parse and for one that carries no `common_runtime_args`.
+    """
+    from cpipes_node.config import FileConfigSource
+    from cpipes_node.errors import ConfigInvalid, StartupError
+    from cpipes_node.node import coordinate
+
+    source = go_source("jets/compute_pipes/actions_coordinate_cp.go")
+    tail = source[source.index("gotError:") :]
+    guard = tail.index("cpConfig == nil || cpConfig.CommonRuntimeArgs == nil")
+    assert guard < tail.index("args.RegisterNodeError(")
+
+    connection = FakeConnection()
+    config = tmp_path / "pipeline.pc.json"
+    config.write_text("{ not json")
+    with pytest.raises(ConfigInvalid):
+        coordinate(
+            NodeArgs(id=0, pe=1), FileConfigSource(config), connection=connection
+        )
+    assert connection.statements() == []
+
+    document = runtime_document([])
+    del document["common_runtime_args"]
+    config.write_text(_json(document))
+    with pytest.raises(StartupError, match="invalid cpipesMode"):
+        coordinate(
+            NodeArgs(id=0, pe=1), FileConfigSource(config), connection=connection
+        )
+    assert connection.statements() == []
+
+
+def test_a_failure_to_record_the_refusal_does_not_replace_it(tmp_path, caplog):
+    """`RegisterNodeError`'s own error is a warning; the node's error is returned.
+
+    So the reason the node failed is never replaced by the reason its record
+    could not be written.
+    """
+    from cpipes_node.config import FileConfigSource
+    from cpipes_node.errors import StartupError
+    from cpipes_node.node import coordinate
+
+    source = go_source("jets/compute_pipes/actions_coordinate_cp.go")
+    tail = source[source.index("gotError:") :]
+    assert '"WARNING", err)' in tail
+    assert tail.rstrip().endswith("return cpErr\n}")
+
+    class Unreachable(FakeConnection):
+        def cursor(self) -> Cursor:
+            raise RuntimeError("the database went away")
+
+    config = tmp_path / "pipeline.pc.json"
+    config.write_text(_json(runtime_document([], mode="sharding")))
+    with caplog.at_level("WARNING"):
+        with pytest.raises(StartupError, match="generator input channel"):
+            coordinate(
+                NodeArgs(id=0, pe=1), FileConfigSource(config), connection=Unreachable()
+            )
+    assert "while registering node error" in caplog.text
+    assert "the database went away" in caplog.text
+
+
+def test_a_run_with_no_database_records_a_refusal_nowhere(tmp_path):
+    """`NoSideEffects.register_node_error` writes nothing and raises nothing."""
+    from cpipes_node.config import FileConfigSource
+    from cpipes_node.errors import StartupError
+    from cpipes_node.node import coordinate
+
+    assert NoSideEffects().register_node_error(StartupError("x")) is None
+    config = tmp_path / "pipeline.pc.json"
+    config.write_text(_json(runtime_document([], mode="sharding")))
+    with pytest.raises(StartupError, match="generator input channel"):
+        coordinate(NodeArgs(id=0, pe=1), FileConfigSource(config))
 
 
 # --- the two rows -----------------------------------------------------------
@@ -764,7 +948,7 @@ def test_a_kill_switch_is_not_a_failure():
 def test_the_four_metric_names_are_the_go_switchs_own():
     """Read off `ReportMetrics`' `case` labels.
 
-    The partition into measurable and not is this node's judgement (P9-I65); the
+    The partition into measurable and not is this node's judgement; the
     *set* of four is Go's, and a fifth metric added there makes this red.
     """
     source = go_source(METRICS_GO)
@@ -776,7 +960,7 @@ def test_the_four_metric_names_are_the_go_switchs_own():
 
 
 def test_a_metric_this_runtime_cannot_measure_is_not_written(caplog):
-    """**D-225**, whose cost is P9-I65, and the direction is `RowCountUnknown`'s
+    """**The metrics decision**, whose cost is recorded, and the direction is `RowCountUnknown`'s
     argument one table over.
 
     `alloc_mb` is the live heap and `total_alloc_mb` is cumulative-ever-allocated;
@@ -790,7 +974,7 @@ def test_a_metric_this_runtime_cannot_measure_is_not_written(caplog):
 
 
 def test_nothing_in_the_metric_row_says_which_runtime_wrote_it():
-    """**P9-I65, which D-225 does not close.**
+    """**The cost the metrics decision does not close.**
 
     The table is `(session_id, jets_partition, node_id, category, name, value,
     units)` and there is no engine column, so a consumer comparing a Go row with
@@ -900,7 +1084,7 @@ def test_a_run_with_no_database_writes_nothing_and_is_not_a_double():
 
 
 def test_nothing_in_this_package_imports_a_database_driver():
-    """The seam P9-T14's image depends on, asserted structurally.
+    """The seam the node's image depends on, asserted structurally.
 
     Its packaging notes record that declaring `psycopg` as an extra would
     contradict the package's refusal to import one, so the refusal is held by a
@@ -982,30 +1166,6 @@ def test_a_crashed_node_closes_its_own_row_as_failed(tmp_path):
     assert parameters[2], "the error message is empty on a failed row"
 
 
-def test_a_document_the_scope_gate_refuses_writes_no_row_at_all(tmp_path):
-    """A run that never started is not an `in progress` row.
-
-    Everything X6 refuses happens before the INSERT, deliberately: a
-    `pipeline_execution_details` row for a document this node will not run would
-    say a worker started.
-    """
-    from conftest import out_of_scope_step
-    from cpipes_node.config import FileConfigSource
-    from cpipes_node.errors import OperatorOutOfScope
-    from cpipes_node.node import coordinate
-
-    connection = FakeConnection()
-    config = tmp_path / "pipeline.pc.json"
-    config.write_text(_json(runtime_document([out_of_scope_step()])))
-    with pytest.raises(OperatorOutOfScope):
-        coordinate(
-            NodeArgs(id=0, pe=1),
-            FileConfigSource(config),
-            connection=connection,
-        )
-    assert connection.statements() == []
-
-
 def test_a_merge_reports_its_synthetic_edge_as_a_child_row(tmp_path):
     """Without it a merge worker writes no child row and zero in every count.
 
@@ -1039,7 +1199,7 @@ def test_a_merge_reports_its_synthetic_edge_as_a_child_row(tmp_path):
 
 
 def test_a_graph_run_reports_each_writer_as_an_edge(tmp_path):
-    """**P9-I67's hole, closed.** This test asserted that a graph run reported
+    """**The writer-edge hole, closed.** This test asserted that a graph run reported
     no edge, and said it would go red "when the first writer lands owing its
     `WriterResult`". The writer landed and the test stayed green, because its
     document had no writer in it - and the first completed deployed run (2423,

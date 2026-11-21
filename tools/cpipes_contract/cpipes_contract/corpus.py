@@ -4,7 +4,7 @@
 `workspaces/*/data/` are notes and reference material for developers — JetStore never
 loads them — and they preserve config shapes that have since been retired. Counting them
 does not merely add noise, it manufactures contradictions: every apparent disagreement
-between the validator and the corpus in the B.1 seed came from that directory.
+between the validator and the corpus in the initial seed came from that directory.
 
 The rule that follows is the one the plan already implies but never states: **the
 validator wins.** It runs on every execution, so a shape it rejects cannot be in service.
@@ -16,7 +16,7 @@ Counting is driven by the matrix rather than by a hand-written traversal: a fiel
 with a `ref_struct` says where a child of that type is found, and the child's own
 discriminator says which row it is. So the matrix measures itself, and the reach of the
 walk is exactly the coverage of the matrix — `unreachable` in the report below is the
-worklist for B.2-B.6, not a bug.
+worklist for the matrix extraction, not a bug.
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
+from . import aliases
 from .matrix_schema import (
     ANY_TOKEN,
     NONE,
@@ -37,14 +38,14 @@ from .matrix_schema import (
     variant_matches,
 )
 
-# `workspaces/<ws>/pipes_config/...`, at any depth below it - usi_ws and jets_ws keep a
+# `workspaces/<ws>/pipes_config/...`, at any depth below it - some workspaces keep a
 # `test/` subdirectory, and those configs do run.
 LIVE_PARENT = "pipes_config"
 
 # Within the live corpus, a `test/` directory holds configs that exercise a feature
 # rather than run a client's data. They are real configs and they must validate, so they
 # stay in the corpus - but a field attested only there is weaker evidence than one a
-# production pipeline depends on, and the review is ordered by evidence strength (R-1).
+# production pipeline depends on, and the review is ordered by evidence strength.
 TEST_PARENT = "test"
 
 
@@ -54,11 +55,31 @@ def is_production(path: Path) -> bool:
 TypeKey = tuple[str, str]
 
 
+# The pipeline configurations JetStore owns and installs into every workspace's
+# `pipes_config/` (`jets/workspace_assets`). A workspace does not commit them - it
+# ignores them - so whether a checkout holds a copy depends on whether the installer
+# has run there, and each installed copy is the same file once per workspace.
+JETSTORE_ASSETS = Path(__file__).resolve().parents[3] / "jets" / "workspace_assets" / LIVE_PARENT
+
+
+def jetstore_assets() -> frozenset[str]:
+    """The names of the `.pc.json` JetStore installs into a workspace's `pipes_config/`."""
+    return frozenset(p.name for p in JETSTORE_ASSETS.glob("*.pc.json"))
+
+
 def config_files(root: Path) -> tuple[list[Path], list[Path]]:
-    """Split the workspaces' `.pc.json` into (live, retired)."""
+    """Split the workspaces' `.pc.json` into (live, retired).
+
+    An installed copy of a JetStore-owned configuration is neither: it is not the
+    workspace's material, and counting it would make the corpus depend on whether the
+    asset installer has run in the checkout being measured.
+    """
     live: list[Path] = []
     retired: list[Path] = []
+    assets = jetstore_assets()
     for path in sorted((root / "workspaces").rglob("*.pc.json")):
+        if path.parent.name == LIVE_PARENT and path.name in assets:
+            continue
         (live if LIVE_PARENT in path.parts else retired).append(path)
     return live, retired
 
@@ -80,7 +101,7 @@ class Measurement:
     # until a production occurrence turns up.
     exemplar_is_prod: dict[TypeKey, bool] = field(default_factory=dict)
     # Keys seen on a typed node that no field row accounts for: candidates for a missing
-    # row, or - once the matrix is complete - dead keys, which is the B.14 audit.
+    # row, or - once the matrix is complete - dead keys, which is the dead-key audit.
     unknown_keys: dict[TypeKey, Counter[str]] = field(
         default_factory=lambda: defaultdict(Counter)
     )
@@ -291,13 +312,17 @@ def apply(matrix: Matrix, measurement: Measurement) -> None:
     Counting by hand is how the seed acquired both its bad exemplars and its wrong
     totals. The numbers are measured or they are not written.
     """
+    # The walk reads the corpus under its real workspace names; the matrix records
+    # them under neutral ones, as every other file in this package does, and
+    # `check --corpus` resolves them back through the same alias file.
+    names = aliases.load()
     for t in matrix.types:
         key = (t.go_struct, t.type_token)
         t.corpus_instances = measurement.instances.get(key, 0)
         t.corpus_prod_instances = measurement.prod_instances.get(key, 0)
         exemplar = measurement.exemplars.get(key)
         if exemplar is not None:
-            t.exemplar_file, t.exemplar_path = exemplar
+            t.exemplar_file, t.exemplar_path = names.anonymise(exemplar[0]), exemplar[1]
         # When the walk found none, a hand-proposed exemplar is left standing rather
         # than erased: while extraction is partial the walk cannot reach every type,
         # and the proposal is still verified by `check --corpus`. Once the type

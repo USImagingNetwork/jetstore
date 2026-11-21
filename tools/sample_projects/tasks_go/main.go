@@ -29,8 +29,7 @@ import (
 //go:embed task_schema.json
 var taskSchema []byte
 
-const defaultPromptFile = "/home/michel/projects/repos/jetstore_agentic_ai/workspaces/jets_ws/data/" +
-	"patient_clinical_summary/initial_test_prompt_with_model.md"
+const defaultPromptFile = "data/patient_clinical_summary/initial_test_prompt_with_model.md"
 
 // promptRe splits a prompt file into its "System:" and "User:" sections.
 var promptRe = regexp.MustCompile(`(?s)\s*System:\s*(.*?)\n\s*User:\s*(.*)`)
@@ -79,10 +78,10 @@ func callOllama(ctx context.Context, host, model, system, user string) (string, 
 		Model:  model,
 		Stream: false,
 		// Constrain generation to our JSON Schema.
-		Format:  json.RawMessage(taskSchema),
+		Format: json.RawMessage(taskSchema),
 		Options: map[string]any{
 			"temperature": 0.8,
-			"num_thread": 16,
+			"num_thread":  16,
 		},
 		Messages: []chatMessage{
 			{Role: "system", Content: system},

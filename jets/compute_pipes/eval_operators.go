@@ -56,8 +56,8 @@ func BuildEvalOperator(op string) (evalOperator, error) {
 		return &opIn{
 			noCase: true,
 		}, nil
-	// String operators: CONTAINS and CONTAINS_NO_CASE, mirroring the rules engine's ContainsOp
-	// (jets/jetrules/rete/expr_operator_str_contains.go)
+	// String operators: CONTAINS and CONTAINS_NO_CASE, mirroring the Go rules engine's ContainsOp
+	// (expr_operator_str_contains.go, at the go-engine-final tag)
 	case "CONTAINS":
 		return &opContains{}, nil
 	case "CONTAINS_NO_CASE":
@@ -1420,7 +1420,7 @@ func (op *opABS) Eval(lhs any, _ any) (any, error) {
 	return nil, fmt.Errorf("opABS incompatible types: '%T', rejected", lhs)
 }
 
-// Operator toDate() unary operator, convert a string to date if possible, 
+// Operator toDate() unary operator, convert a string to date if possible,
 // or int to seconds since epoch, int64 to milliseconds since epoch, float64 to seconds since epoch
 type opToDate struct{}
 
@@ -1428,7 +1428,7 @@ func (op *opToDate) Eval(lhs any, _ any) (any, error) {
 	if lhs == nil {
 		return nil, nil
 	}
-	// Return the date part of a datetime, or convert a string to date if possible, 
+	// Return the date part of a datetime, or convert a string to date if possible,
 	// or int to seconds since epoch, int64 to milliseconds since epoch, float64 to seconds since epoch
 	switch lhsv := lhs.(type) {
 	case string:

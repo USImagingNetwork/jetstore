@@ -1,5 +1,5 @@
 /**
- * Tests for the data table's logic (task A.4b).
+ * Tests for the data table's logic.
  *
  * The three `DIVERGENCE` cases get their own tests asserting the *corrected*
  * behaviour, with the Dart's answer written into the test name. If someone
@@ -53,7 +53,7 @@ describe("visibleColumns", () => {
     const visible = visibleColumns(cols);
     expect(visible).toHaveLength(1);
     // The surviving column still points at position 1 of the row array — hiding
-    // is not reindexing, and A.4c's bindings depend on that.
+    // is not reindexing, and the form-state bindings depend on that.
     expect(visible[0]!.index).toBe(1);
   });
 });
@@ -113,7 +113,7 @@ describe("resolveSortColumn", () => {
   );
 
   // **Six since 2026-10-01**: the three add-or-edit option tables were retired
-  // with the steps `D06` removed (`jetstore_maintenance_02` `AF.2`–`AF.4`).
+  // with the add-or-edit steps their flows no longer have.
   it("leaves exactly the six static tables without a resolvable sort column", () => {
     expect(unsortable).toHaveLength(6);
     for (const key of unsortable) {
@@ -207,19 +207,20 @@ describe("cell text", () => {
     expect(cellText(["hidden", "acme"], col)).toBe("acme");
   });
 
-  it("renders a null as the string 'null', as the Dart does", () => {
-    // Deliberate: users read these tables, and an empty cell and a null are
-    // different facts about the row.
-    expect(cellText(["x", null], col)).toBe("null");
+  it("renders a null as an empty cell, not as the word null", () => {
+    // The Dart printed `null`, and every empty column then read as data.
+    expect(cellText(["x", null], col)).toBe("");
+    expect(cellText(["x"], col)).toBe("");
   });
 
-  it("applies a supplied cell filter, and falls back to 'null'", () => {
+  it("applies a supplied cell filter, and falls back to an empty cell", () => {
     expect(cellText(["x", "s3://bucket/key"], col, (v) => v?.split("/").pop() ?? null)).toBe("key");
-    expect(cellText(["x", "v"], col, () => null)).toBe("null");
+    expect(cellText(["x", "v"], col, () => null)).toBe("");
   });
 
-  it("copies the unfiltered value", () => {
+  it("copies the unfiltered value, and nothing for a null", () => {
     expect(cellFullText(["x", "s3://bucket/key"], col)).toBe("s3://bucket/key");
+    expect(cellFullText(["x", null], col)).toBe("");
   });
 });
 
@@ -236,7 +237,7 @@ describe("selection", () => {
   });
 
   it("clears the previous row in a single-select table and reports it", () => {
-    // The reported indices are what A.4c needs: the Dart calls
+    // The reported indices are what the form-state binding needs: the Dart calls
     // `_updateFormState(i, false)` on each one before setting the new row.
     let sel = emptySelection(3);
     sel = toggleSelection(sel, 0, true, true).selection;

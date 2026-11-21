@@ -27,7 +27,7 @@ import (
 //	-123        -> {type: "int", value: "-123"}
 //	+12.3       -> {type: "double", value: "+12.3"}
 //
-// Note: if the type is "var" then it's a variable and a new resource is created in the scope of the rule only. 
+// Note: if the type is "var" then it's a variable and a new resource is created in the scope of the rule only.
 // Note: if the type is "identifier" then it's actually either "resource" or "volatile_resource",
 // this is resolved by the WorkspaceResourceManager when adding to the model.
 // returns the ResourceNode.
@@ -49,7 +49,7 @@ func (s *JetRuleListener) ParseObjectAtom(txt string, keywordsContextValue strin
 		}
 		// Resource not found - log error and create it as inline resource
 		if !s.autoAddResources {
-			fmt.Fprintf(s.errorLog, "warning: identifier '%s' must be defined in a declaration section before use, creating as resource\n", r.Id)
+			s.logErrorf("warning: identifier '%s' must be defined in a declaration section before use, creating as resource\n", r.Id)
 			fmt.Fprintf(s.parseLog, "warning: identifier '%s' must be defined in a declaration section before use, creating as resource\n", r.Id)
 		}
 		if after, ok := strings.CutPrefix(r.Id, "_0:"); ok {
@@ -132,7 +132,7 @@ func (s *JetRuleListener) AddResource(r *rete.ResourceNode) *rete.ResourceNode {
 			if resById, existsById := s.resourceManager.ResourceById[r.Id]; existsById {
 				if resById.Type != r.Type || resById.Value != r.Value {
 					// Conflict - same Id with different type/value
-					fmt.Fprintf(s.errorLog, "error: resource Id conflict for Id '%s': existing (%s|%s), new (%s|%s), keeping the existing resource\n",
+					s.logErrorf("error: resource Id conflict for Id '%s': existing (%s|%s), new (%s|%s), keeping the existing resource\n",
 						r.Id, resById.Type, resById.Value, r.Type, r.Value)
 					fmt.Fprintf(s.parseLog, "error: resource Id conflict for Id '%s': existing (%s|%s), new (%s|%s), keeping the existing resource\n",
 						r.Id, resById.Type, resById.Value, r.Type, r.Value)
@@ -242,30 +242,35 @@ func (s *JetRuleListener) parseObjectAtom(txt string, keywordsContextValue strin
 		// String
 		return &rete.ResourceNode{
 			Type:  "text",
-			Value: StripQuotes(txt),
+			Value: UnquoteString(txt),
 		}
 	case strings.HasSuffix(txt, ")"):
-		// Literal cast
-		v := strings.Split(txt, "(")
-		if len(v) == 2 {
-			typ := v[0]
-			val := strings.TrimSuffix(v[1], ")")
-			// validate typ is one of text, int, double, bool
-			switch typ {
-			case "text", "int", "uint", "long", "ulong", "double", "bool", "date", "datetime":
-			default:
-				// invalid type - report error, return nil
-				fmt.Fprintf(s.errorLog, "error: invalid literal type '%s' for value '%s', source text: %s\n", typ, val, txt)
-				fmt.Fprintf(s.parseLog, "error: invalid literal type '%s' for value '%s', source text: %s\n", typ, val, txt)
-				return nil
-			}
-			if typ == "bool" && !s.checkBoolLiteral(s.currentLine, StripQuotes(val)) {
-				return nil
-			}
-			return &rete.ResourceNode{
-				Type:  typ,
-				Value: StripQuotes(val),
-			}
+		// Literal cast, type(value). The type is what precedes the first '(',
+		// and the value is everything between it and the closing ')': a quoted
+		// value may itself hold parentheses, as in text("a(b)"). Until
+		// 2026-11-14 the text was split on every '(', so a value holding one
+		// returned nil here without a word, and the term it was in was dropped.
+		typ, rest, found := strings.Cut(txt, "(")
+		if !found {
+			s.LogErrorAt(s.currentLine, fmt.Sprintf("cannot read %s as a literal: a cast is written type(value)", txt))
+			return nil
+		}
+		val := strings.TrimSuffix(rest, ")")
+		// validate typ is one of text, int, double, bool
+		switch typ {
+		case "text", "int", "uint", "long", "ulong", "double", "bool", "date", "datetime":
+		default:
+			// invalid type - report error, return nil
+			s.LogErrorAt(s.currentLine, fmt.Sprintf("invalid literal type '%s' for value '%s', source text: %s", typ, val, txt))
+			fmt.Fprintf(s.parseLog, "error: invalid literal type '%s' for value '%s', source text: %s\n", typ, val, txt)
+			return nil
+		}
+		if typ == "bool" && !s.checkBoolLiteral(s.currentLine, UnquoteString(val)) {
+			return nil
+		}
+		return &rete.ResourceNode{
+			Type:  typ,
+			Value: UnquoteString(val),
 		}
 	case len(keywordsContextValue) > 0:
 		// Keyword
@@ -292,7 +297,6 @@ func (s *JetRuleListener) parseObjectAtom(txt string, keywordsContextValue strin
 			Id:   EscR(txt),
 		}
 	}
-	return nil
 }
 
 // Determine if the string is numeric (int or double)
@@ -317,8 +321,15 @@ func isNumeric(s string) bool {
 	return true
 }
 
-// Escape resource name that conflicts with keywords such as rdf:type becomes rdf:"type"
-// this function removes the quotes
+// EscR reads a resource name written with its name quoted, prefix:"name", as
+// prefix:name. The quotes let a name be a keyword or hold characters an
+// Identifier cannot (JetRule.g4, declIdentifier: Identifier ':' STRING).
+//
+// It applies to an identifier only: parseObjectAtom calls it on the text it has
+// found to be one, and the declarations call it on their names. A string
+// literal or a cast must not pass through it, since every double quote is
+// removed: until 2026-11-14 the antecedent, consequent and triple handlers
+// applied it to the whole term, so text("\"x:") was read as text(\x:).
 func EscR(s string) string {
 	if len(s) > 4 && s[0] != '"' && strings.Contains(s, ":\"") {
 		return strings.ReplaceAll(s, "\"", "")
@@ -326,16 +337,9 @@ func EscR(s string) string {
 	return s
 }
 
-func StripQuotes(s string) string {
-	if len(s) >= 2 && ((s[0] == '"' && s[len(s)-1] == '"') || (s[0] == '\'' && s[len(s)-1] == '\'')) {
-		return s[1 : len(s)-1]
-	}
-	return s
-}
-
 // checkBoolLiteral refuses a bool literal outside the accepted spellings, at the
-// line it was written (I-45). Empty is null and is accepted. Both engines also
-// refuse such a literal at load; this is where the author hears of it.
+// line it was written. Empty is null and is accepted. The engine also
+// refuses such a literal at load; this is where the author hears of it.
 func (s *JetRuleListener) checkBoolLiteral(globalLine int, value string) bool {
 	if _, err := rdf.ParseBool(value); err != nil && !errors.Is(err, rdf.ErrNullBool) {
 		s.LogErrorAt(globalLine, fmt.Sprintf("bool literal: %v", err))

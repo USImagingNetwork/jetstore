@@ -1,10 +1,10 @@
 /**
  * Every user-flow and table document in a workspace, validated as the app would
- * load them. `jetstore_maintenance_02` task AG.2 (`R12`).
+ * load them.
  *
  * ## Why this exists
  *
- * These documents are going to be written by a model (Michel, 2026-10-01), so a
+ * These documents are going to be written by a model (2026-10-01), so a
  * validator is the whole of their quality control. Two halves existed and
  * neither was reachable by a generator or a build:
  *
@@ -20,19 +20,23 @@
  *
  * ## What is checked, and in what order
  *
- * 1. Every `table_configs/*.tc.json` parses, and every escape it names (cell
- *    filters, `isEnabled` predicates) is in the registry.
+ * 1. Every `table_configs/*.tc.json` parses, every escape it names (cell
+ *    filters, `isEnabled` predicates) is in the registry, and every authored
+ *    `isEnabled` is the predicate the runtime derives for that table and action
+ *    (`isEnabledFindings`).
  * 2. Every `user_flows/*.uf.json`, `*.ua.json` and `*.form.json` parses.
- * 3. For each flow: both siblings exist; `validateFlow`'s reference checks;
- *    `validateDocumentSet`; every table its forms name exists; then
- *    `validateTableActions`; then every escape the flow, its actions and its
+ * 3. For each flow: both siblings exist; every table its forms name exists;
+ *    then `checkFlowSet` (`store.ts`), the checks `FlowStore.load` makes:
+ *    `validateFlow`'s reference checks, `validateDocumentSet`,
+ *    `validateTableActions`, and every escape the flow, its actions and its
  *    forms name is in the registry.
  *
- * Step 3 mirrors `FlowStore.load` (`store.ts`) check for check. **It is a second
- * reading of that sequence rather than a call to it**, because `load` throws at
- * the first failing stage and reports pointers without files, which is right for
- * a screen and wrong for a build log. A new check added to `load` must be added
- * here too; the test beside this file runs both over the shipping assets.
+ * ~~Step 3 mirrors `FlowStore.load` check for check, as a second reading of
+ * that sequence rather than a call to it.~~ **It calls it, since
+ * 2026-10-27.** The restatement had begun to drift. `load` throws at the first failing stage and this
+ * reports every finding with its file, and that difference is now in what each
+ * caller does with `checkFlowSet`'s findings rather than in two copies of the
+ * checks.
  *
  * `.apply.json` (a projected flow's template plan, read by `src/cpipes/` alone)
  * is not one of the four kinds and is not checked here.
@@ -48,14 +52,16 @@ import { resolveEscapes, type EscapeReferences, type EscapeRegistry } from "../a
 import { ActionDocumentSchema, type ActionDocument } from "../actions/schema";
 import {
   TableConfigDocumentSchema,
+  actionRowsOf,
   tableEscapeReferences,
   type TableConfigDocument,
 } from "../datatable/table";
-import { validateDocumentSet, validateTableActions, type SetFinding } from "./documentSet";
+import { isEnabledEscapeFor } from "../datatable/tableTranslate";
+import type { SetFinding } from "./documentSet";
 import { FormDocumentSchema, fieldsOf, type FormDocument } from "./form";
 import { UserFlowSchema, type UserFlow } from "./schema";
-import { actionPath, escapeReferences, flowPath, formEscapeReferences, formPath, tableKeysOf } from "./store";
-import { defaultPolicy, validateFlow, type Policy, type Severity } from "./validate";
+import { actionPath, checkFlowSet, flowPath, formPath, tableKeysOf } from "./store";
+import { defaultPolicy, type Policy, type Severity } from "./validate";
 
 export const TABLE_DIR = "table_configs";
 export const FLOW_DIR = "user_flows";
@@ -85,17 +91,121 @@ export interface ValidateWorkspaceOptions {
 
 const tableFile = (key: string): string => `${TABLE_DIR}/${key}.tc.json`;
 
-type Parser = { safeParse(v: unknown): { success: boolean; data?: unknown; error?: unknown } };
+type Parser = {
+  safeParse(v: unknown): { success: boolean; data?: unknown; error?: unknown };
+  /** Zod's: whether `v` parses, stopping at the first problem rather than collecting every one. */
+  validate(v: unknown): boolean;
+};
 
 const escapePointer = (segment: PropertyKey): string =>
   String(segment).replace(/~/g, "~0").replace(/\//g, "~1");
+
+/**
+ * The most findings listed for one file; the rest are counted in one more.
+ *
+ * A file with this many findings is not fixed one finding at a time, so the
+ * first ones and a count say all an author can use, and a compile log is not
+ * buried under one document's problems.
+ */
+export const MAX_FINDINGS_PER_FILE = 100;
+
+/**
+ * The most JSON values a document may hold and still have its problems listed.
+ *
+ * **The cap above does not bound memory on its own.** The schema records an
+ * issue for every element that fails before any finding is built, so a
+ * `.tc.json` whose `columns` holds a million numbers ran a 1 GB Node heap out
+ * of memory inside the schema library, with or without the cap. A document over
+ * this size is checked with `validate`, which stops at its first problem: a
+ * valid one is accepted as before, and an invalid one gets one finding saying
+ * so, without the list. The largest shipped document holds about 7,700 values
+ * (a projected form document, 2026-11-14), so this is several times any real
+ * one, and at this size the schema's issues fit in a few hundred megabytes even
+ * for a form document whose every field fails all its kinds.
+ */
+export const MAX_VALUES_LISTED = 50_000;
+
+/** Whether `value` holds more than `limit` JSON values, counting containers. Stops counting there. */
+function holdsMoreThan(value: unknown, limit: number): boolean {
+  let count = 0;
+  const stack: unknown[] = [value];
+  while (stack.length > 0) {
+    const v = stack.pop();
+    count += 1;
+    if (count > limit) return true;
+    if (Array.isArray(v)) stack.push(...v.slice(0, limit + 1 - count));
+    else if (v !== null && typeof v === "object") stack.push(...Object.values(v as object).slice(0, limit + 1 - count));
+  }
+  return false;
+}
+
+/**
+ * The findings of one run, at most `MAX_FINDINGS_PER_FILE` per file.
+ *
+ * `push` takes findings as an array's `push` does and drops those past the cap,
+ * counting them; `list` adds, for each file that had more, one finding saying
+ * how many were not listed, an error if any of them was.
+ */
+class CappedFindings {
+  private readonly listed: WorkspaceFinding[] = [];
+  private readonly perFile = new Map<string, { count: number; omitted: number; omittedError: boolean }>();
+
+  private entry(file: string) {
+    let e = this.perFile.get(file);
+    if (e === undefined) {
+      e = { count: 0, omitted: 0, omittedError: false };
+      this.perFile.set(file, e);
+    }
+    return e;
+  }
+
+  /** Whether `file` already has as many findings listed as it may. */
+  full(file: string): boolean {
+    return this.entry(file).count >= MAX_FINDINGS_PER_FILE;
+  }
+
+  push(...findings: WorkspaceFinding[]): void {
+    for (const f of findings) {
+      const e = this.entry(f.file);
+      if (e.count < MAX_FINDINGS_PER_FILE) {
+        e.count += 1;
+        this.listed.push(f);
+      } else {
+        this.omit(f.file, 1, f.severity);
+      }
+    }
+  }
+
+  /** Counts `n` findings of `file` that were never built. */
+  omit(file: string, n: number, severity: Severity): void {
+    const e = this.entry(file);
+    e.omitted += n;
+    if (severity === "error") e.omittedError = true;
+  }
+
+  list(): WorkspaceFinding[] {
+    const out = [...this.listed];
+    for (const [file, e] of this.perFile) {
+      if (e.omitted === 0) continue;
+      out.push({
+        severity: e.omittedError ? "error" : "warning",
+        file,
+        pointer: "",
+        message:
+          `${e.omitted} more finding(s) in this file are not listed: ` +
+          `the validator lists the first ${MAX_FINDINGS_PER_FILE} of each file`,
+      });
+    }
+    return out;
+  }
+}
 
 /** Parses one file, or reports why it does not. */
 function parseFile<T>(
   reader: WorkspaceReader,
   file: string,
   schema: Parser,
-  findings: WorkspaceFinding[],
+  findings: CappedFindings,
 ): T | undefined {
   const text = reader.read(file);
   if (text === null) return undefined;
@@ -106,10 +216,27 @@ function parseFile<T>(
     findings.push({ severity: "error", file, pointer: "", message: `not valid JSON: ${(error as Error).message}` });
     return undefined;
   }
+  if (holdsMoreThan(value, MAX_VALUES_LISTED) && !schema.validate(value)) {
+    findings.push({
+      severity: "error",
+      file,
+      pointer: "",
+      message:
+        `does not match its schema, and holds more than ${MAX_VALUES_LISTED} values, too many for ` +
+        "its problems to be listed: check a smaller copy of it to see them",
+    });
+    return undefined;
+  }
   const result = schema.safeParse(value);
   if (result.success) return result.data as T;
   const issues = (result.error as { issues: { path: PropertyKey[]; message: string }[] }).issues;
-  for (const issue of issues) {
+  for (const [index, issue] of issues.entries()) {
+    // Stop building findings at the cap rather than building them all and
+    // dropping most: building them is the cost the cap is for.
+    if (findings.full(file)) {
+      findings.omit(file, issues.length - index, "error");
+      break;
+    }
     findings.push({
       severity: "error",
       file,
@@ -127,7 +254,10 @@ const keysWithSuffix = (names: string[] | null, suffix: string): string[] =>
     .sort();
 
 /** Which file a set finding is about, given the flow it was raised for. */
-function setFindingFile(key: string, finding: SetFinding): { file: string; pointer: string } {
+function setFindingFile(
+  key: string,
+  finding: Pick<SetFinding, "document" | "path">,
+): { file: string; pointer: string } {
   switch (finding.document) {
     case "flow":
       return { file: flowPath(key), pointer: finding.path };
@@ -161,11 +291,49 @@ function unresolvedFindings(
   return findings;
 }
 
-/** Every finding over the workspace a reader exposes, errors and warnings both. */
+/**
+ * An authored `isEnabled` the runtime would not use.
+ *
+ * **The action bar does not read the document's `isEnabled`.** It asks
+ * `isEnabledEscapeFor(tableKey, actionKey)` (`actionBarModel.ts`), because
+ * `fromDocument` keeps only that the action has a predicate, not its name
+ * (a choice that keeps `ActionConfig` free of a field the
+ * corpus cannot express). So a document naming another predicate is valid,
+ * resolves, and is silently gated on the derived one instead. Every committed
+ * document agrees with the derivation, which `clearFiltersGate.test.tsx`
+ * pins; this is the check for a document written in a workspace, by hand or by
+ * a model.
+ *
+ * The table key is the file's name, which is the key the runtime is given.
+ */
+export function isEnabledFindings(tableKey: string, table: TableConfigDocument): WorkspaceFinding[] {
+  const findings: WorkspaceFinding[] = [];
+  for (const [row, actions] of actionRowsOf(table)) {
+    actions.forEach((action, index) => {
+      if (action.isEnabled === undefined) return;
+      const derived = isEnabledEscapeFor(tableKey, action.key);
+      if (action.isEnabled === derived) return;
+      findings.push({
+        severity: "error",
+        file: tableFile(tableKey),
+        pointer: `/${row}/${index}/isEnabled`,
+        message:
+          `action "${action.key}" names predicate "${action.isEnabled}", and the runtime gates it on ` +
+          `"${derived}" for this table and action, so "${action.isEnabled}" would be ignored`,
+      });
+    });
+  }
+  return findings;
+}
+
+/**
+ * Every finding over the workspace a reader exposes, errors and warnings both,
+ * at most `MAX_FINDINGS_PER_FILE` of them per file and a count of the rest.
+ */
 export function validateWorkspace(reader: WorkspaceReader, options: ValidateWorkspaceOptions): WorkspaceFinding[] {
   const { registry } = options;
   const policy = options.policy ?? defaultPolicy;
-  const findings: WorkspaceFinding[] = [];
+  const findings = new CappedFindings();
 
   // 1. Tables, alone. Every table on disk rather than only the ones a flow
   //    names: an unreferenced table with a bad document is still a bad document,
@@ -181,6 +349,7 @@ export function validateWorkspace(reader: WorkspaceReader, options: ValidateWork
         registry,
       ),
     );
+    findings.push(...isEnabledFindings(key, table));
   }
 
   // 2. Every flow document, alone.
@@ -244,16 +413,10 @@ export function validateWorkspace(reader: WorkspaceReader, options: ValidateWork
     // references over it would report missing forms that are merely unreadable.
     if (flow === undefined || actions === undefined || forms === undefined) continue;
 
-    for (const f of validateFlow(flow, policy)) {
-      findings.push({ severity: f.severity, file: flowPath(key), pointer: f.path, message: f.message });
-    }
-
-    for (const f of validateDocumentSet({ flow, actions, forms })) {
-      findings.push({ severity: f.severity, ...setFindingFile(key, f), message: f.message });
-    }
-
     // Every table the forms name is on disk and parsed. Which form names it is
     // the pointer, so an author lands on the field rather than on the file.
+    // This is the validator's half of what `FlowStore.load` meets as a read
+    // failure, so it stays here rather than in `checkFlowSet`.
     const named: Record<string, TableConfigDocument> = {};
     for (const tableKey of tableKeysOf(forms)) {
       const table = tables[tableKey];
@@ -273,29 +436,19 @@ export function validateWorkspace(reader: WorkspaceReader, options: ValidateWork
       }
     }
 
-    for (const f of validateTableActions(actions, forms, named)) {
+    // `load`'s checks, by calling them. Every stage is reported rather
+    // than the first that fails, each finding at the file it is about.
+    for (const f of checkFlowSet({ flow, actions, forms }, named, { registry, policy }, key)) {
+      // A table's escapes were reported in step 1 for every table on disk, so
+      // the copy each flow naming the table would add is dropped.
+      if (f.stage === "escapes" && f.document === "tables") continue;
       const located = setFindingFile(key, f);
-      findings.push({ severity: f.severity, ...located, message: `${f.message} (in flow "${key}")` });
+      const message = f.stage === "tables" ? `${f.message} (in flow "${key}")` : f.message;
+      findings.push({ severity: f.severity, ...located, message });
     }
-
-    // Escapes. `escapeReferences` writes pointers without a file — the
-    // initializer is the flow's, a step is the action document's — and
-    // `formEscapeReferences` prefixes its own; both are split back here.
-    const references: { file: string; ref: EscapeReferences }[] = [];
-    for (const ref of escapeReferences(flow, actions)) {
-      references.push({ file: ref.at.startsWith("/actions/") ? actionPath(key) : flowPath(key), ref });
-    }
-    for (const ref of formEscapeReferences(forms, key)) {
-      const prefix = formPath(key);
-      references.push({
-        file: prefix,
-        ref: { ...ref, at: ref.at.startsWith(prefix) ? ref.at.slice(prefix.length) : ref.at },
-      });
-    }
-    findings.push(...unresolvedFindings(references, registry));
   }
 
-  return findings;
+  return findings.list();
 }
 
 /** `file#pointer`, the form a finding is printed in. */

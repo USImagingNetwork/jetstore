@@ -1,5 +1,5 @@
 /**
- * The flow engine. Task S.5.
+ * The flow engine.
  *
  * A port of `modules/actions/user_flow_actions.dart` — 187 lines of Dart, and
  * the smallest piece of this whole phase. It is a switch over six action keys
@@ -24,7 +24,7 @@
  * `next()` returns null when no choice matched and there is no default. The Dart
  * logs and returns an error string; the state machine stays where it is. That is
  * reproduced — a flow that cannot advance is not a flow that should advance
- * somewhere arbitrary — and S.1's schema makes it unreachable for a *non-end*
+ * somewhere arbitrary — and the schema makes it unreachable for a *non-end*
  * state by requiring choices or a default, so it can now only happen when every
  * choice evaluates false.
  */
@@ -146,9 +146,9 @@ export const startAt = (flow: UserFlow): FlowPosition => ({
 });
 
 /**
- * Where a run begins when the url names a state. Task D.10, from **I-260**.
+ * Where a run begins when the url names a state, from a defect report.
  *
- * **Three answers, and the two that are not taken are the interesting ones.**
+ * **Two decisions, each made against a plausible alternative.**
  *
  * - **A state the flow does not declare throws**, rather than falling back to
  *   `startAt`. The fallback is the plausible failure: a user who pressed *Load
@@ -158,19 +158,40 @@ export const startAt = (flow: UserFlow): FlowPosition => ({
  *   operator who renamed a state in a workspace document needs to see. It is the
  *   same refusal `resolveEscapes` makes for an unresolved name and `reactFlowRoute`
  *   makes for a partial argument list.
- * - **`visited` is the requested state alone, not the flow's own start followed
- *   by it.** Seeding the stack would make *Previous* show a page this entry point
- *   exists to skip — a step the user never saw, appearing from behind them, with
- *   the choice they made on another screen presented again as a table. So
- *   `ufPrevious` refuses here, exactly as it refuses on any flow's first page.
- *   The cost is real and is a page the run does not have rather than one it lost.
+ * - **`visited` is the flow's own pages up to the requested state**, along
+ *   their default transitions, so *Previous* reaches the pages the entry point
+ *   skipped. Until 2026-11-11 it was the requested state alone, on the reasoning
+ *   that a skipped page should not appear from behind the user. `loadFilesUF`
+ *   showed the cost: its first page is the only place *Drop Staging Table* is,
+ *   and its only entry point opens it on the second, so that button could not be
+ *   reached at all. A skipped page is skipped for the common case, not removed.
+ *   When the requested state is not on the default path (it is reached only
+ *   through a choice), there is no single page behind it and the stack is the
+ *   requested state alone, as before.
  */
 export function startAtPosition(flow: UserFlow, requested: string | null): FlowPosition {
   if (requested === null || requested === flow.startAtKey) return startAt(flow);
   if (flow.states[requested] === undefined) {
     throw new FlowError(`this flow has no state "${requested}" to start at`);
   }
-  return { stateKey: requested, visited: [requested] };
+  return { stateKey: requested, visited: defaultPathTo(flow, requested) ?? [requested] };
+}
+
+/**
+ * The states from the flow's start to `target` along `defaultNextState`, both
+ * ends included, or null when the default path does not reach it. Stops at a
+ * state it has already visited, so a document whose defaults loop cannot hang.
+ */
+function defaultPathTo(flow: UserFlow, target: string): string[] | null {
+  const path: string[] = [];
+  let key: string | undefined = flow.startAtKey;
+  while (key !== undefined && !path.includes(key)) {
+    path.push(key);
+    if (key === target) return path;
+    const state: State | undefined = flow.states[key];
+    key = state !== undefined && "defaultNextState" in state ? state.defaultNextState : undefined;
+  }
+  return null;
 }
 
 export interface StepRequest {
@@ -182,7 +203,7 @@ export interface StepRequest {
    * Runs the state's `stateAction`, if it has one.
    *
    * Returns whether the action completed as well as what to say, because the flow
-   * may only move when it did — see `step`, and I-29.
+   * may only move when it did — see `step`.
    */
   runStateAction(name: string): Promise<ActionResult>;
   /** Runs the form's validators. False stops without failing. */
@@ -204,7 +225,7 @@ export interface StepResult {
  * The order inside `ufNext` and `ufCompleted` is the Dart's and is load-bearing:
  * **validate, then run the state's action, then move.**
  *
- * ## A failed action no longer advances — I-29, fixed 2026-08-26
+ * ## A failed action no longer advances — fixed 2026-08-26
  *
  * It used to. The Dart logs the error and carries on
  * (`user_flow_actions.dart:62`), so a state whose action posts and gets a 500
@@ -214,7 +235,7 @@ export interface StepResult {
  * to be the Flutter app** and changing when a flow advances is a behaviour change
  * rather than a translation.
  *
- * **That reasoning expired when the Flutter app did** (track X, 2026-08-26).
+ * **That reasoning expired when the Flutter app did** (2026-08-26).
  * There is nothing left to be faithful to, and what remained was an application
  * that tells a user their work is saved when it is not — now in front of real
  * users, which it was not when the entry was written.
@@ -278,7 +299,7 @@ export async function step(action: StandardAction, request: StepRequest): Promis
         return stay(`No next step from "${position.stateKey}"`);
       }
       if (flow.states[to] === undefined) {
-        // S.4 refuses this at save time; reaching it means a flow was loaded
+        // The Go validator refuses this at save time; reaching it means a flow was loaded
         // from somewhere that did not check.
         throw new FlowError(`state "${position.stateKey}" transitions to "${to}", which does not exist`);
       }

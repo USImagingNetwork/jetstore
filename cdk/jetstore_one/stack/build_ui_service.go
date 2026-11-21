@@ -54,8 +54,6 @@ func (jsComp *JetStoreStackComponents) BuildUiService(scope constructs.Construct
 		"JETS_ENCRYPTION_KEY_SECRET":    jsComp.EncryptionKeySecret.SecretName(),
 		"JETS_DOMAIN_KEY_HASH_ALGO":     jsii.String(os.Getenv("JETS_DOMAIN_KEY_HASH_ALGO")),
 		"JETS_DOMAIN_KEY_HASH_SEED":     jsii.String(os.Getenv("JETS_DOMAIN_KEY_HASH_SEED")),
-		"JETS_INPUT_ROW_JETS_KEY_ALGO":  jsii.String(os.Getenv("JETS_INPUT_ROW_JETS_KEY_ALGO")),
-		"JETS_INVALID_CODE":             jsii.String(os.Getenv("JETS_INVALID_CODE")),
 		"JETS_REGION":                   jsii.String(os.Getenv("AWS_REGION")),
 		"JETS_PIVOT_YEAR_TIME_PARSING":  jsii.String(os.Getenv("JETS_PIVOT_YEAR_TIME_PARSING")),
 		"JETS_s3_INPUT_PREFIX":          jsii.String(os.Getenv("JETS_s3_INPUT_PREFIX")),
@@ -102,12 +100,18 @@ func (jsComp *JetStoreStackComponents) BuildUiService(scope constructs.Construct
 		// string explicitly, so adding this line changes nothing for a deployment that
 		// does not set the variable.
 		"JETS_NO_GIT_ACCESS": jsii.String(os.Getenv("JETS_NO_GIT_ACCESS")),
+		// The IDE code guard's off switch (jets/dblogin/codeguard.go): "off", in any
+		// case, makes the apiserver, and the update_db it starts, drop the event trigger
+		// jets_ide_code_guard at start; empty or anything else keeps it on. Passed to
+		// every component that can call dblogin.Ensure (the run_reports task and
+		// Lambdas, the compute-pipes nodes), so none re-installs a guard switched off.
+		"JETS_IDE_CODE_GUARD": jsii.String(os.Getenv("JETS_IDE_CODE_GUARD")),
 		// The deployment's own Pipeline Status buttons, served by the apiserver at login
 		// and rendered by the React app after the built-in buttons of the table's last
 		// row. A deployment setting so that no workspace document can name them; see the
 		// variable's entry in jetstore_one.go. Like every os.Getenv entry above, an unset
 		// variable arrives here present and empty, and the apiserver reads empty as "no
-		// custom buttons". Added 2026-10-01 (jetstore_maintenance_02, D04): nothing had
+		// custom buttons". Added 2026-10-01: nothing had
 		// read the variable since the Flutter app that compiled it in was deleted.
 		"JETS_CUSTOM_BUTTONS_CONFIG_JSON": jsii.String(os.Getenv("JETS_CUSTOM_BUTTONS_CONFIG_JSON")),
 	}
@@ -168,13 +172,22 @@ func (jsComp *JetStoreStackComponents) BuildUiService(scope constructs.Construct
 		ReadOnly:      jsii.Bool(false),
 	})
 
-	jsComp.EcsUiService = awsecs.NewFargateService(stack, jsii.String("jetstore-ui"), &awsecs.FargateServiceProps{
+	uiServiceProps := &awsecs.FargateServiceProps{
 		Cluster:        jsComp.EcsCluster,
 		ServiceName:    jsii.String("jetstore-ui"),
 		TaskDefinition: jsComp.UiTaskDefinition,
 		VpcSubnets:     jsComp.PrivateSubnetSelection,
 		AssignPublicIp: jsii.Bool(false),
 		DesiredCount:   jsii.Number(1),
+		// A new task that never becomes healthy (a failed startup compile, say) stops the
+		// deployment and rolls back to the previous task definition, instead of being
+		// relaunched until CloudFormation's stabilisation wait fails the stack update.
+		// The old task keeps serving either way: minimum healthy is 50%, which ECS rounds up
+		// to one task when DesiredCount is 1. A slow start is covered by the grace period
+		// below, not by the breaker, whose failure count ECS fixes (3 tasks at this size).
+		CircuitBreaker: &awsecs.DeploymentCircuitBreaker{
+			Rollback: jsii.Bool(true),
+		},
 		SecurityGroups: &[]awsec2.ISecurityGroup{
 			jsComp.VpcEndpointsSg,
 			jsComp.RdsAccessSg,
@@ -182,7 +195,12 @@ func (jsComp *JetStoreStackComponents) BuildUiService(scope constructs.Construct
 			// Add git access security group to allow outbound access to git providers
 			// for pulling workspace definitions
 			NewGitAccessSecurityGroup(stack, jsComp.Vpc)},
-	})
+	}
+	if secs := UiHealthCheckGracePeriodSec(); secs != nil {
+		// Health check failures are ignored this long after a task starts; unset is CDK's 60s
+		uiServiceProps.HealthCheckGracePeriod = awscdk.Duration_Seconds(jsii.Number(float64(*secs)))
+	}
+	jsComp.EcsUiService = awsecs.NewFargateService(stack, jsii.String("jetstore-ui"), uiServiceProps)
 	if phiTagName != nil {
 		awscdk.Tags_Of(jsComp.EcsUiService).Add(phiTagName, jsii.String("true"), nil)
 	}

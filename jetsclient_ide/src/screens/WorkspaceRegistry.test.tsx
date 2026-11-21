@@ -1,7 +1,7 @@
 /**
  * @vitest-environment jsdom
  *
- * **C.2b's exit condition: a non-flow screen runs in the app.**
+ * **The first non-flow screen runs in the app.**
  *
  * On `FlowRunner.test.tsx`'s shape and for its reason. The documents, the
  * schemas, the interpreter and the widgets are all tested elsewhere; what is
@@ -14,14 +14,14 @@
  * Everything below the api client is real. The only stub is `fetch`, answering as
  * the apiserver's `/dataTable` switch does.
  *
- * **I-104 is why these render rather than parse.** A field added to a schema has
+ * **These render rather than parse, deliberately.** A field added to a schema has
  * two halves and the corpus can only tell you about the first; the half that bit
- * F.5 was a document that validated, round-tripped and drew nothing.
+ * an earlier change was a document that validated, round-tripped and drew nothing.
  *
  * **Back on this screen since 2026-10-15.** From 2026-10-11 the buttons that
  * need a workspace were on the Workspace IDE's toolbar (`WorkspaceToolbar.tsx`),
  * and the cases for them mounted the toolbar. They returned to the registry at
- * Michel's request, because a compile started from the IDE showed no progress
+ * request, because a compile started from the IDE showed no progress
  * there: the compile's status is on this table. So those cases select a row
  * again, and keep what the toolbar taught them — Export refused only for
  * `local workspace removed`, the three git buttons ungated, and the flows
@@ -77,8 +77,8 @@ function stubServer(active = { name: "jets_ws", branch: "jets_ai", uri: "git@exa
       return new Response(
         JSON.stringify({
           token: "t0",
-          name: "Michel",
-          user_email: "michel@artisoft.io",
+          name: "Test User",
+          user_email: "user@example.com",
           is_admin: false,
           capabilities: ["workspace_ide"],
         }),
@@ -99,7 +99,7 @@ function stubServer(active = { name: "jets_ws", branch: "jets_ai", uri: "git@exa
         );
       // **The table's own read, and the arm name is the assertion.** A document
       // with no `apiAction` would arrive here as `read` and this stub would 422 —
-      // which is the whole of what C.2a's enum buys, tested from the wire rather
+      // which is the whole of what the `apiAction` enum buys, tested from the wire rather
       // than from the schema.
       //
       // The IDE's toolbar reads one workspace's row through the same query with a
@@ -140,7 +140,7 @@ function LocationProbe() {
 async function mount(active?: { name: string; branch: string; uri: string }) {
   const { fetchImpl, posts } = stubServer(active);
   const api = new ApiClient("", fetchImpl);
-  await api.login("michel@artisoft.io", "pw");
+  await api.login("user@example.com", "pw");
 
   render(
     <ApiProvider api={api}>
@@ -149,7 +149,7 @@ async function mount(active?: { name: string; branch: string; uri: string }) {
           <Banners />
           <MemoryRouter initialEntries={["/workspaces"]}>
             {/* Surfaces the in-app location so the Open button's destination can be
-                asserted rather than inferred from a banner (C.3). */}
+                asserted rather than inferred from a banner. */}
             <LocationProbe />
             <Routes>
               <Route path="/workspaces" element={<WorkspaceRegistry api={api} />} />
@@ -174,7 +174,7 @@ async function mount(active?: { name: string; branch: string; uri: string }) {
 async function mountToolbar(workspace: string) {
   const { fetchImpl, posts } = stubServer();
   const api = new ApiClient("", fetchImpl);
-  await api.login("michel@artisoft.io", "pw");
+  await api.login("user@example.com", "pw");
 
   render(
     <ApiProvider api={api}>
@@ -212,12 +212,10 @@ const REGISTRY_ROWS = [
 /**
  * Selects the row whose workspace name is given, and waits for it to stick.
  *
- * **The wait is not politeness.** Publishing a selection notifies the form store,
- * which rebuilds the query context inside `useTableBinding` and refetches; the
- * reply clears the selection and an effect restores it from form state one tick
- * later (I-185). So a synchronous assertion after this call reads the table
- * mid-sequence, which is a race rather than a failure — and it is exactly the
- * flake I-104 recorded, arriving from the other side.
+ * The wait was needed while a tick refetched the table: the reply cleared the
+ * selection and an effect restored it from form state a moment later. A tick
+ * sends no request since November 2026 (`WorkspaceRegistry.tick.test.tsx`), and
+ * the wait is kept because it costs nothing.
  */
 async function selectRow(name: string) {
   const row = screen.getByText(name).closest("tr")!;
@@ -271,7 +269,8 @@ describe("the screen", () => {
     await mount();
     // The second row is where Compile, Rules Unit Tests, Commit, Push, Pull and
     // the three git buttons live. Rendering one bar would have lost nine of the
-    // fourteen and looked like a working screen, which is I-104's second finding.
+    // fourteen and looked like a working screen: a contract tested from the end
+    // that could not fail.
     // From 2026-10-11 to 2026-10-15 the table drew four and the IDE's toolbar the
     // rest; this is the layout from before, restored.
     const groups = screen.getAllByRole("group");
@@ -307,7 +306,7 @@ describe("the screen", () => {
 
     // And this is the active workspace on its base branch: its status ends
     // `feature branch missing or removed`, which a bare `removed` gate read as a
-    // removed workspace and refused Export for (Michel, 2026-10-11). The three
+    // removed workspace and refused Export for (2026-10-11). The three
     // git buttons have no gate at all since the same evening.
     expect(button("Export Client Config").hasAttribute("disabled")).toBe(false);
     for (const label of ["Commit & Push Workspace", "Push Only", "Pull Workspace"]) {
@@ -325,15 +324,15 @@ describe("the screen", () => {
     await mount();
     await selectRow("initech_ws");
     // `in progress` refuses the seven with a status gate; the three git buttons
-    // have none since 2026-10-11 (Michel: always enabled).
+    // have none since 2026-10-11 (always enabled).
     //
     // **Wait on the button that becomes *enabled*, not on one that becomes
     // disabled.** This waited on `Open` being disabled, which is also true with
     // no row selected at all — so the wait returned before the selection landed
     // and the assertions below raced the restore, failing about two runs in five.
-    // That is I-104's shape in a `waitFor` predicate: a condition satisfied by the
-    // state you are waiting to leave is not a wait. Found by C.3 running the suite
-    // repeatedly for its own flake check; the case itself is C.2b's and correct.
+    // That is a check that cannot fail, in a `waitFor` predicate: a condition
+    // satisfied by the state you are waiting to leave is not a wait. Found by
+    // running the suite repeatedly as a flake check; the case itself is correct.
     await waitFor(() => expect(button("Push Only").hasAttribute("disabled")).toBe(false));
     for (const label of [
       "Open", "Export Client Config", "Load Client Config", "Delete",
@@ -391,7 +390,7 @@ describe("every dialog the table can open", () => {
   });
 
   it("carries workspace_ide on the six OK buttons and on neither Cancel", async () => {
-    // **The capability no corpus reports** (I-180): `FormConfig.actions` is a
+    // **The capability no corpus reports**: `FormConfig.actions` is a
     // container `allFields` does not walk, so these six declarations exist in the
     // Dart and in the transcription and in no generated fixture. Asserting them
     // here is the only mechanical check they have.
@@ -442,7 +441,7 @@ describe("the dialog host", () => {
     expect(sent["fromClauses"]).toEqual([{ table: "commit_workspace" }]);
     expect(sent["workspaceName"]).toBe("globex_ws");
     const row = (sent["data"] as Record<string, unknown>[])[0]!;
-    expect(row["user_email"]).toBe("michel@artisoft.io");
+    expect(row["user_email"]).toBe("user@example.com");
     // `last_git_log` is redacted on the way out, which the Dart does at every one
     // of these arms — the log can be a megabyte and the server does not read it.
     expect(row["last_git_log"]).toBe("redacted");
@@ -479,6 +478,70 @@ describe("the dialog host", () => {
     expect(screen.queryByRole("dialog")).not.toBeNull();
   });
 
+  it("opens each time from the row and the document, not from what a cancelled open typed", async () => {
+    const { posts } = await mount();
+    await selectRow("globex_ws");
+    await waitFor(() => expect(button("Commit & Push Workspace").hasAttribute("disabled")).toBe(false));
+    fireEvent.click(button("Commit & Push Workspace"));
+    let dialog = await screen.findByRole("dialog");
+    fireEvent.change(within(dialog).getByLabelText(/Commit Message/), { target: { value: "half typed" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+
+    fireEvent.click(button("Commit & Push Workspace"));
+    dialog = await screen.findByRole("dialog");
+    expect((within(dialog).getByLabelText(/Commit Message/) as HTMLInputElement).value).toBe(
+      "Commit from JetStore UI",
+    );
+    fireEvent.click(within(dialog).getByRole("button", { name: "Commit & Push" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    const posted = posts.filter((p) => p.body["action"] === "workspace_insert_rows");
+    expect(posted).toHaveLength(1);
+    const row = (posted[0]!.body["data"] as Record<string, unknown>[])[0]!;
+    expect(row["git.commit.message"]).toBe("Commit from JetStore UI");
+  });
+
+  it("still posts the selected row's keys the dialog does not show, on an update", async () => {
+    // `previous.workspace_name` is published by the table's selection and is in
+    // no `navigationParams`: it is how an update that renames a workspace finds
+    // the row. A dialog with a state of its own has to carry it over.
+    const { posts } = await mount();
+    await selectRow("globex_ws");
+    await waitFor(() => expect(button("Add/Update").hasAttribute("disabled")).toBe(false));
+    fireEvent.click(button("Add/Update"));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(within(dialog).getByLabelText(/Workspace Name/), { target: { value: "globex2_ws" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Add / Update" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    const posted = posts.filter((p) => p.body["action"] === "workspace_insert_rows");
+    expect(posted).toHaveLength(1);
+    expect(posted[0]!.body["fromClauses"]).toEqual([{ table: "update/workspace_registry" }]);
+    const row = (posted[0]!.body["data"] as Record<string, unknown>[])[0]!;
+    expect(row["workspace_name"]).toBe("globex2_ws");
+    expect(row["previous.workspace_name"]).toBe("globex_ws");
+    expect(row["key"]).toBe("2");
+  });
+
+  it("leaves the screen's selection as it was when a dialog is cancelled", async () => {
+    // The dialog's typed name must not reach the state the row buttons act on:
+    // Compile, which is not a dialog, reads the workspace name from it.
+    const { posts } = await mount();
+    await selectRow("globex_ws");
+    await waitFor(() => expect(button("Add/Update").hasAttribute("disabled")).toBe(false));
+    fireEvent.click(button("Add/Update"));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(within(dialog).getByLabelText(/Workspace Name/), { target: { value: "typed_ws" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+
+    fireEvent.click(button("Compile Workspace"));
+    await waitFor(() =>
+      expect(posts.some((p) => p.body["action"] === "workspace_insert_rows")).toBe(true),
+    );
+    const compile = posts.find((p) => p.body["action"] === "workspace_insert_rows")!;
+    expect(compile.body["workspaceName"]).toBe("globex_ws");
+  });
+
   it("closes on Escape, which is what the Dart's dismissible barrier does", async () => {
     await mount();
     await selectRow("globex_ws");
@@ -507,7 +570,7 @@ describe("isReadOnlyFrom — the closures the corpus could only report as boolea
     expect((within(dialog).getByLabelText(/Workspace Name/) as HTMLInputElement).readOnly).toBe(true);
     expect((within(dialog).getByLabelText(/Workspace Branch/) as HTMLInputElement).readOnly).toBe(true);
     // The uri predicate is a different body and this deployment has no uri.
-    expect((within(dialog).getByLabelText(/Worksapce URI/) as HTMLInputElement).readOnly).toBe(false);
+    expect((within(dialog).getByLabelText(/Workspace URI/) as HTMLInputElement).readOnly).toBe(false);
   });
 
   it("leaves another workspace's name editable", async () => {
@@ -573,8 +636,8 @@ describe("the actions that are not dialogs", () => {
   });
 
   /**
-   * **I-183, closed by C.3 — and the case changed shape rather than being
-   * deleted.** It asserted that Open *reports* instead of navigating, because the
+   * **Closed once the workspace home existed — and the case changed shape rather
+   * than being deleted.** It asserted that Open *reports* instead of navigating, because the
    * destination did not exist; it now asserts where it goes. What is kept from the
    * original is the second assertion: the escape does **not** post
    * `workspace_query_structure`.
@@ -599,7 +662,7 @@ describe("the actions that are not dialogs", () => {
   /**
    * The three flows, and where they come back to. Since 2026-10-11 none of
    * `loadConfigUF`, `workspacePullUF` and `rulesUnitTestUF` names an
-   * `exitScreenPath`, so each returns where it was launched (D.8's `returnTo`):
+   * `exitScreenPath`, so each returns where it was launched (its `returnTo`):
    * here, now that the buttons are here again.
    */
   it.each([
@@ -618,6 +681,26 @@ describe("the actions that are not dialogs", () => {
       expect(screen.getByTestId("location").textContent).toBe(`${path}&returnTo=%2Fworkspaces`),
     );
   });
+
+  it("opens Pull Workspace for a row with no repository URI or feature branch", async () => {
+    // A workspace registered with no repository: the URI is NULL. The button used
+    // to report that "/pullWorkspaceUF/5/bare_ws/main//" is not served.
+    rows.push(["5", "bare_ws", "main", null, null, "No repository", "active", "", "u@x", "now"]);
+    try {
+      await mount();
+      await selectRow("bare_ws");
+      await waitFor(() => expect(button("Pull Workspace").hasAttribute("disabled")).toBe(false));
+      fireEvent.click(button("Pull Workspace"));
+      await waitFor(() =>
+        expect(screen.getByTestId("location").textContent).toBe(
+          "/flow/workspacePullUF?key=5&workspace_name=bare_ws&workspace_branch=main&feature_branch=&workspace_uri=&returnTo=%2Fworkspaces",
+        ),
+      );
+      expect(screen.queryByRole("alert")).toBeNull();
+    } finally {
+      rows.pop();
+    }
+  });
 });
 
 describe("the export dialog's item query", () => {
@@ -628,7 +711,7 @@ describe("the export dialog's item query", () => {
     fireEvent.click(button("Export Client Config"));
     const dialog = await screen.findByRole("dialog");
     await waitFor(() => expect(within(dialog).getByText("acme")).toBeTruthy());
-    // I.2b's transport: one `raw_query_map`, the literal prompt item kept in
+    // The dropdown's transport: one `raw_query_map`, the literal prompt item kept in
     // front of the rows.
     expect(posts.some((p) => p.body["action"] === "raw_query_map")).toBe(true);
     expect(within(dialog).getByText("Select a Client")).toBeTruthy();

@@ -1,17 +1,17 @@
 /**
  * @vitest-environment jsdom
  *
- * Rendering tests for the data table (task A.4b).
+ * Rendering tests for the data table.
  *
  * The environment is set per file rather than globally so the rest of the suite
  * keeps running in node, where it is faster and where a DOM would only hide a
  * dependency on one.
  *
- * **A.4b's exit condition is "renders any of the 37 configurations, driven by
- * A.4a, against a live apiserver."** The first two clauses are tested here: the
- * sweep at the bottom renders every configuration in the corpus, and the fetcher
- * asserts the payload it is handed is A.4a's. The third is not — there is no
- * apiserver in this environment. Issue I-7.
+ * **The table's exit condition is "renders any of the 37 configurations, driven
+ * by the query builder, against a live apiserver."** The first two clauses are
+ * tested here: the sweep at the bottom renders every configuration in the corpus,
+ * and the fetcher asserts the payload it is handed is `makeQuery`'s. The third is
+ * not — there is no apiserver in this environment; `live.test.ts` covers it.
  */
 
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -21,6 +21,9 @@ import corpus from "./fixtures/table_configs.json";
 import { DataTable } from "./DataTable";
 import { useDataTable, type DataTableFetcher, type DataTableResponse } from "./useDataTable";
 import type { JetsRow, TableConfig } from "./types";
+
+/** A row's own box, and not the heading's select-all box. */
+const ROW_BOX = /^Select row /;
 
 const tables = corpus.tables as unknown as Record<string, TableConfig>;
 
@@ -97,7 +100,7 @@ describe("DataTable", () => {
     expect(lastCall["sortAscending"]).toBe(true);
   });
 
-  it("hands the fetcher exactly what A.4a builds", async () => {
+  it("hands the fetcher exactly what makeQuery builds", async () => {
     const fetcher = respondWith([]);
     render(<Harness config={sourceConfig} fetcher={fetcher} />);
     await waitFor(() => expect(fetcher).toHaveBeenCalled());
@@ -120,7 +123,7 @@ describe("DataTable", () => {
     render(<Harness config={sourceConfig} fetcher={respondWith(rows)} />);
     await screen.findByText("st1");
 
-    const boxes = screen.getAllByRole("checkbox") as HTMLInputElement[];
+    const boxes = screen.getAllByRole("checkbox", { name: ROW_BOX }) as HTMLInputElement[];
     fireEvent.click(boxes[0]!);
     await waitFor(() => expect(boxes[0]!.checked).toBe(true));
 
@@ -133,12 +136,39 @@ describe("DataTable", () => {
     const config = tables["lfFileKeyStagingTable"]!;
     const row = (k: string): JetsRow => [k, "acme", "v", "t", "f", "2026", "8", "1", "p", "tbl", "s", "d", "spk"];
     render(<Harness config={config} fetcher={respondWith([row("1"), row("2")])} />);
-    await waitFor(() => expect(screen.getAllByRole("checkbox").length).toBe(2));
+    await waitFor(() => expect(screen.getAllByRole("checkbox", { name: ROW_BOX }).length).toBe(2));
 
-    const boxes = screen.getAllByRole("checkbox") as HTMLInputElement[];
+    const boxes = screen.getAllByRole("checkbox", { name: ROW_BOX }) as HTMLInputElement[];
     fireEvent.click(boxes[0]!);
     fireEvent.click(boxes[1]!);
     await waitFor(() => expect(boxes[0]!.checked && boxes[1]!.checked).toBe(true));
+  });
+
+  it("selects and clears every row of the page with the heading's box", async () => {
+    const config = tables["lfFileKeyStagingTable"]!;
+    const row = (k: string): JetsRow => [k, "acme", "v", "t", "f", "2026", "8", "1", "p", "tbl", "s", "d", "spk"];
+    render(<Harness config={config} fetcher={respondWith([row("1"), row("2"), row("3")])} />);
+    await waitFor(() => expect(screen.getAllByRole("checkbox", { name: ROW_BOX }).length).toBe(3));
+    const all = screen.getByRole("checkbox", { name: "Select all rows on this page" }) as HTMLInputElement;
+    const boxes = () => screen.getAllByRole("checkbox", { name: ROW_BOX }) as HTMLInputElement[];
+
+    // One row ticked: the heading is mixed, and pressing it selects the rest.
+    fireEvent.click(boxes()[1]!);
+    await waitFor(() => expect(all.indeterminate).toBe(true));
+    expect(all.checked).toBe(false);
+    fireEvent.click(all);
+    await waitFor(() => expect(boxes().every((b) => b.checked)).toBe(true));
+    expect(all.checked).toBe(true);
+    expect(all.indeterminate).toBe(false);
+
+    fireEvent.click(all);
+    await waitFor(() => expect(boxes().some((b) => b.checked)).toBe(false));
+  });
+
+  it("has no select-all box on a single-select table", async () => {
+    render(<Harness config={sourceConfig} fetcher={respondWith([["1", "acme", "v", "t", "st1", "csv", "d"]])} />);
+    await screen.findByText("st1");
+    expect(screen.queryByRole("checkbox", { name: "Select all rows on this page" })).toBeNull();
   });
 
   it("pages through the server's rows, and lands on the real last page", async () => {
@@ -159,7 +189,7 @@ describe("DataTable", () => {
   it("disables the paging buttons at the ends", async () => {
     // **50 rows at 20 per page, where this asked for 5.** With 5 the table had
     // one page, so *both ends* were the same end and the assertion held for a
-    // reason it was not testing — and since D.11 a one-page table draws no
+    // reason it was not testing — and now a one-page table draws no
     // footer at all, which is what turned a weak test into a failing one. Three
     // pages, on the first: the backward pair is disabled and the forward pair is
     // not, which is the claim the name makes.
@@ -172,7 +202,7 @@ describe("DataTable", () => {
   });
 
   it("draws no footer at all for a table that fits on one page", async () => {
-    // D.11. The footer is paging apparatus; 5 rows at 20 per page have no pages
+    // The footer is paging apparatus; 5 rows at 20 per page have no pages
     // to move between, and the four buttons were rendered permanently disabled
     // beside a range that read `1–5 of 5`.
     render(<Harness config={sourceConfig} fetcher={respondWith([["1", "a", "v", "t", "s", "c", "d"]], 5)} />);
@@ -183,7 +213,7 @@ describe("DataTable", () => {
   });
 
   it("blanks the column header of a one-column table that already has a caption", async () => {
-    // **D.11.** `ufClientOrVendorOption` captioned itself *Select one of the
+    // `ufClientOrVendorOption` captioned itself *Select one of the
     // following options:* and its single column header read *Select one of the
     // following option* — the same sentence, one letter shorter. **9 of the 35
     // installed documents had exactly one visible column and the header was
@@ -192,7 +222,7 @@ describe("DataTable", () => {
     //
     // **On `input_format` since 2026-10-01**, which carries the same column
     // header under a different caption: `ufClientOrVendorOption` was retired with
-    // the step that drew it (`jetstore_maintenance_02` `AF.2`, `D06`). The
+    // the step that drew it. The
     // structural rule is what is under test, so a caption that does *not* repeat
     // the header is the stronger case rather than a weaker one.
     const config = tables["input_format"]!;

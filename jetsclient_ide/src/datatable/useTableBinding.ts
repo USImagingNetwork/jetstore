@@ -1,5 +1,6 @@
 /**
- * Wires a data table to the enclosing form: A.4b's state plus A.4c's binding.
+ * Wires a data table to the enclosing form: `useDataTable`'s state plus the
+ * form-state binding.
  *
  * This is the sequencing layer. Every decision it makes lives in `binding.ts` as
  * a pure function; what is here is *when* they run, which is the part the
@@ -23,7 +24,6 @@ import {
   type FormField,
 } from "./binding";
 import type { FormState } from "./formState";
-import { keepSelectedRows } from "./model";
 import { refreshTable, useTableModes, type TableModes } from "./modes";
 import { useDataTable, type DataTableFetcher, type DataTableState } from "./useDataTable";
 import { selectedClient, subscribeToClient } from "../shell/selectedClient";
@@ -34,7 +34,7 @@ export interface UseTableBindingOptions {
   field: FormField;
   formState: FormState;
   fetcher: DataTableFetcher;
-  /** Route params and the selected client — everything A.4a needs besides the form. */
+  /** Route params and the selected client — everything the query builder needs besides the form. */
   context?: Omit<
     QueryContext,
     | "config"
@@ -51,10 +51,10 @@ export interface UseTableBindingOptions {
 /**
  * The table's state, plus the two things only the widget itself can do.
  *
- * `modes` and `refresh` are A.5's: the four configured actions the sizing found
- * misfiled into S.2 (`toggleCheckboxVisible` ×3, `refreshTable` ×1) act on the
- * table rather than on a flow, so the widget owns the behaviour and S.2b's
- * action bar only has to find it here.
+ * `modes` and `refresh` are the widget's own: the four configured actions that
+ * were misfiled among the flow actions (`toggleCheckboxVisible` ×3,
+ * `refreshTable` ×1) act on the table rather than on a flow, so the widget owns
+ * the behaviour and the action bar only has to find it here.
  */
 export interface TableBinding extends DataTableState {
   modes: TableModes;
@@ -63,7 +63,7 @@ export interface TableBinding extends DataTableState {
 }
 
 /**
- * A form-state table's rows, out of the form. Task C.9.
+ * A form-state table's rows, out of the form.
  *
  * The React half of the Dart's two model branches
  * (`jetsclient/lib/components/data_table_source.dart`, the `modelStateFormKey` and
@@ -168,14 +168,14 @@ export function useTableBinding(options: UseTableBindingOptions): TableBinding {
   );
 
   /**
-   * The client filter, defaulted here rather than required of every caller. D.3.
+   * The client filter, defaulted here rather than required of every caller.
    *
-   * **`makeQuery` has implemented this since A.4a** — it adds the implicit
+   * **`makeQuery` has always implemented this** — it adds the implicit
    * `WHERE client = $n` when `selectedClient` is set *and* the table has a
-   * `client` column — and until D.3 exactly one caller passed it, `Home.tsx`.
-   * So the filter narrowed the Home screen's tables and silently did nothing on
-   * every other screen and in every flow, which is **I-259**'s note: it must
-   * apply to *"all tables in user flows that have the column `client`"*.
+   * `client` column — and until this default exactly one caller passed it,
+   * `Home.tsx`. So the filter narrowed the Home screen's tables and silently did
+   * nothing on every other screen and in every flow, against the report's
+   * requirement: it must apply to *"all tables in user flows that have the column `client`"*.
    *
    * **Defaulted rather than added to each call site**, because the call sites are
    * the thing that keeps growing: a screen or a flow table that forgets the
@@ -202,7 +202,7 @@ export function useTableBinding(options: UseTableBindingOptions): TableBinding {
     fetcher,
     blocked,
     refreshToken,
-    onSelectionChange: ({ rows, deselected, changedIndex, selected }) => {
+    onSelectionChange: ({ rows, deselected, changedIndex, selected, changed }) => {
       const fsc = config.formStateConfig;
       if (!fsc) return;
       // Single-select clears the previous rows first, and each has to be
@@ -212,8 +212,12 @@ export function useTableBinding(options: UseTableBindingOptions): TableBinding {
         const row = rows[index];
         if (row) publishSelection(formState, field, fsc, row, false);
       }
-      const row = rows[changedIndex];
-      if (row) publishSelection(formState, field, fsc, row, selected);
+      // The select-all box changes many rows at once; they are published one by
+      // one, and the listeners told once.
+      for (const index of changed ?? [changedIndex]) {
+        const row = rows[index];
+        if (row) publishSelection(formState, field, fsc, row, selected);
+      }
       formState.notifyListeners();
     },
   });
@@ -227,11 +231,9 @@ export function useTableBinding(options: UseTableBindingOptions): TableBinding {
     refreshTable(
       {
         setPage: state.setPage,
-        setRowsPerPage: state.setRowsPerPage,
         clearSelection: state.clearSelection,
         refresh: () => setRefreshToken((t) => t + 1),
       },
-      config,
       formState,
       field,
       config.formStateConfig,
@@ -243,8 +245,8 @@ export function useTableBinding(options: UseTableBindingOptions): TableBinding {
   // is `updateTableFromFormState`, and it is what makes a selection survive
   // paging away and back — the rows are retained in form state, not in the page.
   //
-  // **Keyed on the rows array's identity, and it was keyed on its JSON. Task
-  // C.2b, and the change is a defect fix rather than an optimisation** — though
+  // **Keyed on the rows array's identity, and it was keyed on its JSON. The
+  // change is a defect fix rather than an optimisation** — though
   // it is also that, since the old key serialised up to 200 rows on every render.
   //
   // The sequence that broke: publishing a selection calls `notifyListeners`, the
@@ -261,11 +263,17 @@ export function useTableBinding(options: UseTableBindingOptions): TableBinding {
   // test passes. What needs the widget's own selection is a button gated on the
   // selected row — `enableWhen`, which no flow table has and which
   // `workspaceRegistryTable` puts on eight of thirteen buttons. So the symptom is
-  // a screen where every row-gated button stays dead. **I-185**, and it is I-104's
-  // shape a fourth time: a contract tested from the end that could not fail.
+  // a screen where every row-gated button stays dead: a contract tested from
+  // the end that could not fail.
   //
   // Identity is the right key because it changes exactly once per fetch and is
   // stable across every re-render in between, which is what the guard is for.
+  //
+  // **A tick no longer refetches** (November 2026): `useDataTable` fetches only
+  // when the request's value changes, and the one table whose request read back
+  // a key its own selection writes, the workspace registry's `workspace_name`,
+  // no longer reads it (`makeQuery`). The restore still runs after every real
+  // fetch: a refresh, a page, a sort, a watched key.
   const restoredFor = useRef<JetsRow[] | null>(null);
   useEffect(() => {
     const fsc = config.formStateConfig;
@@ -274,13 +282,18 @@ export function useTableBinding(options: UseTableBindingOptions): TableBinding {
     restoredFor.current = state.rows;
 
     const restored = restoreSelection(formState, field, fsc, state.rows);
-    restored.forEach((isSelected, index) => {
-      if (isSelected) state.setRowSelected(index, true);
-    });
-    if (config.showSelectedOnly) {
-      // `filterSelectedRows` runs after the restore, not after the fetch — the
-      // ordering A.4b left to this file.
-      keepSelectedRows(state.rows, restored);
+    if (config.isReadOnly || config.showSelectedOnly) {
+      // A read-only table cannot take the user's tick, so the restored selection
+      // is applied as it stands; and `filterSelectedRows` runs after the restore,
+      // not after the fetch — the ordering `useDataTable` leaves to this file. Both of the
+      // `showSelectedOnly` tables are read-only confirmation copies of a choice,
+      // which until 2026-11-11 showed every row, unticked: the tick was refused
+      // and the narrowed rows were computed and thrown away.
+      state.restoreSelected(restored, config.showSelectedOnly === true);
+    } else {
+      restored.forEach((isSelected, index) => {
+        if (isSelected) state.setRowSelected(index, true);
+      });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.rows]);
@@ -288,8 +301,8 @@ export function useTableBinding(options: UseTableBindingOptions): TableBinding {
   /**
    * The watched keys as this table last saw them.
    *
-   * **This replaced `isKeyUpdated`, and the reason is a defect C.4 found rather
-   * than a preference.** `FormState.updatedKeys` is a set that `setValue` adds to
+   * **This replaced `isKeyUpdated`, and the reason is a defect rather than a
+   * preference.** `FormState.updatedKeys` is a set that `setValue` adds to
    * and only `publishSelection` ever clears (`binding.ts`), because the Dart
    * clears it at the end of `getModelData` and this port has no equivalent. So
    * the flag *latches*: once a watched key has changed, `isKeyUpdated` stays true
@@ -304,7 +317,7 @@ export function useTableBinding(options: UseTableBindingOptions): TableBinding {
    * Comparing values rather than reading a shared flag also fixes the multi-table
    * case the Dart's reset gets wrong: clearing the group's `updatedKeys` hides the
    * change from a second table that has not been notified yet, whereas a per-table
-   * snapshot cannot. Recorded as **I-165**.
+   * snapshot cannot.
    */
   const lastWatched = useRef<string>("");
   const watchedNow = useCallback(
@@ -323,7 +336,9 @@ export function useTableBinding(options: UseTableBindingOptions): TableBinding {
       if (!changed) return;
 
       // `_refreshTable`, shared with the action button rather than open-coded
-      // here — which is how this path came to omit the page-size reset (A.5).
+      // here, so the two cannot drift. This path once omitted the Dart's
+      // page-size reset and had it added; 2026-11-05 removed the reset from
+      // both, because the page size is the user's choice (see `refreshTable`).
       restoredFor.current = null;
       doRefresh();
     });
@@ -344,7 +359,7 @@ export function useTableBinding(options: UseTableBindingOptions): TableBinding {
 
   // The second notification channel: something wrote to the server, so re-read
   // regardless of whether any watched key moved. `invokeCallbacks` — see
-  // `FormState.onRefreshRequested`, added by S.2a.
+  // `FormState.onRefreshRequested`.
   useEffect(() => formState.onRefreshRequested(refresh), [formState, refresh]);
 
   return { ...state, blocked, setRowSelected, modes, refresh };

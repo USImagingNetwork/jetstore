@@ -29,7 +29,7 @@ func (q oneTableOnly) Query(ctx context.Context, sql string, args ...any) (pgx.R
 	q.t.Helper()
 	for _, table := range []string{"agent_run", "change_proposal", "approval_event"} {
 		if strings.Contains(sql, table) {
-			q.t.Fatalf("the transcript query reads jetsapi.%s; criterion 29 is that the audit record alone suffices", table)
+			q.t.Fatalf("the transcript query reads jetsapi.%s; the audit record alone must suffice", table)
 		}
 	}
 	if !strings.Contains(sql, "agent_audit") {
@@ -40,7 +40,7 @@ func (q oneTableOnly) Query(ctx context.Context, sql string, args ...any) (pgx.R
 
 // seedRun writes one run's whole story: the intent that opened it, a tool call,
 // a decision, a recovered error, and the outcome that closed it. Unique per
-// call — I-72's lesson is that a test sharing a run id with another passes in
+// call — a test sharing a run id with another passes in
 // isolation and fails in a suite.
 func seedRun(t *testing.T, pool *pgxpool.Pool, suffix string) string {
 	t.Helper()
@@ -118,7 +118,7 @@ func TestTranscriptIsReadableFromTheAuditRecordAlone(t *testing.T) {
 	}
 }
 
-// K.1 carried this forward: run_ref is the originating run, not the approver's
+// The approval record carried this forward: run_ref is the originating run, not the approver's
 // session, so a decision taken after the run ended still belongs to its story.
 // A transcript that stopped at ended_at would omit the approval entirely.
 func TestTranscriptCarriesApprovalsTakenAfterTheRunEnded(t *testing.T) {
@@ -129,7 +129,7 @@ func TestTranscriptCarriesApprovalsTakenAfterTheRunEnded(t *testing.T) {
 	if _, err := RecordApproval(ctx, pool, &Approval{
 		ApprovalEventId: "apv_k2_" + proposalId, RunRef: runId, SubjectRef: proposalId,
 		FromState: "draft", ToState: "approved",
-		Actor: "michel@artisoft.io", TierAtEvent: "T2",
+		Actor: "user@example.com", TierAtEvent: "T2",
 		DecisionRationale: "reviewed the artifact",
 	}); err != nil {
 		t.Fatalf("recording approval: %v", err)
@@ -146,11 +146,11 @@ func TestTranscriptCarriesApprovalsTakenAfterTheRunEnded(t *testing.T) {
 	if last.EventType != EventApproval {
 		t.Fatalf("the last event is %q, want the approval that closed the proposal", last.EventType)
 	}
-	if last.Actor != "michel@artisoft.io" {
+	if last.Actor != "user@example.com" {
 		t.Errorf("the approval is attributed to %q; an unattributable approval is what the record exists to prevent", last.Actor)
 	}
 	rendered := tr.String()
-	for _, fragment := range []string{proposalId, "approved", "michel@artisoft.io"} {
+	for _, fragment := range []string{proposalId, "approved", "user@example.com"} {
 		if !strings.Contains(rendered, fragment) {
 			t.Errorf("the transcript does not show %q:\n%s", fragment, rendered)
 		}

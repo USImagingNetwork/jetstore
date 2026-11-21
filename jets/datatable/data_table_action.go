@@ -40,11 +40,14 @@ type DataTableContext struct {
 	CpipesEnv      map[string]any
 }
 
+// NewDataTableContext keeps the adminEmail it is given (the apiserver's
+// -adminEmail flag) and falls back to user.AdminLoginFromEnv only when none is
+// given, nil or empty.
 func NewDataTableContext(dbpool *pgxpool.Pool, devMode bool, usingSshTunnel bool,
 	unitTestDir *string, adminEmail *string) *DataTableContext {
 
-	if adminEmail != nil {
-		v := os.Getenv("JETS_ADMIN_EMAIL")
+	if adminEmail == nil || *adminEmail == "" {
+		v := user.AdminLoginFromEnv()
 		adminEmail = &v
 	}
 	return &DataTableContext{
@@ -155,14 +158,11 @@ func (dtq *DataTableAction) buildQuery() (string, string) {
 	buf.WriteString(whereClause)
 	if len(dtq.SortColumn) > 0 {
 		buf.WriteString(" ORDER BY ")
-		if len(dtq.SortColumnTable) > 0 {
-			buf.WriteString(pgx.Identifier{dtq.SortColumnTable, dtq.SortColumn}.Sanitize())
-		} else {
-			buf.WriteString(pgx.Identifier{dtq.SortColumn}.Sanitize())
-		}
+		buf.WriteString(dtq.sortColumnIdentifier())
 		if !dtq.SortAscending {
 			buf.WriteString(" DESC ")
 		}
+		buf.WriteString(dtq.sortTiebreaker())
 	}
 	buf.WriteString(" LIMIT ")
 	buf.WriteString(fmt.Sprintf("%d", dtq.Limit))
@@ -180,6 +180,87 @@ func (dtq *DataTableAction) buildQuery() (string, string) {
 		stmt = fmt.Sprintf("%s SELECT count(*) FROM %s %s", withClause, fromClause, whereClause)
 	}
 	return buf.String(), stmt
+}
+
+// sortColumnIdentifier names the sort column for ORDER BY.
+// makeSelectColumns casts every plain column to text and keeps its name, and
+// PostgreSQL resolves a bare ORDER BY name to an output column before a table
+// column, so a numeric column sorted as text (10 before 8). A plain selected
+// column is therefore qualified: by the table the request names, else by the
+// column's own table, else by the only FROM entry. A calculated column keeps
+// its bare name, which is its output name and the only one it has. A query
+// with several FROM entries and no table to name stays as it was.
+func (dtq *DataTableAction) sortColumnIdentifier() string {
+	if len(dtq.SortColumnTable) > 0 {
+		return pgx.Identifier{dtq.SortColumnTable, dtq.SortColumn}.Sanitize()
+	}
+	for i := range dtq.Columns {
+		col := &dtq.Columns[i]
+		if col.Column != dtq.SortColumn || len(col.CalculatedAs) > 0 {
+			continue
+		}
+		if len(col.Table) > 0 {
+			return pgx.Identifier{col.Table, dtq.SortColumn}.Sanitize()
+		}
+		if len(dtq.FromClauses) == 1 {
+			table := dtq.FromClauses[0].Table
+			if len(dtq.FromClauses[0].AsTable) > 0 {
+				table = dtq.FromClauses[0].AsTable
+			}
+			if len(table) > 0 {
+				return pgx.Identifier{table, dtq.SortColumn}.Sanitize()
+			}
+		}
+	}
+	return pgx.Identifier{dtq.SortColumn}.Sanitize()
+}
+
+// sortTiebreaker returns what follows the requested sort in ORDER BY: the
+// output position of every plain selected column, ascending (", 1, 2, 4").
+//
+// The requested sort alone is not a total order. Rows that tie on it (every row
+// of a domain table sorted on a column that is empty throughout, say) come back
+// in whatever order the plan produces, which may differ from one execution to
+// the next, so LIMIT/OFFSET paging can repeat one row and skip another.
+//
+// Ordering on every selected column makes the order total on what the page
+// shows: two rows that still tie are identical on every column the caller sees,
+// so which comes first cannot be observed and paging cannot repeat or skip a
+// visible row. It is chosen over the table's own key because the query serves
+// views and tables with no primary key, joins of several FROM entries, and the
+// workspace's SQLite database as well as PostgreSQL; output positions are valid
+// in all of them and need no catalogue lookup. A plain column is selected as
+// text, which every engine can order; a calculated column is left out, since
+// its type may have no ordering (json) and it is derived from the row anyway.
+// The requested sort still comes first, so the order the user asked for and a
+// DISTINCT ON prefix are unchanged; ties are only cut where they were arbitrary.
+// SELECT * (no columns named) has no positions to name and keeps the requested
+// sort alone.
+func (dtq *DataTableAction) sortTiebreaker() string {
+	var buf strings.Builder
+	for i := range dtq.Columns {
+		if len(dtq.Columns[i].CalculatedAs) > 0 {
+			continue
+		}
+		fmt.Fprintf(&buf, ", %d", i+1)
+	}
+	return buf.String()
+}
+
+// defaultSortColumn is the sort column of a read that names no columns, whose
+// columns are the table's (getColumnsDefinitions): the column the request sorts
+// on when it is one of them, so a header click on a server-defined table sorts
+// that table, else the first column. A requested name that is not a column of
+// the table is not used, since it would reach ORDER BY.
+func defaultSortColumn(requested string, columnsDef []DataTableColumnDef) string {
+	if requested != "" {
+		for i := range columnsDef {
+			if columnsDef[i].Name == requested {
+				return requested
+			}
+		}
+	}
+	return columnsDef[0].Name
 }
 
 // Get Column definition
@@ -319,6 +400,17 @@ func parseWcValue(value string) []string {
 	}
 }
 
+// sqlLiteral quotes s as a SQL string literal, doubling its single quotes. That
+// is sound only with standard_conforming_strings on, which readOnlyTx sets for
+// every read built here, so a backslash in s is an ordinary character.
+func sqlLiteral(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+// visitWhereClause writes one where clause. Its values and like pattern are
+// quoted literals (sqlLiteral) and joinWith is quoted as table.column. Ge and le
+// are SQL expressions by design (a timestamp literal, now() - interval '1 day'),
+// written as sent: the read runs READ ONLY (readOnlyTx), so they cannot write.
 func visitWhereClause(buf *strings.Builder, wc *WhereClause) {
 	if wc.OrWith != nil {
 		buf.WriteString("( ")
@@ -336,13 +428,13 @@ func visitWhereClause(buf *strings.Builder, wc *WhereClause) {
 	case len(wc.Values) > 0:
 		wcValues = wc.Values
 		inOp = " IN ("
-		eqOp = " = '"
+		eqOp = " = "
 		if len(wc.Values) == 1 {
 			wcValues = parseWcValue(wc.Values[0])
 		}
 	case len(wc.NotInValues) > 0:
 		inOp = " NOT IN ("
-		eqOp = " != '"
+		eqOp = " != "
 		wcValues = wc.NotInValues
 		if len(wc.NotInValues) == 1 {
 			wcValues = parseWcValue(wc.NotInValues[0])
@@ -351,12 +443,11 @@ func visitWhereClause(buf *strings.Builder, wc *WhereClause) {
 	switch {
 	case len(wc.Like) > 0:
 		buf.WriteString(" LIKE ")
-		buf.WriteString("'")
-		buf.WriteString(wc.Like)
-		buf.WriteString("' ")
+		buf.WriteString(sqlLiteral(wc.Like))
+		buf.WriteString(" ")
 	case len(wc.JoinWith) > 0:
 		buf.WriteString(" = ")
-		buf.WriteString(wc.JoinWith)
+		buf.WriteString(pgx.Identifier(strings.Split(wc.JoinWith, ".")).Sanitize())
 	case len(wcValues) > 1:
 		buf.WriteString(inOp)
 		isFirstValue := true
@@ -369,9 +460,7 @@ func visitWhereClause(buf *strings.Builder, wc *WhereClause) {
 			if value == "NULL" {
 				buf.WriteString(" NULL ")
 			} else {
-				buf.WriteString("'")
-				buf.WriteString(value)
-				buf.WriteString("'")
+				buf.WriteString(sqlLiteral(value))
 			}
 		}
 		buf.WriteString(") ")
@@ -381,8 +470,7 @@ func visitWhereClause(buf *strings.Builder, wc *WhereClause) {
 			buf.WriteString(" is NULL ")
 		} else {
 			buf.WriteString(eqOp)
-			buf.WriteString(value)
-			buf.WriteString("'")
+			buf.WriteString(sqlLiteral(value))
 		}
 	case len(wc.Ge) > 0:
 		buf.WriteString(" >= ")
@@ -419,11 +507,107 @@ func (dtq *DataTableAction) makeWhereClause() string {
 }
 
 // Simple definition of sql statement for insert
+//
+// AdminOnly reserves a statement to the installation admin (user.IsAdmin), whatever
+// the caller's roles. No statement sets it since update/users and delete/users moved
+// to the user_admin capability (2026-11-07); it stays for a later statement that
+// should remain the admin's alone, with ErrAdminOnly and the test that pins its text.
+//
+// ProtectAdminRow marks a statement that writes jetsapi.users by its user_email
+// column. InsertRows refuses the whole request, before any row is written, when any
+// row names the installation admin's email -- whoever calls, the admin included -- so
+// that the one account defined outside the database cannot be deactivated, stripped
+// of its roles or deleted from inside it. A field rather than a test on the
+// statement's name, so the next statement that writes users declares it.
 type SqlInsertDefinition struct {
-	Stmt       string
-	ColumnKeys []string
-	AdminOnly  bool
-	Capability string
+	Stmt            string
+	ColumnKeys      []string
+	AdminOnly       bool
+	Capability      string
+	ProtectAdminRow bool
+	// OwnRowOnly binds every row to the caller: InsertRows writes the caller's
+	// email into each row's user_email and refuses a row that names another
+	// user (ErrNotOwnRow). For a statement on the caller's own account, such as
+	// update/user_git_profile, which every role's user_profile capability reaches.
+	OwnRowOnly bool
+}
+
+// ErrNotOwnRow is InsertRows' refusal of an OwnRowOnly statement whose row names
+// a user other than the caller. A 403 that names the row, as ErrAdminRowProtected
+// does, rather than a missing capability the caller holds.
+var ErrNotOwnRow = errors.New("error: forbidden, this statement writes the caller's own account only")
+
+// bindToCaller writes email into each row's user_email, and reports false,
+// writing nothing, when a row names another user. The comparison is exact, as
+// the statements' WHERE user_email = $n is.
+func bindToCaller(rows []map[string]any, email string) bool {
+	for _, row := range rows {
+		if v, ok := row["user_email"]; ok && v != nil && v != "" && v != email {
+			return false
+		}
+	}
+	for _, row := range rows {
+		row["user_email"] = email
+	}
+	return true
+}
+
+// ErrAdminRowProtected is InsertRows' refusal of a ProtectAdminRow statement that
+// names the installation admin's row. A 403 with its own message, and deliberately
+// not one of VerifyUserPermission's refusals: it says nothing about the caller, who
+// may be the admin, and everything about the row, so collapsing it into ErrRefused
+// would tell a user administrator they lack a capability they hold.
+var ErrAdminRowProtected = errors.New("error: forbidden, the installation admin's account cannot be changed or deleted")
+
+// ErrMalformedRoles is the 400 for an update/users row whose roles are not a list of
+// strings. Until a fix InsertRows type-asserted them unchecked, so such a row
+// panicked the handler; since user_admin (2026-11-07) that input comes from user
+// administrators as well as from the admin.
+var ErrMalformedRoles = errors.New("error: bad request, roles must be a list of role names")
+
+// rolesOf reads the roles of an update/users row: a JSON array of strings arrives as
+// []any, and a Go caller may pass []string. Anything else is ErrMalformedRoles.
+func rolesOf(rolesi any) ([]string, error) {
+	switch v := rolesi.(type) {
+	case []string:
+		return v, nil
+	case []any:
+		roles := make([]string, len(v))
+		for i, r := range v {
+			role, ok := r.(string)
+			if !ok {
+				return nil, fmt.Errorf("%w: element %d is %T", ErrMalformedRoles, i, r)
+			}
+			roles[i] = role
+		}
+		return roles, nil
+	default:
+		return nil, fmt.Errorf("%w: got %T", ErrMalformedRoles, rolesi)
+	}
+}
+
+// writesAdminRow reports whether any row's user_email is adminEmail. The comparison
+// is exact, as user.IsAdmin's is and as the statements' WHERE user_email = $n is, so
+// it refuses precisely the rows the statement would have written. An empty
+// adminEmail protects nothing: no row can be the admin's when none is configured.
+func writesAdminRow(rows []map[string]any, adminEmail string) bool {
+	if adminEmail == "" {
+		return false
+	}
+	for _, row := range rows {
+		v, ok := row["user_email"]
+		if !ok || v == nil {
+			continue
+		}
+		email, ok := v.(string)
+		if !ok {
+			email = fmt.Sprint(v)
+		}
+		if email == adminEmail {
+			return true
+		}
+	}
+	return false
 }
 
 // The four errors VerifyUserPermission returns, as values rather than as calls to
@@ -432,7 +616,7 @@ type SqlInsertDefinition struct {
 // this declaration, and that is what makes AuthzStatusFor's claim checkable.
 //
 // **Three of the four are refusals and the first is not**, which is the split
-// ui_refresh D.2 added on top of the one below. ErrCapabilityNotConfigured says
+// a later change added on top of the one below. ErrCapabilityNotConfigured says
 // the server is misconfigured; the other three say something about the caller.
 //
 // **Among the refusals the split that matters is identity against policy, and it
@@ -443,20 +627,21 @@ type SqlInsertDefinition struct {
 var (
 	// ErrCapabilityNotConfigured is a defect in the *server*, not a refusal of the
 	// caller: a SqlInsertDefinition that names no capability. It answers **500**,
-	// and it is the only one of the four that does; ui_refresh I-241 raised it and
-	// D.2 fixed it.
+	// and it is the only one of the four that does (2026-08-27).
 	//
 	// **It is unreachable from every caller in this package, re-measured 2026-08-27.**
-	// sqlInsertStmts has 58 entries and 58 non-empty Capability fields
+	// sqlInsertStmts had 58 entries and 58 non-empty Capability fields (38 since
+	// the 20 unused WORKSPACE/ statements were removed, 2026-11-14)
 	// (jets/datatable/sql_stmts.go, sqlInsertStmts); the two reading "none" are both
-	// AdminOnly, so the admin branch decides them. Every ad-hoc definition in this
-	// package names a capability literally except requireCapability's, which passes a
-	// parameter -- and each of its nine call sites passes one of the three
-	// Capability* constants below. So a statement added without a capability is what
-	// reaches this, and nothing else does.
+	// AdminOnly, so the admin branch decides them. (Since 2026-11-07 none reads
+	// "none": those two, update/users and delete/users, require user_admin and are
+	// not AdminOnly.) Every ad-hoc definition in this package names a capability
+	// literally except requireCapability's, which passes a parameter -- and each of
+	// its nine call sites passes one of the three Capability* constants below. So a
+	// statement added without a capability is what reaches this, and nothing else does.
 	//
 	// **The text keeps its "unauthorized" prefix deliberately.** It is pinned by
-	// TestTheFourRefusalTextsAreUnchanged, which exists so C.17's promise that no
+	// TestTheFourRefusalTextsAreUnchanged, which exists so the promise that no
 	// message moved stays checkable, and the clause after the comma is the half an
 	// operator needs. Rewording it would spend that guard on a word.
 	ErrCapabilityNotConfigured = errors.New("error: unauthorized, configuration error: missing capability on sql statement")
@@ -471,21 +656,21 @@ var (
 // AuthzStatusFor maps a VerifyUserPermission error to the status that describes it.
 //
 // **This exists because 401 was answering two questions and could only carry one
-// answer** -- ui_refresh I-189. A client cannot distinguish "your session is over,
+// answer**. A client cannot distinguish "your session is over,
 // sign in again" from "you are signed in and may not do this", so the React app
 // signed the user out on both, and a refusal presented as a session failure.
 //
-// **It was answering three, and the third is why 500 is here** -- ui_refresh I-241,
-// fixed at D.2 on 2026-08-27. ErrCapabilityNotConfigured is not an answer about the
+// **It was answering three, and the third is why 500 is here** -- fixed on
+// 2026-08-27. ErrCapabilityNotConfigured is not an answer about the
 // caller at all: it says a SqlInsertDefinition names no capability, which no request
 // can cause and no request can repair. Left at 401 it signed out a user for the
-// server's mistake, in a corner of exactly the failure I-189 describes. C.17 saw it
+// server's mistake, in a corner of exactly that failure. The status split saw it
 // and declined it on two grounds -- that it was unreachable, which it still is, and
 // that a third status was a decision outside what that task was approved to take.
-// The second ground is what Phase 4 exists to discharge.
+// The second ground was discharged later.
 //
-// **One of C.17's grounds has also expired rather than been overruled.** It weighed
-// a third status as "a change on a path both clients use"; track X deleted
+// **One of those grounds has also expired rather than been overruled.** It weighed
+// a third status as "a change on a path both clients use"; the React port deleted
 // jetsclient on 2026-08-26, so there is one client, and the cost side of that trade
 // is gone.
 //
@@ -496,8 +681,8 @@ var (
 // separates the middleware from the handler, and a handler refusal *includes* the
 // dead-user and database-unavailable cases.
 //
-// **It is not a new oracle**, measured against the reasoning I-124, I-125 and
-// I-126 were resolved on. The four gates in jets/apiserver already return two
+// **It is not a new oracle**, measured against the reasoning the earlier
+// gate fixes were resolved on. The four gates in jets/apiserver already return two
 // distinct messages for exactly this distinction, deliberately (jets/apiserver/api_purgedata.go,
 // DoPurgeDataAction, the comment above the IsAdmin check). Splitting the status
 // along the line the message already splits along tells a caller nothing the
@@ -516,11 +701,11 @@ func AuthzStatusFor(err error) int {
 
 // ErrRefused is the one message every gate in this package returns when it refuses
 // a caller. It is unchanged from the errors.New that stood at each of the fourteen
-// sites, and it stays collapsed on purpose: I-124's fix turns on the two gates on
+// sites, and it stays collapsed on purpose: an earlier fix turns on the two gates on
 // the insert_raw_rows path being byte-identical, so that neither becomes an oracle
 // for whether a mapping exists.
 //
-// **The status says more than the message does, and that is the whole of C.17's
+// **The status says more than the message does, and that is the whole of the
 // change.** RefusalFor is the pair, so a handler cannot take one without the other.
 var ErrRefused = errors.New("error: unauthorized, cannot get user info or does not have permission")
 
@@ -534,9 +719,9 @@ var ErrRefused = errors.New("error: unauthorized, cannot get user info or does n
 // deliberate: the classification is for the status line, not for the body.
 //
 // **The configuration error is the exception, and it is the one case where the body
-// moves too** (ui_refresh D.2). Collapsing it into ErrRefused would answer 500 with
+// moves too**. Collapsing it into ErrRefused would answer 500 with
 // a sentence asserting the caller is unauthorised -- the misdescription this fix is
-// about, surviving the fix. I-124's argument does not reach it either: that argument
+// about, surviving the fix. The earlier fix's argument does not reach it either: that argument
 // is about two gates on one path staying indistinguishable, and both of those gates
 // resolve the *same* SqlInsertDefinition, so a missing capability field is identical
 // at both by construction rather than by collapse. Nobody but the operator who
@@ -593,13 +778,47 @@ func (ctx *DataTableContext) VerifyUserPermission(sqlStmt *SqlInsertDefinition, 
 // queries the app composed; `raw_query_tool` is the IDE's free-SQL box, where
 // the statement is whatever the user typed. They shared a case and a capability
 // of none; they now share a case and differ in what they require.
+//
+// **A raw query on the read capability runs READ ONLY** (readOnlyTx): it is the
+// app's own query, always a read, and the read capability is every role's, so
+// no statement sent under it may change data. The query tool's, under
+// CapabilityQueryTool, is the user's SQL and runs as it always has, except that
+// it is cancelled past QueryToolStatementTimeout (execQueryToolStatement).
 func (ctx *DataTableContext) ExecRawQuery(dataTableAction *DataTableAction, token, capability string) (results *map[string]any, httpStatus int, err error) {
 	// fmt.Println("*** ExecRawQuery called, query:",dataTableAction.RawQuery)
 	if code, err2 := ctx.requireCapability(capability, token); err2 != nil {
 		return nil, code, err2
 	}
 
-	resultRows, columnDefs, err2 := execQuery(ctx.Dbpool, dataTableAction, &dataTableAction.RawQuery)
+	var resultRows *[][]any
+	var columnDefs *[]DataTableColumnDef
+	var err2 error
+	switch capability {
+	case CapabilityReadData:
+		tx, err3 := readOnlyTx()
+		if err3 != nil {
+			return nil, http.StatusInternalServerError, err3
+		}
+		defer tx.Rollback(context.Background())
+		resultRows, columnDefs, err2 = execQuery(tx, dataTableAction, &dataTableAction.RawQuery)
+	case CapabilityQueryTool:
+		// On the IDE login (IDERole), never the apiserver's own pool.
+		ide, err3 := ideDB()
+		if err3 != nil {
+			return nil, http.StatusInternalServerError, err3
+		}
+		resultRows, columnDefs, err2 = execQueryToolStatement(ide, dataTableAction,
+			&dataTableAction.RawQuery, queryToolStatementTimeout)
+		if isQueryToolTimeout(err2) {
+			// Said as it is, without the generic prefix below.
+			return nil, http.StatusInternalServerError, err2
+		}
+		err2 = withIDEHint(err2)
+	default:
+		// Every caller passes one of the two above; any other runs nothing
+		// rather than the user's SQL on the apiserver's own pool.
+		return nil, http.StatusInternalServerError, fmt.Errorf("error: raw query with capability %q is not supported", capability)
+	}
 
 	if err2 != nil {
 		httpStatus = http.StatusInternalServerError
@@ -622,7 +841,13 @@ func (ctx *DataTableContext) ExecDataManagementStatement(dataTableAction *DataTa
 		httpStatus, err = RefusalFor(err2)
 		return
 	}
-	resultRows, columnDefs, err2 := execDDL(ctx.Dbpool, dataTableAction, &dataTableAction.RawQuery)
+	// On the IDE login (IDERole), never the apiserver's own pool.
+	ide, err2 := ideDB()
+	if err2 != nil {
+		return nil, http.StatusInternalServerError, err2
+	}
+	resultRows, columnDefs, err2 := execDDL(ide, dataTableAction, &dataTableAction.RawQuery)
+	err2 = withIDEHint(err2)
 
 	if err2 != nil {
 		httpStatus = http.StatusInternalServerError
@@ -644,11 +869,16 @@ func (ctx *DataTableContext) ExecRawQueryMap(dataTableAction *DataTableAction, t
 	if code, err2 := ctx.requireCapability(CapabilityReadData, token); err2 != nil {
 		return nil, code, err2
 	}
-	// fmt.Println("ExecRawQueryMap:")
+	// The app's own queries on the read capability, so read only, as for
+	// ExecRawQuery's raw_query.
+	tx, err2 := readOnlyTx()
+	if err2 != nil {
+		return nil, http.StatusInternalServerError, err2
+	}
+	defer tx.Rollback(context.Background())
 	resultMap := make(map[string]any, len(dataTableAction.RawQueryMap))
 	for k, v := range dataTableAction.RawQueryMap {
-		// fmt.Println("Query:",v)
-		resultRows, _, err2 := execQuery(ctx.Dbpool, dataTableAction, &v)
+		resultRows, _, err2 := execQuery(tx, dataTableAction, &v)
 		if err2 != nil {
 			if strings.Contains(err2.Error(), "SQLSTATE") {
 				httpStatus = http.StatusBadRequest
@@ -834,10 +1064,23 @@ func (ctx *DataTableContext) InsertRows(dataTableAction *DataTableAction, token 
 		err = errors.New("error: unknown table")
 		return
 	}
-	_, err2 := ctx.VerifyUserPermission(sqlStmt, token)
+	caller, err2 := ctx.VerifyUserPermission(sqlStmt, token)
 	if err2 != nil {
 		log.Printf("while VerifyUserPermission: %v", err2)
 		httpStatus, err = RefusalFor(err2)
+		return
+	}
+	// A statement on the caller's own account writes only the caller's row.
+	if sqlStmt.OwnRowOnly && !bindToCaller(dataTableAction.Data, caller.Email) {
+		log.Printf("InsertRows: %s refused, a row names another user", dataTableAction.FromClauses[0].Table)
+		httpStatus, err = http.StatusForbidden, ErrNotOwnRow
+		return
+	}
+	// The installation admin's row is not written by a ProtectAdminRow statement,
+	// whoever calls: the whole request is refused before its first row is written.
+	if sqlStmt.ProtectAdminRow && writesAdminRow(dataTableAction.Data, user.AdminEmail) {
+		log.Printf("InsertRows: %s refused, a row names the installation admin", dataTableAction.FromClauses[0].Table)
+		httpStatus, err = http.StatusForbidden, ErrAdminRowProtected
 		return
 	}
 
@@ -853,6 +1096,26 @@ func (ctx *DataTableContext) InsertRows(dataTableAction *DataTableAction, token 
 			returnedKey[irow] = peKey
 		}
 		return
+	}
+
+	// update/users: the roles go to column encrypted_roles (stored as written; the
+	// encryption the column is named for was never done). Every row is checked before
+	// the first is written, so malformed roles refuse the whole request with 400.
+	if dataTableAction.FromClauses[0].Table == "update/users" {
+		for irow := range dataTableAction.Data {
+			rolesi := dataTableAction.Data[irow]["roles"]
+			if rolesi == nil {
+				continue
+			}
+			var roles []string
+			roles, err = rolesOf(rolesi)
+			if err != nil {
+				log.Printf("InsertRows: update/users refused, row %d: %v", irow, err)
+				httpStatus = http.StatusBadRequest
+				return
+			}
+			dataTableAction.Data[irow]["encrypted_roles"] = roles
+		}
 	}
 
 	row := make([]any, len(sqlStmt.ColumnKeys))
@@ -876,22 +1139,6 @@ func (ctx *DataTableContext) InsertRows(dataTableAction *DataTableAction, token 
 					err = fmt.Errorf("while encrypting the git token: %v", err)
 					return
 				}
-			}
-		case dataTableAction.FromClauses[0].Table == "update/users":
-			// encrypt roles and put them in column encrypted_roles
-			// @**@ encrypt roles and put them in column encrypted_roles
-			rolesi := dataTableAction.Data[irow]["roles"]
-			if rolesi != nil {
-				roles := rolesi.([]any)
-				encryptedRoles := make([]string, len(roles))
-				for i := range roles {
-					role := roles[i].(string)
-					// encrypt role
-					// encryptedRole := user.EncryptWithEmail(role, userProfile.Email)
-					encryptedRole := role
-					encryptedRoles[i] = encryptedRole
-				}
-				dataTableAction.Data[irow]["encrypted_roles"] = encryptedRoles
 			}
 		}
 		if !dbUpdateDone {
@@ -976,7 +1223,38 @@ func populateDomainKeys(row map[string]any) error {
 }
 
 // utility methods
-func execQuery(dbpool *pgxpool.Pool, dataTableAction *DataTableAction, query *string) (*[][]any, *[]DataTableColumnDef, error) {
+// querier is what execQuery runs on: the pool, or a read's transaction.
+type querier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+}
+
+// readOnlyTx opens the transaction a data-table read runs in. The read's SQL is
+// built from fragments the client sends (WithClauses, calculated columns, ge and
+// le), so it runs READ ONLY and no fragment can write: a data-modifying WITH is
+// refused by PostgreSQL. standard_conforming_strings is set on for it, so the
+// where clause's quoted values (sqlLiteral) are escaped whatever the server's
+// default. It runs on the reader login (ReaderRole, restricted_logins.go), so it
+// reads only what that role may, and nothing in the statement can switch to a
+// role that may read more: the login is a member of nothing else. Before the
+// logins are open it fails rather than running on the apiserver's own pool.
+// The caller rolls it back; a read commits nothing.
+func readOnlyTx() (pgx.Tx, error) {
+	pool, err := readerDB()
+	if err != nil {
+		return nil, err
+	}
+	tx, err := pool.BeginTx(context.Background(), pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, fmt.Errorf("while starting the read: %w", err)
+	}
+	if _, err = tx.Exec(context.Background(), "SET LOCAL standard_conforming_strings TO on"); err != nil {
+		_ = tx.Rollback(context.Background())
+		return nil, fmt.Errorf("while starting the read: %w", err)
+	}
+	return tx, nil
+}
+
+func execQuery(dbpool querier, dataTableAction *DataTableAction, query *string) (*[][]any, *[]DataTableColumnDef, error) {
 	// //DEV
 	// fmt.Print("\n*** UI Query:\n", *query, "\n\n")
 	resultRows := make([][]any, 0, dataTableAction.Limit)
@@ -1032,6 +1310,12 @@ func execQuery(dbpool *pgxpool.Pool, dataTableAction *DataTableAction, query *st
 			}
 		}
 		resultRows = append(resultRows, flatRow)
+	}
+	// An error raised while the rows stream, such as a read-only refusal, ends
+	// the loop above without a row; it is reported here, not dropped.
+	if err = rows.Err(); err != nil {
+		log.Printf("While reading the dataTable query's rows: %v", err)
+		return nil, nil, err
 	}
 	return &resultRows, &columnDefs, nil
 }
@@ -1101,7 +1385,7 @@ func execDDL(dbpool *pgxpool.Pool, _ *DataTableAction, query *string) (*[][]any,
 	return &resultRows, &columnDefs, nil
 }
 
-// Capabilities required to read through /dataTable — I-2.
+// Capabilities required to read through /dataTable.
 //
 // **These were already declared and granted; they were simply never checked.**
 // `jets_init_db.sql:48` documents `jetstore_read` as "read data in JetStore" and
@@ -1125,8 +1409,10 @@ const (
 	// sqlInsertStmts["pipeline_execution_status"] and
 	// sqlInsertStmts["input_loader_status"] already require, named here for the two
 	// paths that reach the same authority without resolving a statement: DropTable
-	// below, and the inline resubmit_pipeline arm in jets/apiserver. I-125.
+	// below, and the inline resubmit_pipeline arm in jets/apiserver.
 	CapabilityRunPipelines = "run_pipelines"
+	// CapabilityDeleteSession gates preview_session_deletion and delete_sessions.
+	CapabilityDeleteSession = "delete_session"
 )
 
 // requireCapability is the read-side counterpart of VerifyUserPermission's use
@@ -1143,7 +1429,7 @@ func (ctx *DataTableContext) requireCapability(capability, token string) (int, e
 // /dataTable dispatch that jets/apiserver handles inline rather than through a
 // method on this type. There are two — resubmit_pipeline and
 // fetch_file_from_stage — and both were reachable by any authenticated caller
-// because a watched list of method names could not see them (I-125's sweep).
+// because a watched list of method names could not see them (found by a sweep).
 //
 // It is a wrapper rather than a rename so that the refusal is byte-identical to
 // the one every gated method in this package returns, and so that the read-side
@@ -1171,7 +1457,7 @@ func (ctx *DataTableContext) DoReadAction(dataTableAction *DataTableAction, toke
 			return nil, http.StatusInternalServerError, err
 		}
 
-		dataTableAction.SortColumn = columnsDef[0].Name
+		dataTableAction.SortColumn = defaultSortColumn(dataTableAction.SortColumn, columnsDef)
 		results["columnDef"] = columnsDef
 
 		// Add table's label
@@ -1207,8 +1493,13 @@ func (ctx *DataTableContext) DoReadAction(dataTableAction *DataTableAction, toke
 	// Build the query
 	query, stmt := dataTableAction.buildQuery()
 
-	// Perform the query
-	resultRows, _, err := execQuery(ctx.Dbpool, dataTableAction, &query)
+	// Perform the query, and the count below, read only (readOnlyTx)
+	tx, err := readOnlyTx()
+	if err != nil {
+		return nil, http.StatusInternalServerError, err
+	}
+	defer tx.Rollback(context.Background())
+	resultRows, _, err := execQuery(tx, dataTableAction, &query)
 	if err != nil {
 		return nil, http.StatusInternalServerError,
 			fmt.Errorf("while executing query from tables %s: %v", dataTableAction.FromClauses[0].Table, err)
@@ -1239,7 +1530,7 @@ gotRolesPos:
 
 	// get the total nbr of row
 	var totalRowCount int
-	err = ctx.Dbpool.QueryRow(context.Background(), stmt).Scan(&totalRowCount)
+	err = tx.QueryRow(context.Background(), stmt).Scan(&totalRowCount)
 	if err != nil {
 		return nil, http.StatusInternalServerError,
 			fmt.Errorf("while getting total row count from tables %s: %v", dataTableAction.FromClauses[0].Table, err)
@@ -1327,7 +1618,7 @@ func (ctx *DataTableContext) DoPreviewFileAction(dataTableAction *DataTableActio
 // the ActionKeys.dropTable arm) and loadFilesUF (.../load_files/, ActionKeys.lfDropTable).
 //
 // **It took a token and never read it, so every authenticated caller of any role
-// could drop any table.** ui_refresh I-125, fixed 2026-08-25.
+// could drop any table.** Fixed 2026-08-25.
 //
 // **On the capability, because it was a choice rather than a lookup.** The two
 // call sites sit beside arms requiring different things -- configure_files writes
@@ -1351,11 +1642,13 @@ func (ctx *DataTableContext) DropTable(dataTableAction *DataTableAction, token s
 	if code, err2 := ctx.requireCapability(CapabilityRunPipelines, token); err2 != nil {
 		return nil, code, err2
 	}
-	//* TODO NEED TO APPLY FILTER ON TABLE NAME
-	// Still open, and now with an owner: the identifiers below are sanitised and
-	// the caller is authorised, so what is left is the policy question of which
-	// tables this action may name at all -- jetsapi.users is as reachable as a
-	// staging table. Recorded as ui_refresh I-137.
+	// **Which tables it may drop: a staging table, and nothing else** (2026-11-11).
+	// Until then any table could be named, jetsapi.users as easily as a staging
+	// table. A staging table is in public and is the table_name of a source
+	// configuration; the loader creates it, so this runs on the apiserver's own
+	// pool, which owns it, and not on the IDE login, which may drop only what it
+	// created. The button is used when a file's columns differ from the previous
+	// files': the staging table is dropped and the loader re-creates it.
 	for ipos := range dataTableAction.Data {
 		tableName, ok := dataTableAction.Data[ipos]["tableName"].(string)
 		if !ok {
@@ -1368,6 +1661,24 @@ func (ctx *DataTableContext) DropTable(dataTableAction *DataTableAction, token s
 			// Both call sites send "public" explicitly; the default is kept for a
 			// request that omits it, as the unchecked assertion this replaces did.
 			schemaName = "public"
+		}
+		if schemaName != "public" {
+			httpStatus = http.StatusBadRequest
+			err = fmt.Errorf("error: Drop Staging Table drops a staging table, in schema public, not a table in %s", schemaName)
+			return
+		}
+		var isStaging bool
+		err = ctx.Dbpool.QueryRow(context.Background(),
+			"SELECT EXISTS (SELECT 1 FROM jetsapi.source_config WHERE table_name = $1)", tableName).Scan(&isStaging)
+		if err != nil {
+			httpStatus = http.StatusInternalServerError
+			err = fmt.Errorf("while checking that %s is a staging table: %v", tableName, err)
+			return
+		}
+		if !isStaging {
+			httpStatus = http.StatusBadRequest
+			err = fmt.Errorf("error: %s is not the staging table of a source configuration", tableName)
+			return
 		}
 		// Sanitised rather than interpolated, which is what ResetDomainTables
 		// (jets/apiserver/api_purgedata.go) has always done for the same statement.

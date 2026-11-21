@@ -1,10 +1,10 @@
 /**
- * What a table action does when pressed. Task S.2b.
+ * What a table action does when pressed.
  *
- * **The split from S.2a is of surface, not of vocabulary** — the sizing's R1. A
+ * **The split from the action interpreter is of surface, not of vocabulary.** A
  * `doAction`'s `actionName` dispatches into exactly the switch a state's
  * `stateAction` does, so this file resolves *which* action to run and hands it
- * to S.2a's interpreter rather than growing a second one.
+ * to the action interpreter rather than growing a second one.
  *
  * ## Seven action types, and what each resolves to
  *
@@ -15,20 +15,20 @@
  * | `doActionShowDialog` | 3 | run `actionName`, then open `configForm` |
  * | `clearHomeFilters` | 3 | a named escape, then refresh |
  * | `showDialog` | 2 | open `configForm` with params |
- * | `toggleCheckboxVisible` | 3 | **A.5's** — the table's own presentation |
- * | `refreshTable` | 1 | **A.5's** — the table's own state |
+ * | `toggleCheckboxVisible` | 3 | **the widget's** — the table's own presentation |
+ * | `refreshTable` | 1 | **the widget's** — the table's own state |
  * | `setSessionIdFilter` | 1 | ask for a list, replace the home filters, refresh |
  * | `setRequestIdFilter` | 1 | the same, on `request_id` |
  *
- * `toggleCheckboxVisible` and `refreshTable` are not handled here and that is
- * I-19's finding: they change the widget rather than the flow, so they belong to
- * the table and were returned to track A. Reaching them here is a programming
+ * `toggleCheckboxVisible` and `refreshTable` are not handled here, on purpose:
+ * they change the widget rather than the flow, so they belong to the table
+ * (`modes.ts`). Reaching them here is a programming
  * error and says so.
  *
- * **The last two rows are F.5's, and both sites are on the same table.**
+ * **The last two rows were added later, and both sites are on the same table.**
  * `pipelineExecStatusTable` is the one configuration registered on the non-flow
- * side and rendered by a flow (F18), so `homeFiltersUF` meets them even though
- * they were counted as track C's. They resolve to a request rather than being
+ * side and rendered by a flow, so `homeFiltersUF` meets them even though
+ * they were counted as the screens'. They resolve to a request rather than being
  * handled here for the reason every other row is: what a button asks for is data,
  * and who can satisfy it is the host's problem.
  *
@@ -39,7 +39,7 @@
  * one site, to a literal. Five actions use each and three use both.
  *
  * Reading a column by index is the same positional contract every `columnIdx`
- * binding in A.4c rests on, and it is why `resolveParams` needs the selected row
+ * binding in the form-state binding rests on, and it is why `resolveParams` needs the selected row
  * rather than just form state. An action that wants a column with no row
  * selected is gated by `isEnabledWhenHavingSelectedRows` — every action using
  * `navigationParams` sets it, which is checked in the tests rather than assumed.
@@ -56,13 +56,13 @@ export type ActionRequest =
   | { kind: "runActionThenDialog"; name: string; form: string; params: Record<string, string> }
   | { kind: "escape"; name: string; thenRefresh: true }
   /**
-   * Ask the user for a comma-separated list and filter on it. Task F.5.
+   * Ask the user for a comma-separated list and filter on it.
    *
    * **A prompt rather than a form**, because the Dart's is one: `showGetInputDialog`
    * (`jetsclient/lib/components/dialogs.dart`, `showGetInputDialog`) is a single
    * `TextField` with CANCEL and OK. That is what makes this a request kind of its
    * own rather than an `openDialog` — an `openDialog` names a `configForm` and
-   * this names none, and the host that has no dialog host (I-68) can still serve
+   * this names none, and a host that has no dialog host can still serve
    * it.
    *
    * The two sites differ only in the column, so the column is the payload.
@@ -78,9 +78,20 @@ export class UnsupportedActionType extends Error {}
  * (`data_table.dart:actionDispatcher`). A parameter with no value leaves the
  * segment in place rather than inserting `undefined`, so a broken link is
  * visibly broken instead of silently pointing somewhere plausible.
+ *
+ * **Each value is percent-encoded, because it fills one path segment.** A file
+ * key is an object path (`in/acme/claims.csv`), and inserted as is its slashes
+ * made extra segments, so `/filePreviewPath/:file_key` did not match and the
+ * Input File Preview was a Page not found. React Router decodes each segment of
+ * a matched path before it hands the parameters to `useParams` (an encoded `/`
+ * included), so a screen reads the value as it was written and must not decode
+ * it again. An empty value fills an empty segment, as it always did.
  */
 export function fillPath(path: string, params: Record<string, string>): string {
-  return path.replace(/:([A-Za-z0-9_]+)/g, (whole, name: string) => params[name] ?? whole);
+  return path.replace(/:([A-Za-z0-9_]+)/g, (whole, name: string) => {
+    const value = params[name];
+    return value === undefined ? whole : encodeURIComponent(value);
+  });
 }
 
 /**
@@ -184,7 +195,7 @@ export function requestFor(
     case "toggleCheckboxVisible":
     case "refreshTable":
       throw new UnsupportedActionType(
-        `"${action.actionType}" is the table's own action and belongs to the widget (A.5), not the bar`,
+        `"${action.actionType}" is the table's own action and belongs to the widget, not the bar`,
       );
     default:
       throw new UnsupportedActionType(`unknown actionType "${action.actionType}"`);

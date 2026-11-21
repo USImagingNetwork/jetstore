@@ -1,21 +1,21 @@
 /**
  * The data table's logic, with no React in it.
  *
- * Task A.4b. Everything here is ported from `JetsDataTableState`
+ * Everything here is ported from `JetsDataTableState`
  * (`jetsclient/lib/components/data_table.dart:303`) and `JetsDataTableSource`
  * (`data_table_source.dart`), and lives apart from the component for the same
- * reason A.4a lives apart from the widget: it can then be tested by calling it.
+ * reason the query builder lives apart from the widget: it can then be tested by calling it.
  *
  * **Three of these functions deliberately do not match the Dart, because the
  * Dart is wrong.** Each is marked `DIVERGENCE` with what the original does and
  * what breaks. They are rendering behaviour rather than wire format, so unlike
- * A.4a there is no compatibility argument for reproducing the defect — and the
+ * the query builder there is no compatibility argument for reproducing the defect — and the
  * port is the only reason anyone read these forty lines closely enough to notice.
  */
 
 import type { ColumnConfig, JetsRow } from "./types";
 
-/** Columns the table renders. Hidden columns are still fetched — see A.4a. */
+/** Columns the table renders. Hidden columns are still fetched — see `makeQuery`. */
 export function visibleColumns(columns: ColumnConfig[]): ColumnConfig[] {
   return columns.filter((c) => !c.isHidden);
 }
@@ -73,6 +73,82 @@ export function resolveSortColumn(
     sortColumnName: col.name,
     sortColumnTableName: col.table ?? "",
   };
+}
+
+/**
+ * The sort to keep when a response redefines the columns (`columnDef`).
+ *
+ * A table that declares no columns learns them from every response, the domain
+ * table view and the Query Tool among them. Resetting the sort to the first
+ * column on each of those responses undid every heading press: the press sorted
+ * by the chosen column, the reply carried `columnDef`, and the reset asked again
+ * by column 0. So the sort the user chose is kept whenever a column of that name
+ * (and table) is still among the visible ones, at its position in the new list.
+ *
+ * Otherwise `fallback` decides: `"first"` sorts on the first visible column,
+ * which is what a server-sorted table has always done once its columns arrive;
+ * `"none"` leaves the rows in the order they came, which is right for a
+ * statement the user wrote, whose own `ORDER BY` the client must not override.
+ */
+export function sortAfterColumnDef(
+  previous: SortState,
+  columns: ColumnConfig[],
+  fallback: "first" | "none",
+): SortState {
+  if (previous.sortColumnName !== "") {
+    const visible = visibleColumns(columns);
+    const at = visible.findIndex(
+      (c) =>
+        c.name === previous.sortColumnName && (c.table ?? "") === previous.sortColumnTableName,
+    );
+    if (at >= 0) return resolveSortColumn(columns, "", at);
+  }
+  if (fallback === "none") return resolveSortColumn([], "");
+  return resolveSortColumn(columns, columns[0]?.name ?? "", 0);
+}
+
+/**
+ * Rows sorted in the browser, for a table the server does not sort.
+ *
+ * One kind of table needs it: a raw statement (the Query Tool), whose request
+ * carries no sort column because the server runs the statement as written and
+ * returns every row it produces. A heading press there changed the arrow and
+ * nothing else. Nulls sort last whichever the direction; a numeric column compares
+ * as numbers, and anything else compares as text in the browser's collation with
+ * digits read as numbers. The sort is stable, so equal keys keep the statement's
+ * order. Returns the input itself when there is no sort column.
+ */
+export function sortRowsLocally(
+  rows: JetsRow[],
+  columns: ColumnConfig[],
+  sort: SortState,
+  ascending: boolean,
+): JetsRow[] {
+  if (sort.sortColumnIndex === null) return rows;
+  const col = visibleColumns(columns)[sort.sortColumnIndex];
+  if (col === undefined) return rows;
+  const at = col.index;
+  const sign = ascending ? 1 : -1;
+  const compare = (a: string, b: string): number => {
+    if (col.isNumeric) {
+      const x = Number(a);
+      const y = Number(b);
+      if (!Number.isNaN(x) && !Number.isNaN(y)) return x - y;
+    }
+    return a.localeCompare(b, undefined, { numeric: true });
+  };
+  return rows
+    .map((row, i) => ({ row, i }))
+    .sort((p, q) => {
+      const a = p.row[at] ?? null;
+      const b = q.row[at] ?? null;
+      if (a === null || b === null) {
+        if (a === b) return p.i - q.i;
+        return a === null ? 1 : -1;
+      }
+      return sign * compare(a, b) || p.i - q.i;
+    })
+    .map((p) => p.row);
 }
 
 /**
@@ -154,10 +230,14 @@ export function pageAfterRowsPerPageChange(
 /**
  * The text of one cell. `_cellValue` (`data_table_source.dart:226`).
  *
- * The literal string `'null'` for an absent value is the Dart's, kept because
- * users read these tables and a blank cell and a null are different facts. The
+ * ~~The literal string `'null'` for an absent value is the Dart's, kept because
+ * users read these tables and a blank cell and a null are different facts.~~
+ * **A null is an empty cell since 2026-11-11.** The word `null` in every empty
+ * column read as data (a status of "null", a file key of "null") and was the
+ * first thing a reader of the User Guide's screenshots asked about. No column
+ * gives a null a meaning of its own: both cell filters pass a null through. The
  * `cellFilter` closure cannot cross into TypeScript — three columns declare one,
- * all `file_key` — so a filtered column renders unfiltered until A.4b's caller
+ * all `file_key` — so a filtered column renders unfiltered until the table's caller
  * supplies a replacement. See the corpus README.
  */
 export function cellText(
@@ -166,20 +246,20 @@ export function cellText(
   cellFilter?: (value: string | null) => string | null,
 ): string {
   const v = row[column.index] ?? null;
-  if (cellFilter) return cellFilter(v) ?? "null";
-  return v ?? "null";
+  if (cellFilter) return cellFilter(v) ?? "";
+  return v ?? "";
 }
 
 /** The unfiltered value, for copy-to-clipboard. `_cellFullValue` (`:234`). */
 export function cellFullText(row: JetsRow, column: ColumnConfig): string {
-  return row[column.index] ?? "null";
+  return row[column.index] ?? "";
 }
 
 /**
  * Which rows are selected, by position in the current page.
  *
  * Positional rather than keyed because everything downstream is positional: the
- * form-state binding A.4c implements reads `keyColumnIdx` and `columnIdx` out of
+ * form-state binding (`binding.ts`) reads `keyColumnIdx` and `columnIdx` out of
  * the row array, and the server returns rows as arrays.
  */
 export type Selection = readonly boolean[];
@@ -193,7 +273,7 @@ export function emptySelection(size: number): Selection {
  *
  * Single-select clears every other row first. The Dart does this by walking the
  * list and calling `_updateFormState(i, false)` on each previously selected row,
- * which is the form-state half; A.4c reproduces that side. This returns only the
+ * which is the form-state half; the binding reproduces that side. This returns only the
  * new selection and the rows that were deselected, so the caller can do both
  * without this function knowing what a form is.
  */

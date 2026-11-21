@@ -1,6 +1,8 @@
 package jetrules_native_adaptor
 
 import (
+	"sync"
+
 	"github.com/artisoft-io/jetstore/jets/bridge"
 	"github.com/artisoft-io/jetstore/jets/compute_pipes"
 )
@@ -21,8 +23,9 @@ type JetRuleEngineNative struct {
 	processName  string
 	js           *bridge.JetStore
 	isDebug      bool
-	// retractionMode is the LEGACY retraction mode the networks were built in
-	retractionMode compute_pipes.RetractionMode
+
+	// jetResourcesOnce guards jetResources, which the sessions of a pool share
+	jetResourcesOnce sync.Once
 }
 
 type RdfNodeNative struct {
@@ -33,7 +36,7 @@ type JetResourceManagerNative struct {
 	js *bridge.JetStore // metadata resources
 	// session-based resources, made through the RDF session: through the rete
 	// session they fell back to js until the first rete session existed, and the
-	// meta graph is locked by then (rules_unit_test_harness I-15)
+	// meta graph is locked by then
 	rdfs *bridge.RDFSession
 }
 

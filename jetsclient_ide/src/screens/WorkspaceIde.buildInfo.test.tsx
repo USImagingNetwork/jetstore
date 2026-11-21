@@ -1,8 +1,7 @@
 /**
  * @vitest-environment jsdom
  *
- * **The Workspace IDE shows the build information once.** jetstore_maintenance_02
- * Phase 1, task AC.3, for D05.
+ * **The Workspace IDE shows the build information once.** 2026-10-01.
  *
  * The shell draws the build line in a footer at the bottom of every screen, and
  * this screen already has a bottom bar of its own — so here the footer stands
@@ -11,7 +10,7 @@
  * status bar used to follow the editor only, so with no file open the line
  * would have been nowhere at all.
  *
- * jsdom has no layout, so *at the bottom* is a browser check (plan `AC.4`). What
+ * jsdom has no layout, so *at the bottom* is a browser check. What
  * is asserted here is *how many*, and *in which bar*.
  *
  * The shell is rendered rather than the screen alone, as in
@@ -43,8 +42,8 @@ function stubServer() {
       return new Response(
         JSON.stringify({
           token: "t0",
-          name: "Michel",
-          user_email: "michel@artisoft.io",
+          name: "Test User",
+          user_email: "user@example.com",
           is_admin: false,
           capabilities: [WORKSPACE_IDE],
           jetstore_version: "1759338000",
@@ -96,7 +95,7 @@ function stubServer() {
 
 async function mount() {
   const api = new ApiClient("", stubServer());
-  await api.login("michel@artisoft.io", "pw");
+  await api.login("user@example.com", "pw");
   render(
     <MemoryRouter initialEntries={["/workspace"]}>
       <Routes>

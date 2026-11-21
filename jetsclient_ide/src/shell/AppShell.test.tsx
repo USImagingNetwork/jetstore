@@ -1,7 +1,7 @@
 /**
  * @vitest-environment jsdom
  *
- * Tests for the application shell (task A.1).
+ * Tests for the application shell.
  *
  * The one worth reading is the last: **routes resolve under the mount prefix.**
  * Vite bakes `base` into asset urls at build time and the router's `basename`
@@ -17,6 +17,7 @@ import { MemoryRouter, Navigate, Route, Routes, useLocation } from "react-router
 
 import { ApiClient } from "../api/client";
 import { AppShell, type NavItem } from "./AppShell";
+import { useNavEntry } from "./navEntry";
 import { useNotifications } from "./notifications";
 
 afterEach(() => {
@@ -33,8 +34,8 @@ async function signedIn(
     new Response(
       JSON.stringify({
         token: "t0",
-        name: "Michel",
-        user_email: "michel@artisoft.io",
+        name: "Test User",
+        user_email: "user@example.com",
         is_admin: false,
         capabilities,
         ...build,
@@ -43,7 +44,7 @@ async function signedIn(
     ),
   ) as unknown as typeof fetch;
   const api = new ApiClient("", fetchImpl);
-  await api.login("michel@artisoft.io", "pw");
+  await api.login("user@example.com", "pw");
   return api;
 }
 
@@ -72,6 +73,12 @@ function Counted({ api }: { api: ApiClient }) {
   return <p>screen: counted</p>;
 }
 
+/** A screen reached from the Runbooks entry, whatever its address. */
+function ClaimsRunbooks() {
+  useNavEntry("/runbooks");
+  return <p>screen: runbooks</p>;
+}
+
 /** Surfaces the in-app location so a test can assert the basename was stripped. */
 function LocationProbe() {
   const location = useLocation();
@@ -92,6 +99,10 @@ function renderShell(
           <Route path="workspace" element={<Screen name="workspace" />} />
           <Route path="flows" element={<Screen name="flows" />} />
           <Route path="counted" element={<Counted api={api} />} />
+          <Route path="workspaces" element={<Screen name="workspaces" />} />
+          <Route path="workspaces/:workspace_name/runbooks" element={<ClaimsRunbooks />} />
+          <Route path="runbooks" element={<ClaimsRunbooks />} />
+          <Route path="runbooks/run/:run_key" element={<ClaimsRunbooks />} />
         </Route>
       </Routes>
     </MemoryRouter>,
@@ -115,7 +126,7 @@ describe("AppShell", () => {
     renderShell(await signedIn(), nav);
     expect(await screen.findByText("screen: workspace")).toBeTruthy();
     expect(screen.getByRole("navigation", { name: "Screens" })).toBeTruthy();
-    expect(screen.getByText("Michel")).toBeTruthy();
+    expect(screen.getByText("Test User")).toBeTruthy();
   });
 
   it("navigates between screens without a reload", async () => {
@@ -151,7 +162,7 @@ describe("AppShell", () => {
       expired
         ? new Response("{}", { status: 401 })
         : new Response(
-            JSON.stringify({ token: "t0", name: "Michel", user_email: "m@x.io", is_admin: true, capabilities: [] }),
+            JSON.stringify({ token: "t0", name: "Test User", user_email: "m@x.io", is_admin: true, capabilities: [] }),
             { status: 200 },
           ),
     ) as unknown as typeof fetch;
@@ -173,8 +184,36 @@ describe("AppShell", () => {
     expect(screen.getByRole("link", { name: "Workspace IDE" }).className).not.toContain("is-active");
   });
 
+  // The Runbooks screen of a workspace lives at /workspaces/<name>/runbooks,
+  // under the Workspaces entry's address, and is reached from Runbooks.
+  it("marks the entry a screen claims, and not the one its address is under", async () => {
+    const withRunbooks: NavItem[] = [
+      { to: "/workspaces", label: "Workspaces" },
+      { to: "/runbooks", label: "Runbooks" },
+    ];
+    const marked = () =>
+      ["Workspaces", "Runbooks"].filter((name) =>
+        screen.getByRole("link", { name }).className.includes("is-active"),
+      );
+    for (const at of ["/workspaces/jets_ws/runbooks", "/runbooks", "/runbooks/run/12"]) {
+      renderShell(await signedIn(), withRunbooks, { initial: at });
+      await screen.findByText("screen: runbooks");
+      expect(marked()).toEqual(["Runbooks"]);
+      expect(screen.getByRole("link", { name: "Runbooks" }).getAttribute("aria-current")).toBe("page");
+      expect(screen.getByRole("link", { name: "Workspaces" }).getAttribute("aria-current")).toBeNull();
+      cleanup();
+    }
+
+    // Leaving the screen gives the address back its say.
+    renderShell(await signedIn(), withRunbooks, { initial: "/workspaces/jets_ws/runbooks" });
+    await screen.findByText("screen: runbooks");
+    fireEvent.click(screen.getByRole("link", { name: "Workspaces" }));
+    await screen.findByText("screen: workspaces");
+    expect(marked()).toEqual(["Workspaces"]);
+  });
+
   it("disables a nav item the user has no capability for, and keeps it visible", async () => {
-    // **Corrected in A.2.** A.1 filtered the item out of the list; every gated
+    // **Corrected later.** The first shell filtered the item out of the list; every gated
     // control in the Flutter app disables and stays visible
     // (`screens/base_screen.dart:155`), so hiding was a divergence introduced
     // without noticing. An application that looks different to different people,
@@ -241,7 +280,7 @@ describe("AppShell", () => {
     expect(document.documentElement.getAttribute("data-theme")).toBe("dark");
   });
 
-  it("shows the build information at the foot of the screen (D05)", async () => {
+  it("shows the build information at the foot of the screen", async () => {
     renderShell(
       await signedIn(["workspace_ide"], { jetstore_version: "1759338000", jetstore_git_sha: "jets_ai-6aeb790" }),
       nav,

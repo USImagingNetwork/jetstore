@@ -3,7 +3,6 @@ package user
 import (
 	"context"
 	"errors"
-	"fmt"
 	"html"
 	"log"
 	"regexp"
@@ -38,7 +37,9 @@ type User struct {
 //	- run_pipelines: Load files and run pipelines
 //  - user_profile:  Update user profile
 //  - infer_server_admin: Start & stop the Infer Server and manage its models
-// NOTE: role_capability table is initialized in jets_init_db.sql
+//  - user_admin: Administer users (update/users, delete/users), never the admin's own row
+//  - delete_session: Delete a session completely
+// NOTE: role_capability table is initialized in jets_init_db.sql, which lists them all
 
 func NewUser(email string) *User {
 	u := User{Email: email}
@@ -106,7 +107,7 @@ func (u *User) Validate(action string) error {
 		// the built-in administrator's login need not be an email (-adminEmail
 		// defaults to "admin"), and a login nobody registered fails the lookup
 		// in Server.Login like any other. Registration still requires an email
-		// (the default case below). rules_unit_test_harness I-32, 2026-10-11.
+		// (the default case below). 2026-10-11.
 		return nil
 
 	default:
@@ -183,12 +184,13 @@ func GetUserByEmail(dbpool *pgxpool.Pool, email string) (*User, error) {
 		u.roles[role] = true
 	}
 	if len(u.roles) > 0 {
-		for i := range encryptedRoles {
-			encryptedRoles[i] = fmt.Sprintf("'%s'", encryptedRoles[i])
-		}
-		stmt = fmt.Sprintf("SELECT capability	FROM jetsapi.role_capability WHERE role IN (%s)",
-			strings.Join(encryptedRoles, ","))
-		rows, err := dbpool.Query(context.Background(), stmt)
+		// The roles are bound, not spliced into the statement. They are whatever
+		// update/users last wrote, and since that statement moved from the admin
+		// alone to the user_admin capability (2026-11-07) a role name is input
+		// from a user other than the admin: spliced in quotes, a role containing
+		// a quote would be SQL run on every request its holder makes.
+		stmt = "SELECT capability FROM jetsapi.role_capability WHERE role = ANY($1)"
+		rows, err := dbpool.Query(context.Background(), stmt, encryptedRoles)
 		if err != nil {
 			log.Println("while select user by user_email from db:", err)
 			return nil, errors.New("error retreiving roles")

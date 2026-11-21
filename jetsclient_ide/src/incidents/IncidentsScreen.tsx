@@ -1,37 +1,45 @@
 /**
  * The incident list: what triage has concluded, and where each incident sits.
  *
- * Task AE.1, gap 11 residue — the supervision half of Phase 4, on K.3's
- * precedent and in this project's third directory inside ui_refresh's
- * application (Q-24, answered by the user 2026-09-04).
+ * The incident half of agent supervision, on the proposal screens'
+ * precedent and in the agentic layer's third directory inside the IDE
+ * application (settled 2026-09-04).
  *
  * ## Two columns, never one
  *
- * Plan §9.5's finding is that the execution record supports a taxonomy of
- * **locus** and not of **cause**. `AB.1` therefore carries both on the row with
- * the cause optional (I-289), and **R-27** — that a locus will be read as a
- * cause — names this screen as the place the two are seen together for the first
+ * The execution record supports a taxonomy of
+ * **locus** and not of **cause**. The incident table therefore carries both on the
+ * row with the cause optional, and the risk — that a locus will be read as a
+ * cause — is greatest on this screen, the place the two are seen together for the first
  * time. So the headings say which is which, and an incident with no cause claimed
  * renders the words *not claimed* rather than an empty cell. **A blank cell reads
  * as missing data**; the schema says an unclaimed cause is a legitimate state, and
  * the whole argument for `classification` being nullable was that a deterministic
  * triage step must be able to write an incident without inventing one.
  *
- * ## The empty state is this screen's main behaviour today
+ * ## The empty state says why it is empty
  *
- * Nothing writes `jetsapi.incident` yet — the shadow-mode wiring is `AC.3` — so
- * this list is empty in every deployment. That is stated on the screen rather
- * than left to be inferred, because **an empty supervision queue reads as a quiet
- * system**, and a reader who concludes that from this screen would be concluding
- * it from a table nothing has ever written to.
+ * One thing raises an incident: `shadow_triage` (`jets/cmds/shadow_triage`,
+ * through `jets/agentic/shadow`'s `Writer`, the only `INSERT` into
+ * `jetsapi.incident`), and it runs only where the detection task is deployed. A
+ * verdict on `IncidentScreen` moves an incident's status and creates none. So
+ * this list is empty in any deployment where that task has
+ * not run, and the empty state says so and points at the Detection screen rather
+ * than leaving it to be inferred, because **an empty supervision queue reads as a
+ * quiet system**, and a reader who concludes that from this screen may be
+ * concluding it from a table nothing has written to.
+ *
+ * Until 2026-11-10 this paragraph said nothing writes `jetsapi.incident` and the
+ * list is empty in every deployment. That was true when it was written and stopped
+ * being true when the shadow-mode wiring landed; the on-screen text had
+ * already been corrected.
  *
  * ## The adjudicated view, and why it is not a filter for tidiness
  *
  * Three of `IncidentStatus`'s eleven values are adjudications rather than
- * progress — `verified`, `reclassified` and `suppressed_as_benign` — and plan
- * §10.7 argues that such a transition **is** a corrected label, the only
- * labelling instrument this programme can build (**I-276**). `AA.2` counted the
- * labelled population at zero. This view is the read side of that instrument, and
+ * progress — `verified`, `reclassified` and `suppressed_as_benign` — and such a
+ * transition **is** a corrected label, the only labelling instrument JetStore
+ * has. The labelled population was counted at zero. This view is the read side of that instrument, and
  * what it shows today is that count.
  */
 
@@ -172,7 +180,7 @@ export function IncidentsScreen({ api }: { api: ApiClient }) {
                 <tr>
                   <th scope="col">Incident</th>
                   <th scope="col">Detected</th>
-                  {/* The two headings are the mitigation for R-27. A locus is
+                  {/* The two headings keep a locus from being read as a cause. A locus is
                       where the evidence sits; a classification is a claim about
                       what produced it, and the record does not determine the
                       step between them. */}
@@ -205,7 +213,7 @@ export function IncidentsScreen({ api }: { api: ApiClient }) {
                     <td>
                       {r.classification === "" ? (
                         // Words rather than a blank. An unclaimed cause is a
-                        // state the schema admits on purpose (I-289), and an
+                        // state the schema admits on purpose, and an
                         // empty cell would read as data that failed to load.
                         <em className="unclaimed">not claimed</em>
                       ) : (

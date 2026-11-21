@@ -1,6 +1,6 @@
-"""The audit-store DDL emitter (A8.1) — `jetsapi.agent_audit`, generated.
+"""The audit-store DDL emitter — `jetsapi.agent_audit`, generated.
 
-The §7.2 sketch, derived from the item-1 entities rather than hand-written:
+The audit-store sketch, derived from the domain entities rather than hand-written:
 the run-correlation column takes its name and type from `AgentRun`'s key
 field, the `tier` CHECK enumerates `AutonomyTier`, and the `event_type`
 CHECK enumerates `AuditEventType` — change the model and the DDL follows on
@@ -13,23 +13,23 @@ package directories and the installer is Go. Statements are separated by
 naive `;`-splitter that executes `jets_init_db.sql` cannot carry this file,
 and the audit package's InstallSchema splits on the marker instead.
 
-What the DDL enforces, per §7.2 and §7.3:
+What the DDL enforces, per the audit-store design:
 
 - **Append-only by construction:** one statement-level trigger raises on
   UPDATE, DELETE and TRUNCATE, plus REVOKE of all three from PUBLIC. Today
   the application connects as a superuser, which bypasses GRANT/REVOKE but
   not triggers — so the trigger does the work and the REVOKE starts meaning
-  something the day the application moves off superuser (I-5, §7.3).
-- **The flag and the table agree, per class (F68, added at AB.1):**
+  something the day the application moves off superuser.
+- **The flag and the table agree, per class (added later):**
   `_assert_tables_agree` runs inside `emit()` and fails the generate when an
   entity carrying `jr_as_table` has no `CREATE TABLE` here, or when a table
   here belongs to an entity the domain model does not make a table. The file
   now writes **eight** of them, which is where naming them one at a time
-  stopped being a method. **AB.2 is the first task the guard caught rather
+  stopped being a method. **The next change was the first the guard caught rather
   than the one that wrote it**: setting `jr_as_table` on `Remediation` and
   `IncidentEvent` failed `generate --check` by name, before either table
   existed here.
-- **The additive half of a migration, per table (AB.4, I-337):** every
+- **The additive half of a migration, per table:** every
   `CREATE TABLE` is followed by one `ALTER TABLE … ADD COLUMN IF NOT EXISTS`
   per **nullable** column. `CREATE TABLE IF NOT EXISTS` does nothing to a table
   that already exists, so before this a column added to the model reached a
@@ -37,7 +37,7 @@ What the DDL enforces, per §7.2 and §7.3:
   way. The boundary is deliberate and is stated on `_added_column_alters`:
   NOT NULL columns, drops, renames and type changes each need a migration with
   an author, and this covers none of them.
-- **The hash chain (A8.5):** a BEFORE INSERT trigger assigns `seq`
+- **The hash chain:** a BEFORE INSERT trigger assigns `seq`
   (monotonic per run), links `prev_hash` to the previous row's `row_hash`,
   and computes `row_hash` as SHA-256 over the row's fields joined by the
   0x1F unit separator — recomputable by any client, which is what makes the
@@ -67,7 +67,7 @@ def _key_field(entity) -> tuple[str, object]:
 # entities use six, and a general mapper would invite emitting tables for
 # entities that have no business being tables.
 #
-# `float` was missing until N.2 (2026-08-24) and the fall-through below is
+# `float` was missing until 2026-08-24 and the fall-through below is
 # `text`, so a float field would have become a text column silently. Nothing
 # had caught it because no *tabled* entity carried a float: Hypothesis.confidence
 # is the only other one and Hypothesis has no table. Anomaly's deviation
@@ -107,13 +107,13 @@ def _pg_type(annotation) -> tuple[str, bool]:
         if isinstance(inner_annotation, type) and issubclass(inner_annotation, BaseModel):
             # A list of value objects is **one** jsonb array, not an array of
             # jsonb. Hypothesis.supporting_evidence is the first of these and
-            # AB.1 is where it arrived: before this entity was a table the
+            # arrived when Hypothesis was tabled: before this entity was a table the
             # branch below fell through to `text`, so the column would have been
             # `text[]` — a list of opaque strings where the model declares a list
-            # of {statement, source, source_ref}. That is I-128's silent
+            # of {statement, source, source_ref}. That is the silent `text`
             # widening firing on a composite rather than on a scalar, and it is
             # the failure mode `jr_as_table` on a second entity was always going
-            # to expose (I-287).
+            # to expose.
             return "jsonb", nullable
         inner, _ = _pg_type(inner_annotation)
         return f"{inner}[]", nullable
@@ -134,8 +134,8 @@ def _pg_type(annotation) -> tuple[str, bool]:
     # text column and the DDL still compiles. Raising instead would be the
     # stricter choice and is *not* taken here, because this emitter runs over
     # every field of every tabled entity and a hard failure on an unmapped type
-    # would make adding a field to the model a two-file change. Recorded as
-    # I-128 with the trade stated; the guard that actually matters is that a
+    # would make adding a field to the model a two-file change. Recorded as an
+    # issue with the trade stated; the guard that actually matters is that a
     # column's type is read in review.
     return _PG_TYPES.get(annotation, "text"), nullable
 
@@ -199,19 +199,19 @@ def _added_column_alters(entity) -> str:
 
     **`CREATE TABLE IF NOT EXISTS` does nothing to a table that already exists,
     which is fine while a generator only ever creates and stops being fine at the
-    second version.** AB.1 and AB.2 created these tables; AB.4 is the first task
-    to *change* one, and without this the new `incident_run_ref` would reach a
+    second version.** Earlier changes created these tables; adding `incident_run_ref`
+    was the first to *change* one, and without this the new `incident_run_ref` would reach a
     fresh database and no migrated one — silently, since `InstallSchema` runs
     clean either way and the missing column surfaces as a 42703 in whatever
-    queries it next (**I-337**).
+    queries it next.
 
-    **The rule was nullable columns only until AC.3, and it is now every added
-    column, with the NOT NULL case emitted as two statements.** `AB.4` wrote the
-    boundary as *a NOT NULL column cannot be added to a populated table without a
+    **The rule was nullable columns only at first, and it is now every added
+    column, with the NOT NULL case emitted as two statements.** It was first
+    written with the boundary as *a NOT NULL column cannot be added to a populated table without a
     default, so it needs a hand-written migration* — true, and it made the first
-    NOT NULL widening silent rather than hard. `AC.3` added two required columns
-    to `Hypothesis` (Q-46) and would have had them reach a fresh database and no
-    migrated one, which is I-337 with the loudness removed.
+    NOT NULL widening silent rather than hard. Two required columns added later
+    to `Hypothesis` would have reached a fresh database and no
+    migrated one, which is the missing-column failure with the loudness removed.
 
     So the constraint travels on the same statement: a NOT NULL column emits
     `ADD COLUMN IF NOT EXISTS <col> <type> NOT NULL`. **One statement rather than
@@ -225,7 +225,7 @@ def _added_column_alters(entity) -> str:
     **What it does in each of the three states.** On a fresh install the CREATE
     already made the column and the statement is skipped. On a migrated **empty**
     table the column is added with its constraint, which is every deployment of
-    `jetsapi.hypothesis` that exists — the table has never held a row (F288). On
+    `jetsapi.hypothesis` that exists — the table has never held a row. On
     a migrated **populated** table it fails with a not-null violation naming the
     column.
 
@@ -234,7 +234,7 @@ def _added_column_alters(entity) -> str:
     a 42703 in whatever query touches it, in production, far from the cause — into
     a migration that stops and says which column it could not add. What the
     existing rows should say is still a hand-written migration with an author;
-    what changed is that nobody discovers the gap by accident (**I-381**).
+    what changed is that nobody discovers the gap by accident.
 
     **One case is still silent and is named rather than left to be found**: a
     column that already exists as nullable and that the model now marks required
@@ -269,30 +269,29 @@ def _added_column_alters(entity) -> str:
 
 
 def _assert_tables_agree(sql: str) -> None:
-    """**F68's guard, and the reason it is here rather than in a check script.**
+    """**The flag-and-table guard, and the reason it is here rather than in a check script.**
 
-    F68 is that this emitter names its tabled entities one at a time while the
+    The defect is that this emitter names its tabled entities one at a time while the
     rest of the toolchain — the .jr, the sidecar, the schema projection, the
     compile check — iterates `ENTITIES` on `jr_as_table`. So the flag and the
     Postgres table are set in two files with nothing connecting them, and
     setting one is a complete-looking change: every check in the chain reports
-    clean, because they all read the .jr side. I-24 recorded the confusion in
-    Phase 1 after `agent_run` and `change_proposal` were left modelled and
-    unwritable; N.2 avoided it for `Anomaly` by hand; AB.1 tables two more at
-    once, which is when *by hand* stops being a method.
+    clean, because they all read the .jr side. The confusion was recorded early
+    on, after `agent_run` and `change_proposal` were left modelled and
+    unwritable; it was avoided for `Anomaly` by hand; tabling two more at
+    once is when *by hand* stops being a method.
 
     The assertion runs inside `emit()`, so it fires on `jets-agentic generate`
     **and** on `generate --check` — a stale or missing table is a nonzero exit
     rather than something a reader has to notice. It is deliberately checked in
     **both directions and per class**: a flagged entity with no CREATE TABLE is
-    the failure I-24 recorded, and an unflagged entity *with* one is a table
+    the failure recorded early on, and an unflagged entity *with* one is a table
     nothing in the domain model asks for, which is the same defect arriving from
     the other side and would otherwise be invisible.
 
     What it does not check is the columns — that is `_table_columns`, which is
     reflection-driven and cannot drift. The JetRules half is checked separately,
-    by `compile_check`, against `domain_tables` in the compiled workspace
-    (I-129).
+    by `compile_check`, against `domain_tables` in the compiled workspace.
     """
     problems: list[str] = []
     for entity in M.ENTITIES:
@@ -302,7 +301,7 @@ def _assert_tables_agree(sql: str) -> None:
             problems.append(
                 f"{entity.__name__} carries jr_as_table = True and this emitter writes no "
                 f"`{stmt}`. Setting the flag alone leaves the entity modelled and unwritable, "
-                f"which is I-24; add the table to emit()."
+                f"so add the table to emit()."
             )
         if not entity.jr_as_table and present:
             problems.append(
@@ -312,7 +311,7 @@ def _assert_tables_agree(sql: str) -> None:
             )
     if problems:
         raise AssertionError(
-            "jr_as_table and the emitted DDL disagree (F68):\n  " + "\n  ".join(problems)
+            "jr_as_table and the emitted DDL disagree:\n  " + "\n  ".join(problems)
         )
 
 
@@ -326,7 +325,7 @@ def emit() -> str:
     hypothesis_columns = _table_columns(M.Hypothesis)
     remediation_columns = _table_columns(M.Remediation)
     incident_event_columns = _table_columns(M.IncidentEvent)
-    # AB.4: the additive half of a migration, per table. See
+    # The additive half of a migration, per table. See
     # _added_column_alters for what it covers and what it deliberately does
     # not.
     run_alters = _added_column_alters(M.AgentRun)
@@ -351,7 +350,7 @@ def emit() -> str:
     severities = ", ".join(f"'{m.value}'" for m in M.Severity)
     incident_statuses = ", ".join(f"'{m.value}'" for m in M.IncidentStatus)
     actor_kinds = ", ".join(f"'{m.value}'" for m in M.ActorKind)
-    # §A.2.9's validator rule, expressed as the complement of one member rather
+    # The proposal's validator rule, expressed as the complement of one member rather
     # than as a hand-written pair: the vocabulary carries all three values
     # because the rule is *about* the third, and the DDL admits the other two.
     # Read off the enum for the same reason `step_ambiguous` below is — a rename
@@ -366,7 +365,7 @@ def emit() -> str:
     sql = f"""-- =====================================================================================
 -- jetsapi.agent_audit -- GENERATED by `jets-agentic generate`. DO NOT EDIT.
 -- Source: tools/jets_agentic/jets_agentic/model.py, model version {M.MODEL_VERSION}.
--- The agentic audit store's system of record (plan section 7.2): intent, decision and
+-- The agentic audit store's system of record: intent, decision and
 -- outcome rows appended per agent run, append-only by trigger, hash-chained per run.
 -- Statements are separated by `-- stmt` markers; jets/agentic/audit.InstallSchema
 -- executes them. The existing zap audit logger stays as the CloudWatch mirror.
@@ -425,7 +424,7 @@ CREATE TRIGGER agent_audit_chain
 -- stmt
 CREATE OR REPLACE FUNCTION jetsapi.agent_audit_immutable() RETURNS trigger AS $$
 BEGIN
-  RAISE EXCEPTION 'jetsapi.agent_audit is append-only: % is not permitted; outcomes are appended as new rows, never as updates (plan section 7.2)', TG_OP;
+  RAISE EXCEPTION 'jetsapi.agent_audit is append-only: % is not permitted; outcomes are appended as new rows, never as updates', TG_OP;
 END $$ LANGUAGE plpgsql;
 -- stmt
 DROP TRIGGER IF EXISTS agent_audit_immutable ON jetsapi.agent_audit;
@@ -442,7 +441,7 @@ REVOKE UPDATE, DELETE, TRUNCATE ON jetsapi.agent_audit FROM PUBLIC;
 -- could leave one present and the other absent.
 --
 -- Unlike agent_audit this table is NOT append-only. A run is written once
--- before anything acts (the write-before-act intent, plan section 7.2) and
+-- before anything acts (the write-before-act intent) and
 -- updated once when it ends, with its outcome and what it spent. That is the
 -- division the audit store depends on: the run row is mutable state and the
 -- audit rows are the immutable record of how it got there, so a lost update
@@ -452,14 +451,14 @@ CREATE TABLE IF NOT EXISTS jetsapi.agent_run (
   CONSTRAINT agent_run_tier_ck CHECK (tier IN ({tiers}))
 );
 {run_alters}-- stmt
--- What a run proposes. Phase 1 writes one on success and writes nothing to git:
--- staged branch writes are the analysis's "Write - staged" class and arrive
--- with the Phase-2 approval screens, because a copilot that can commit before
--- anyone can review the commit has the supervision layer in the wrong order.
+-- What a run proposes. An authoring run writes one on success and writes nothing
+-- to git: staged branch writes arrive with the approval screens, because a
+-- copilot that can commit before anyone can review the commit has the
+-- supervision layer in the wrong order.
 --
--- Note what `draft` means here. Appendix A.2.10 requires generated_tests,
--- affected_pipelines and the impact analysis, and a Phase-1 authoring run has
--- none of them - it produced one transformation, not a change set with tests
+-- Note what `draft` means here. The proposal's ChangeProposal schema requires
+-- generated_tests, affected_pipelines and the impact analysis, and an authoring
+-- run has none of them - it produced one transformation, not a change set with tests
 -- and a blast radius. Those columns are NOT NULL because the model marks the
 -- fields required, and a draft carries empty arrays rather than nulls: honest
 -- about having nothing, and distinguishable from a proposal that was never
@@ -470,12 +469,12 @@ CREATE TABLE IF NOT EXISTS jetsapi.change_proposal (
   CONSTRAINT change_proposal_approval_state_ck CHECK (approval_state IN ({approval_states}))
 );
 {proposal_alters}-- stmt
--- Who decided what, and from which state to which. The supervision seam of
--- section 7.2, emitted for the first time at K.1.
+-- Who decided what, and from which state to which. The supervision seam of the
+-- audit store.
 --
 -- **This table is the typed half of a record whose other half is an audit
 -- event, and the two are written in one transaction.** jetsapi.agent_audit
--- carries an `approval` event type and has since Phase 0, which is what makes
+-- carries an `approval` event type and always has, which is what makes
 -- the decision tamper-evident: hash-chained, append-only, ordered within its
 -- run. What it cannot carry is structure. Its columns are actor and tier; the
 -- subject, the two states and the rationale would live in `payload` jsonb,
@@ -509,14 +508,14 @@ CREATE INDEX IF NOT EXISTS approval_event_subject_idx
 CREATE INDEX IF NOT EXISTS approval_event_run_idx
   ON jetsapi.approval_event (run_ref);
 -- stmt
--- What a deterministic detector observed, emitted at N.2 (phase-3 plan section 12).
+-- What a deterministic detector observed.
 --
 -- **This table is here because `$as_table` is not persistence.** The Anomaly entity
 -- carries jr_as_table = True, which makes it a table in the JetRules domain model and
--- says nothing about Postgres. I-24 was raised when exactly that confusion left
--- agent_run and change_proposal modelled and unwritable, and was resolved by emitting
--- both from this generator. Anomaly is the third application of that resolution, and
--- the first where the two halves were done in one change rather than two phases apart.
+-- says nothing about Postgres. Exactly that confusion once left agent_run and
+-- change_proposal modelled and unwritable, and was resolved by emitting both from this
+-- generator. Anomaly is the third application of that resolution, and the first where
+-- the two halves were done in one change.
 --
 -- Unlike agent_audit this table is not append-only by trigger, and unlike agent_run it
 -- is not updated: a detector's observation is a fact about one run at one instant.
@@ -524,11 +523,11 @@ CREATE INDEX IF NOT EXISTS approval_event_run_idx
 -- intended - the anomaly_detector_ref column is what tells two generations of a
 -- detector apart.
 --
--- Section 12.2 fixes what each column can hold; three of the schema's own required
+-- The detector rows fix what each column can hold; three of the schema's own required
 -- properties are nullable here because four of the six derivable rows are within-run
--- predicates with no range and no magnitude (I-126). The CHECK constraints carry the
--- three vocabularies, two of which extend the proposal's Appendix A.2.6 with the rows
--- and grains JetStore's execution record actually has (I-127).
+-- predicates with no range and no magnitude. The CHECK constraints carry the three
+-- vocabularies, two of which extend the proposal's Anomaly schema with the rows and
+-- grains JetStore's execution record actually has.
 --
 -- anomaly_confounders is a text[] with a containment CHECK rather than a child table.
 -- The list is small, closed and read whole, which is the same argument the array
@@ -551,49 +550,48 @@ CREATE INDEX IF NOT EXISTS anomaly_session_idx
 CREATE INDEX IF NOT EXISTS anomaly_detector_idx
   ON jetsapi.anomaly (anomaly_detector_ref, detected_at);
 -- stmt
--- What triage concluded, emitted at AB.1 (phase-4 plan section 9).
+-- What triage concluded.
 --
 -- **Two taxonomies, on purpose.** incident_locus is where in the execution record
 -- the evidence sits -- nine values, each a predicate over jetsapi with no free-text
 -- parsing -- and classification is what produced the failure, the proposal's own ten.
--- Section 9.5's reading is that the record supports the first and does not support the
--- second below the level of a hypothesis: three of the ten classes have no substrate
--- in JetStore at all and four are evidenced only coarsely. Carrying both is that
--- section's recommendation rather than this task's choice, because pruning an imported
--- model on this project's authority is the unreviewed extraction gap 2b exists to
--- prevent. Read incident_locus as evidence and classification as a claim; a report
--- that aggregates accuracy over both is the silent rescoping criterion 46 forbids.
+-- The triage design's reading is that the record supports the first and does not
+-- support the second below the level of a hypothesis: three of the ten classes have no
+-- substrate in JetStore at all and four are evidenced only coarsely. Carrying both is
+-- that design's recommendation, because pruning an imported model unilaterally is not
+-- this model's call. Read incident_locus as evidence and classification as a claim; a
+-- report that aggregates accuracy over both silently rescopes what it measures.
 --
 -- **The grain is the session and that is a finding, not a default.** Seven tables can
--- carry evidence for an incident and session_id is the only key all seven share
--- (F202), so an incident identified below the session is one whose evidence set cannot
+-- carry evidence for an incident and session_id is the only key all seven share,
+-- so an incident identified below the session is one whose evidence set cannot
 -- be assembled by a join. incident_step_ref and incident_shard_ref are nullable
 -- because localisation is a property of an incident and not its identity: four of the
 -- nine loci supply no step at all. An incident that sets incident_step_ref should
 -- carry step_label_ambiguous, cpipes_step_id being a stage location rather than a step
--- identity (F52) -- which is why incident_confounders reuses the detector's vocabulary
+-- identity -- which is why incident_confounders reuses the detector's vocabulary
 -- rather than opening a second one that would not compare.
 --
 -- **incident_step_confounder_ck is the one cross-column rule in this file, and it is an
--- invariant rather than a convention.** Section 9.6 says an incident that names a step
--- must carry step_label_ambiguous, and F52's reason does not depend on which step it is:
+-- invariant rather than a convention.** An incident that names a step must carry
+-- step_label_ambiguous, and the reason does not depend on which step it is:
 -- cpipes_step_id is a stage location, so *any* incident naming one inherits the
 -- ambiguity. That makes it checkable, and a requirement that is checkable and left to
--- prose is a requirement that goes quiet the first time nobody re-reads the plan. The
--- alternative -- leave it to AC.1 -- was rejected for that reason and not for a
--- technical one.
+-- prose is a requirement that goes quiet the first time nobody re-reads the design. The
+-- alternative -- leave it to the triage classifier -- was rejected for that reason and
+-- not for a technical one.
 --
--- **incident_run_ref is a governance column and not a localisation one (AB.4, Q-32).**
+-- **incident_run_ref is a governance column and not a localisation one.**
 -- Every other reference here says where in the execution record the incident sits; this
 -- one says which AgentRun raised it, and it exists because jetsapi.agent_audit is keyed
--- on an AgentRun by construction (F254). Before it, a transition on an incident reached
+-- on an AgentRun by construction. Before it, a transition on an incident reached
 -- the hash chain only when its own caller named a run -- which put a person's correction
 -- of a classification on the unchained side and an agent's own reclassification on the
--- chained one, inverting the property a governance record is for (R-34).
+-- chained one, inverting the property a governance record is for.
 -- RecordIncidentTransition reads this column inside the write and uses it when the
 -- caller supplies none. It is nullable because a deterministic triage step is not an
 -- AgentRun, so the residue is *incidents nothing agentic raised*, uniform across actors
--- rather than aimed at humans (R-44). No foreign key, on approval_event.run_ref's
+-- rather than aimed at humans. No foreign key, on approval_event.run_ref's
 -- precedent.
 --
 -- Note what is NOT a column: hypotheses. The domain model declares it as an object
@@ -603,7 +601,7 @@ CREATE INDEX IF NOT EXISTS anomaly_detector_idx
 -- rather than by hand -- see _table_columns.
 --
 -- Like anomaly and unlike agent_audit this table is not append-only by trigger, and
--- unlike anomaly it IS updated: status walks Appendix A.5's state machine, so an
+-- unlike anomaly it IS updated: status walks the proposal's incident state machine, so an
 -- incident row is mutable state and the audit chain is the record of how it moved.
 CREATE TABLE IF NOT EXISTS jetsapi.incident (
 {incident_columns},
@@ -627,38 +625,38 @@ CREATE INDEX IF NOT EXISTS incident_session_idx
 CREATE INDEX IF NOT EXISTS incident_status_idx
   ON jetsapi.incident (status, incident_detected_at);
 -- stmt
--- One ranked causal hypothesis for an incident, emitted at AB.1 with the table above.
+-- One ranked causal hypothesis for an incident, emitted with the table above.
 --
 -- **contradicting_evidence is NOT NULL because the model marks it required, and that
--- is the whole point of the column.** Appendix A.2.8 calls it a calibration control:
--- an agent that can omit the evidence against its own hypothesis will. Section 9.7
--- found that side has a substrate already built -- AnomalyConfounder's fourteen
--- members are the record's own statement of what a detector could not rule out -- and
--- EvidenceSource gained detector_confounder at AB.1 so a hypothesis can name it. An
+-- is the whole point of the column.** The proposal calls it a calibration control:
+-- an agent that can omit the evidence against its own hypothesis will. That side has a
+-- substrate already built -- AnomalyConfounder's fourteen members are the record's own
+-- statement of what a detector could not rule out -- and EvidenceSource gained
+-- detector_confounder so a hypothesis can name it. An
 -- empty array is the honest value where the agent asserts none exists; null is not.
 --
 -- Both evidence columns are jsonb rather than text[]. Evidence is a value object with
 -- three fields and no table of its own (it is a JetsaValue, $as_table = false, on the
 -- jets:State precedent), so it inlines; text[] is what the emitter's unmapped-type
 -- fall-through would have produced, and it would have stored three fields as one
--- opaque string per item. That is I-128's silent widening reaching a composite, and
+-- opaque string per item. That is the silent text widening reaching a composite, and
 -- tabling this entity is what exposed it.
 --
--- **hypothesis_locus and basis were added at AC.3 by the user's answer to Q-46, and
--- deliberately before the first row was written.** Section 19.7 graded criterion 45's last
--- clause -- *a human can read the ranking's basis* -- as met in what the ranker emits and
--- not surviving the write, because this table had a column for neither.
+-- **hypothesis_locus and basis were added deliberately before the first row was
+-- written.** The requirement that *a human can read the ranking's basis* was met in
+-- what the ranker emits and did not survive the write, because this table had a column
+-- for neither.
 --
 -- hypothesis_locus is constrained by the SAME vocabulary incident_locus is: the CHECK
 -- below interpolates the one {loci} the emitter builds from M.IncidentLocus, so there is
--- no second list to drift (F68). It is required because AC.2's headline finding was that
+-- no second list to drift. It is required because the ranker's headline finding was that
 -- 20 of 29 model-generated hypotheses sat at loci triage did not find present -- and
 -- without this column a hypothesis raised at an absent locus is indistinguishable in
 -- stored data from a sound one, which would persist that failure mode in a form that
 -- hides it.
 --
--- basis is counts rather than prose: the two evidence lengths and the section 9.5
--- evidenceability tier the ranker sorts on. A count can be checked against the arrays on
+-- basis is counts rather than prose: the two evidence lengths and the evidenceability
+-- tier the ranker sorts on. A count can be checked against the arrays on
 -- the same row and a sentence cannot. It is persisted rather than left to be recomputed
 -- because *re-run it* is false twice over: the model arm is not deterministic (16
 -- hypotheses on one run and 13 on the next from identical input), and the evidence itself
@@ -681,17 +679,14 @@ CREATE TABLE IF NOT EXISTS jetsapi.hypothesis (
 CREATE INDEX IF NOT EXISTS hypothesis_incident_idx
   ON jetsapi.hypothesis (hypothesis_incident_ref, rank);
 -- stmt
--- A proposed corrective action, emitted at AB.2 (phase-4 plan section 12) -- **with no
--- executor, and nothing in this phase writes a row.** Criterion 47 says in terms that
--- nothing acts; what the table buys is that Phase 5's autonomy gate has a subject.
--- Section 1.4's finding is that autonomy tiers are recorded, trustworthy and gate
--- nothing, and autonomy_tier_required is the one property in the model that names the
+-- A proposed corrective action -- **with no executor, and nothing yet writes a row.**
+-- Nothing acts; what the table buys is that an autonomy gate has a subject. Autonomy
+-- tiers are recorded, trustworthy and gate nothing, and autonomy_tier_required is the one property in the model that names the
 -- authority an *action* needs rather than the authority a run had.
 --
--- **remediation_reversibility_ck is Appendix A.2.9's validator rule and not this
--- project's policy.** The appendix states it: "reversibility: irreversible is rejected
--- at schema level. No irreversible remediation may be persisted at any tier (Section
--- 4.3)." So the Reversibility vocabulary carries three members -- the rule is about the
+-- **remediation_reversibility_ck is the proposal's own validator rule and not a local
+-- policy.** The proposal states it: "reversibility: irreversible is rejected at schema
+-- level. No irreversible remediation may be persisted at any tier." So the Reversibility vocabulary carries three members -- the rule is about the
 -- third -- and this table accepts two. The excluded value is read off the enum rather
 -- than spelled here, so a rename moves the rule instead of quietly widening it, which
 -- is the same mechanism as incident_step_confounder_ck above.
@@ -699,14 +694,13 @@ CREATE INDEX IF NOT EXISTS hypothesis_incident_idx
 -- **The cost of that CHECK is worth naming beside it.** An agent that concludes the
 -- only available correction is irreversible cannot record the conclusion; it can only
 -- decline to propose. The record then shows nothing where a refusal happened, which is
--- a gap a supervision screen cannot display and a Phase 5 metric cannot count. Enforcing
--- the appendix's own rule is still the right call at this phase -- the alternative is a
--- table that accepts a row section 4.3 forbids -- but it is a trade rather than a free
--- guard (R-35).
+-- a gap a supervision screen cannot display and a metric cannot count. Enforcing the
+-- proposal's own rule is still the right call -- the alternative is a table that
+-- accepts a row the proposal forbids -- but it is a trade rather than a free guard.
 --
--- Four of Appendix A.2.9's nine required properties are absent: action_type, proposed_by,
--- rationale and blast_radius. The first is the executor's dispatch key and a tier rule
--- keyed on it would be this task inventing Phase 5's gate; the others are read by a
+-- Four of the proposal's nine required Remediation properties are absent: action_type,
+-- proposed_by, rationale and blast_radius. The first is the executor's dispatch key and
+-- a tier rule keyed on it would be inventing the autonomy gate here; the others are read by a
 -- screen that does not write yet. approver and approved_at are absent for a different
 -- reason -- ApprovalEvent.subject_ref is documented as "the Remediation or ChangeProposal
 -- being decided", so they are already a row in jetsapi.approval_event, and inlining them
@@ -716,7 +710,7 @@ CREATE TABLE IF NOT EXISTS jetsapi.remediation (
   CONSTRAINT remediation_tier_ck CHECK (autonomy_tier_required IN ({tiers})),
   CONSTRAINT remediation_approval_state_ck
              CHECK (remediation_approval_state IN ({approval_states})),
-  -- Appendix A.2.9: '{irreversible}' is a member of the vocabulary and is not
+  -- The proposal's rule: '{irreversible}' is a member of the vocabulary and is not
   -- a persistable value.
   CONSTRAINT remediation_reversibility_ck
              CHECK (reversibility IN ({persistable_reversibilities}))
@@ -727,7 +721,7 @@ CREATE TABLE IF NOT EXISTS jetsapi.remediation (
 CREATE INDEX IF NOT EXISTS remediation_incident_idx
   ON jetsapi.remediation (incident_ref, remediation_approval_state);
 -- stmt
--- One transition of one incident, emitted at AB.2 (I-276). Appendix A.5's preamble says
+-- One transition of one incident. The preamble of the proposal's state machines says
 -- "Every transition records actor, agent version where applicable, and timestamp" and
 -- then draws four machines and no entity to record one. jetsapi.approval_event is that
 -- entity for ChangeProposal; this is it for Incident.
@@ -735,7 +729,7 @@ CREATE INDEX IF NOT EXISTS remediation_incident_idx
 -- **The reason it is owed is a labelled population rather than an audit trail.** Three
 -- of IncidentStatus's eleven values are adjudications rather than progress --
 -- reclassified, verified, suppressed_as_benign -- so the lifecycle already carried the
--- verdicts section 11.3.1's four label-bearing metrics need. What it did not carry is
+-- verdicts the four label-bearing metrics need. What it did not carry is
 -- who reached them, and a label the measured system may have written is not a label.
 --
 -- **event_actor_kind is a column and not a spelling convention**, which is the one place
@@ -750,7 +744,7 @@ CREATE INDEX IF NOT EXISTS remediation_incident_idx
 -- out of the row inside the same statement that moves it, rather than accepting it from
 -- the caller: the party being measured does not state what it is measured against.
 --
--- incident_event_reclassified_ck is Appendix A.5's own sentence -- "reclassified returns
+-- incident_event_reclassified_ck is the proposal's own sentence -- "reclassified returns
 -- to triaged with a new classification and a recorded reason" -- as a cross-column rule.
 -- It is the second such CHECK in this file and it fires on the same argument as the
 -- first: a requirement that is checkable and left in prose goes quiet the first time
@@ -758,10 +752,9 @@ CREATE INDEX IF NOT EXISTS remediation_incident_idx
 --
 -- event_run_ref is nullable and that is the table's one stated weakness. agent_audit's
 -- run_id is an AgentRun's key, and neither a human at a screen nor a deterministic
--- triage step is an AgentRun -- Incident records no run at all, where
--- ChangeProposal.trigger_ref does, which is precisely what the approval handler reads to
--- find the chain to append to. A transition with no run is durable and attributable here
--- and is not in the hash chain (R-34).
+-- triage step is an AgentRun. RecordIncidentTransition falls back to the incident's
+-- incident_run_ref when the caller names no run; a transition on an incident nothing
+-- agentic raised is durable and attributable here and is not in the hash chain.
 --
 -- Like incident and unlike agent_audit this table has no append-only trigger, and like
 -- approval_event it is never updated: a further transition is a further row.
@@ -788,7 +781,7 @@ CREATE INDEX IF NOT EXISTS incident_event_incident_idx
   ON jetsapi.incident_event (event_incident_ref, transitioned_at);
 -- stmt
 -- "Which verdicts did people reach, and when" -- the query a labelled population is
--- counted with (plan section 10.7). Partial on the actor kind because the human rows are
+-- counted with. Partial on the actor kind because the human rows are
 -- the scarce ones and the index exists to make counting them cheap.
 CREATE INDEX IF NOT EXISTS incident_event_human_verdict_idx
   ON jetsapi.incident_event (to_status, transitioned_at)

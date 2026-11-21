@@ -75,7 +75,7 @@ func TestIdeHandlerServesIndexAtRoot(t *testing.T) {
 func TestIdeHandlerFallsBackToIndexForClientRoutes(t *testing.T) {
 	h := appHandler(appAssetPrefix, buildIdeDir(t))
 	// A deep client-side route must survive a reload rather than 404.
-	res := get(t, h, "/workspace/cedargate_ws/jet_rules/main.jr")
+	res := get(t, h, "/workspace/my_ws/jet_rules/main.jr")
 	if res.Code != http.StatusOK {
 		t.Fatalf("got %d, want 200", res.Code)
 	}
@@ -176,7 +176,7 @@ func TestIdeHandlerServesTheRealBundle(t *testing.T) {
 
 // TestIdeShipsItsOwnFavicon guards a dependency that is easy to reintroduce by
 // accident. With no <link rel="icon"> the browser falls back to /favicon.ico at
-// the origin root — which was the *Flutter* app's icon until X.1 and is now this
+// the origin root — which was the *Flutter* app's icon until 2026-08-26 and is now this
 // bundle's own file if one happens to be there and a 404 otherwise. The icon has
 // to ship with this bundle and be declared, which is what stops the tab from
 // depending on what else is in the deployment directory.
@@ -250,7 +250,7 @@ func TestTheCachePolicyIsDerivedFromTheRequestPath(t *testing.T) {
 		// applied at one ServeFile call and not the other shows up here.
 		{"the shell at the root", "/", revalidateCachePolicy, immutableCachePolicy},
 		{"a real unhashed file", "/favicon.ico", revalidateCachePolicy, immutableCachePolicy},
-		{"a deep client route", "/workspace/cedargate_ws/jet_rules/main.jr", revalidateCachePolicy, immutableCachePolicy},
+		{"a deep client route", "/workspace/my_ws/jet_rules/main.jr", revalidateCachePolicy, immutableCachePolicy},
 		{"an unmatched route", "/no-such-page", revalidateCachePolicy, immutableCachePolicy},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

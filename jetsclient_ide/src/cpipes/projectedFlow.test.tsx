@@ -1,21 +1,21 @@
 /**
  * @vitest-environment jsdom
  *
- * **Criterion 32's second half: a projected flow, in the application, from the bytes a
- * workspace receives.** Tasks U.2 and U.3 of the `agentic_ai` project, 2026-08-25.
+ * **A projected flow, in the application, from the bytes a
+ * workspace receives.** Added 2026-08-25.
  *
  * `templateApply.test.ts` beside this file already walked the `qc_metrics` projection with
  * the shipped engine, interpreter and `validateForm` — 24 steps, a config out the other
  * end — and said plainly what it could not show: *"There is no flow runner in this
- * application yet"*. That sentence is false since `ui_refresh`'s F.0a, and two things this
- * project owned stood between the projection and the runner:
+ * application yet"*. That sentence is false since the flow runner landed, and two things
+ * stood between the projection and the runner:
  *
  * * `FlowStore` reads `user_flows/` **in the workspace**, and the projections were
- *   committed under `tools/cpipes_contract/`. U.2 made them the third `AssetGroup`, so
+ *   committed under `tools/cpipes_contract/`. They are now the third `AssetGroup`, so
  *   `install_workspace_assets` writes them into every workspace.
  * * `productionRegistry.actions` did not carry `cpipesTemplateApply`, so
  *   `FlowStore.load` refused the set at `resolveEscapes` — before any button existed to
- *   press. U.3 registered it.
+ *   press. It is registered now.
  *
  * ## What this file demonstrates, and what it still cannot
  *
@@ -32,13 +32,13 @@
  *
  * **What it is not is a browser, and no wording here should be read as one.** Everything
  * below `ApiClient` is real and `fetch` is a stub, exactly as `FlowRunner.test.tsx`'s is;
- * a live apiserver and a database are what would make this criterion's *end to end*
+ * a live apiserver and a database are what would make this file's *end to end*
  * unqualified, and neither was available to the session that wrote it.
  *
  * ## Why `qc_report` for the DOM walk
  *
  * It projects to **one** state — all eleven of its holes are loops, so it asks a filler
- * for nothing and its configuration is its bindings (I-76). That makes it the whole of a
+ * for nothing and its configuration is its bindings. That makes it the whole of a
  * flow in one render, which is what a seam test wants; `qc_metrics`' 34-step walk is
  * already covered headlessly next door and would test the engine a second time rather
  * than the screen.
@@ -57,7 +57,7 @@ import { ApiClient } from "../api/client";
 import { queryEscape, WorkspaceApi } from "../api/workspace";
 import { FlowRunner } from "../screens/FlowRunner";
 import { ApiProvider } from "../shell/capabilities";
-import { NotificationsProvider } from "../shell/notifications";
+import { NotificationsProvider, useNotifications } from "../shell/notifications";
 import { PromptsProvider } from "../shell/prompts";
 import { FlowStore } from "../userflow/store";
 import { valueFieldsOf, type Form } from "../userflow/form";
@@ -112,7 +112,7 @@ interface Posted {
  * third the size of `FlowRunner.test.tsx`'s — the surface a template wizard needs is
  * narrow, and that is a fact about the projection rather than about the test.
  */
-function stubServer() {
+function stubServer(saveAnswer: { status: number; body: unknown } = { status: 200, body: {} }) {
   const posts: Posted[] = [];
   const saved: { fileName: string; content: string }[] = [];
   const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit) => {
@@ -124,8 +124,8 @@ function stubServer() {
       return new Response(
         JSON.stringify({
           token: "t0",
-          name: "Michel",
-          user_email: "michel@artisoft.io",
+          name: "Test User",
+          user_email: "user@example.com",
           is_admin: false,
           capabilities: ["workspace_ide"],
         }),
@@ -157,7 +157,7 @@ function stubServer() {
       case "save_workspace_file_content": {
         const data = (body["data"] as { file_name: string; file_content: string }[])[0]!;
         saved.push({ fileName: data.file_name, content: data.file_content });
-        return new Response("{}", { status: 200 });
+        return new Response(JSON.stringify(saveAnswer.body), { status: saveAnswer.status });
       }
 
       default:
@@ -171,10 +171,10 @@ function stubServer() {
   return { fetchImpl, posts, saved };
 }
 
-async function client() {
-  const stub = stubServer();
+async function client(saveAnswer?: { status: number; body: unknown }) {
+  const stub = stubServer(saveAnswer);
   const api = new ApiClient("", stub.fetchImpl);
-  await api.login("michel@artisoft.io", "pw");
+  await api.login("user@example.com", "pw");
   return { ...stub, api };
 }
 
@@ -204,7 +204,7 @@ describe("a projected document set, where the installer puts it", () => {
    *
    * Without `cpipesTemplateApply` in the registry the set fails at `resolveEscapes` —
    * the sixth of `FlowStore.load`'s six checks, and the last one before a flow would
-   * render. That is exactly the state this application was in until U.3, and stating it
+   * render. That is exactly the state this application was in until it was registered, and stating it
    * as a failing load rather than as prose is what stops the entry above being read as
    * "the documents happen to be fine".
    */
@@ -218,10 +218,14 @@ describe("a projected document set, where the installer puts it", () => {
   });
 });
 
-/** Fills every value field of a form, the way a careful author would. */
-function fillEveryField(form: Form): void {
+/**
+ * Fills every value field of a form, the way a careful author would. With `keepDefaults`
+ * a field that carries a `defaultValue` is left as the form seeded it.
+ */
+function fillEveryField(form: Form, keepDefaults = false): void {
   for (const field of valueFieldsOf(form)) {
     if (field.field !== "text") continue;
+    if (keepDefaults && field.defaultValue !== undefined) continue;
     const json = (field.rules ?? []).some((r) => r.rule === "json");
     // **The value is the field's key**, as `templateApply.test.ts` does and for the
     // same reason: a config whose every value names the step that produced it reads
@@ -242,15 +246,13 @@ describe("the runner drives one, in a DOM, against the real client", () => {
             <MemoryRouter initialEntries={["/flow/qc_report"]}>
               <Routes>
                 <Route path="/flow/:key" element={<FlowRunner api={api} />} />
-                {/* Where a finished flow lands. **`/home` since D.8, and it was
+                {/* Where a finished flow lands. **`/home` now, and it was
                     `/workspace` until then** — a flow declaring no `exitScreenPath`,
                     which a projected one does not, used to exit to the Workspace IDE
-                    wherever it began (I-265). It now returns to the `returnTo` its
+                    wherever it began. It now returns to the `returnTo` its
                     url carries, and to the app's index when it carries none, which
                     is this case. Stubbed so that "the flow completed" is observable
-                    rather than a router warning. Changed by the ui_refresh session
-                    that made it, per the cross-project rule in the root `CLAUDE.md`:
-                    the editor fixes the call site rather than handing it over. */}
+                    rather than a router warning. */}
                 <Route path="/home" element={<p>Home</p>} />
               </Routes>
             </MemoryRouter>
@@ -284,20 +286,73 @@ describe("the runner drives one, in a DOM, against the real client", () => {
       expect({ saved: saved.length, alerts }).toEqual({ saved: 1, alerts: [] });
     });
     // Escaped, because that is what `saveFile` takes and what the server
-    // unescapes on the way in (I-147).
+    // unescapes on the way in.
     expect(saved[0]!.fileName).toBe(queryEscape(configPath("qc_report")));
 
     // **A config, not a form dump.** The escape substitutes into the generator's
     // skeleton, so what comes back is the expanded template with the collected values
-    // in it — which is the property M.5 built the apply plan for.
+    // in it — which is the property the apply plan was built for.
     const config = JSON.parse(saved[0]!.content) as Record<string, unknown>;
     expect(Array.isArray(config["channels"]) || Array.isArray(config["pipes"])).toBe(true);
     expect(saved[0]!.content).toContain("bindings._item.report");
 
     // And the flow finished: `ufCompleted` exits after the state action, so the
     // runner is gone and the app is where a completed flow leaves a user — the
-    // index, since this url carries no `returnTo` (D.8).
+    // index, since this url carries no `returnTo`.
     await waitFor(() => expect(screen.getByText("Home")).toBeTruthy());
+  });
+
+  /**
+   * **The notification context keys start at their neutral defaults and are saved as
+   * such.** They are the keys a deployment's notification template reads, so the flow
+   * offers a default the author can see and change rather than a name fixed in the
+   * shipped documents; left alone, the default is what the config carries.
+   */
+  it("saves the notification keys the form seeded when the author leaves them", async () => {
+    const { api, saved } = await client();
+
+    render(
+      <ApiProvider api={api}>
+        <NotificationsProvider>
+          <PromptsProvider>
+            <MemoryRouter initialEntries={["/flow/qc_report"]}>
+              <Routes>
+                <Route path="/flow/:key" element={<FlowRunner api={api} />} />
+                <Route path="/home" element={<p>Home</p>} />
+              </Routes>
+            </MemoryRouter>
+          </PromptsProvider>
+        </NotificationsProvider>
+      </ApiProvider>,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByText("The values this template is parameterised by")).toBeTruthy(),
+    );
+    expect(
+      (screen.getByLabelText("Notification key for the file type") as HTMLInputElement).value,
+    ).toBe("$NOTIFICATION_FILE_TYPE");
+
+    const form = (JSON.parse(files["user_flows/qc_report.form.json"]!) as {
+      forms: Record<string, Form>;
+    }).forms["bindings"]!;
+    fillEveryField(form, true);
+    await waitFor(() =>
+      expect(
+        (screen.getByRole("button", { name: "Save configuration" }) as HTMLButtonElement).disabled,
+      ).toBe(false),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Save configuration" }));
+    await waitFor(() => expect(saved.length).toBe(1));
+
+    const config = JSON.parse(saved[0]!.content) as { context: { key: string }[] };
+    expect(config.context.map((c) => c.key)).toEqual([
+      "$PROCESSING_TICKET",
+      "$REPORT",
+      "$NOTIFICATION_FILE_TYPE",
+      "$NOTIFICATION_TYPE",
+      "layout_name",
+    ]);
   });
 
   /**
@@ -332,5 +387,121 @@ describe("the runner drives one, in a DOM, against the real client", () => {
     // escape's, and that is the layering the generator intended.
     expect((save as HTMLButtonElement).disabled).toBe(true);
     expect(saved.length).toBe(0);
+  });
+});
+
+/**
+ * The shell's two banners, with the status in its tone, as `AppShell` draws them
+ * (`banner-ok` or `banner-warn`). Rendered outside the router, as the shell is,
+ * so what a flow said survives the flow's exit.
+ */
+function Banners() {
+  const { error, status, statusTone } = useNotifications();
+  return (
+    <>
+      {error != null && <div role="alert">{error}</div>}
+      {status != null && error == null && (
+        <div role="status" className={`banner banner-${statusTone}`}>
+          {status}
+        </div>
+      )}
+    </>
+  );
+}
+
+/** Mounts `/flow/qc_report` against a server answering the save as given, fills it and saves. */
+async function fillAndSave(saveAnswer: { status: number; body: unknown }) {
+  const { api, saved } = await client(saveAnswer);
+  render(
+    <ApiProvider api={api}>
+      <NotificationsProvider>
+        <PromptsProvider>
+          <Banners />
+          <MemoryRouter initialEntries={["/flow/qc_report"]}>
+            <Routes>
+              <Route path="/flow/:key" element={<FlowRunner api={api} />} />
+              <Route path="/home" element={<p>Home</p>} />
+            </Routes>
+          </MemoryRouter>
+        </PromptsProvider>
+      </NotificationsProvider>
+    </ApiProvider>,
+  );
+  await waitFor(() =>
+    expect(screen.getByText("The values this template is parameterised by")).toBeTruthy(),
+  );
+  const form = (JSON.parse(files["user_flows/qc_report.form.json"]!) as {
+    forms: Record<string, Form>;
+  }).forms["bindings"]!;
+  fillEveryField(form);
+  await waitFor(() =>
+    expect(
+      (screen.getByRole("button", { name: "Save configuration" }) as HTMLButtonElement).disabled,
+    ).toBe(false),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Save configuration" }));
+  await waitFor(() => expect(saved.length).toBe(1));
+  return { saved };
+}
+
+/**
+ * **A configuration the server saves with warnings says so.** The save check
+ * answers its validator's warnings in a 200 (a key the pipeline ignores when it
+ * runs, for one), and the Workspace IDE shows them; the escape that writes a
+ * projected flow's configuration dropped them, so the flow ended as if the check
+ * had found nothing.
+ */
+describe("the runner shows what the save check found", () => {
+  it("finishes the flow and shows each warning, in the warning tone", async () => {
+    await fillAndSave({
+      status: 200,
+      body: {
+        file_name: queryEscape(configPath("qc_report")),
+        warnings: [
+          {
+            severity: "warning",
+            code: "cpipes_config_unknown_field",
+            message: 'ignored when the pipeline runs: unknown field "output_tabel"',
+            path: "/output_tabel",
+          },
+          { severity: "warning", code: "x", message: "a finding on a line", line: 7 },
+        ],
+      },
+    });
+
+    // Still a success: the flow completes and leaves, and the warning outlives it.
+    await waitFor(() => expect(screen.getByText("Home")).toBeTruthy());
+    const banner = await screen.findByRole("status");
+    expect(banner.className).toContain("banner-warn");
+    expect(banner.textContent).toContain(`Saved ${configPath("qc_report")}, with 2 warnings:`);
+    expect(banner.textContent).toContain(
+      '/output_tabel: ignored when the pipeline runs: unknown field "output_tabel"',
+    );
+    expect(banner.textContent).toContain("line 7: a finding on a line");
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("says nothing extra when the check found nothing, nor from a server that sends no warnings", async () => {
+    for (const body of [{ warnings: [] }, {}]) {
+      await fillAndSave({ status: 200, body });
+      await waitFor(() => expect(screen.getByText("Home")).toBeTruthy());
+      expect(screen.queryByRole("status")).toBeNull();
+      expect(screen.queryByRole("alert")).toBeNull();
+      cleanup();
+    }
+  });
+
+  it("keeps a refused save an error, and the flow open", async () => {
+    await fillAndSave({
+      status: 400,
+      body: {
+        error: `${configPath("qc_report")} cannot be saved:\n  /cluster_config: cluster_config is required`,
+      },
+    });
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain(`Cannot save ${configPath("qc_report")}`);
+    expect(alert.textContent).toContain("cluster_config is required");
+    expect(screen.queryByRole("status")).toBeNull();
+    expect(screen.queryByText("Home")).toBeNull();
   });
 });

@@ -1,5 +1,5 @@
 /**
- * Tests for the `/dataTable` query builder (task A.4a).
+ * Tests for the `/dataTable` query builder.
  *
  * Three layers, and the third is the one that makes this a port rather than a
  * rewrite:
@@ -11,7 +11,7 @@
  *     They assert properties that must hold for every table rather than one
  *     payload each, which is what catches a branch that only ever runs on
  *     configurations nobody wrote a fixture for.
- *  3. **Goldens** for `load_files`, the flow Phase 2 proves the widget on, with
+ *  3. **Goldens** for `load_files`, the flow the widget was proved on, with
  *     the payload written out in full.
  *
  * **What the goldens are, honestly.** They are the payload read out of the Dart
@@ -23,10 +23,15 @@
  * documents rather than left as a footnote here.
  */
 
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 import corpus from "./fixtures/table_configs.json";
 import { makeQuery, makeWhereClause } from "./query";
+import { TableConfigDocumentSchema, type TableConfigDocument } from "./table";
+import { fromDocument } from "./tableTranslate";
 import type {
   FormStateReader,
   FormStateValue,
@@ -67,6 +72,40 @@ function whereClause(over: Partial<WhereClause> = {}): WhereClause {
     lookupColumnInFormState: false,
     ...over,
   };
+}
+
+/**
+ * The payload properties every querying table must have, fixture or document.
+ *
+ * `action` is `read` for every table in the fixture. A document's is what
+ * `fromDocument` restores from its key (`workspace_read` on the Workspace IDE's
+ * tables, for one), since an authored document cannot name a server action.
+ */
+function expectWellFormedPayload(
+  key: string,
+  config: TableConfig,
+  action = "read",
+  state: Record<string, FormStateValue> = {},
+): void {
+  const msg = makeQuery(
+    context(config, { formField: { group: 0, key }, formState: formState(state) }),
+  );
+
+  // Every field the Go struct requires is present and of the right shape.
+  expect(msg.action).toBe(action);
+  expect(Array.isArray(msg.fromClauses)).toBe(true);
+  expect(msg.fromClauses.length).toBe(config.fromClauses.length);
+  expect(Array.isArray(msg.withClauses)).toBe(true);
+  expect(msg.columns).toHaveLength(config.columns.length);
+  expect(typeof msg.offset).toBe("number");
+  expect(typeof msg.limit).toBe("number");
+  expect(typeof msg.sortAscending).toBe("boolean");
+  // No clause may be emitted with an undefined column: that is the shape that
+  // reaches the server as a quoted empty identifier and fails at the database.
+  for (const wc of msg.whereClauses ?? []) {
+    expect(typeof wc.column).toBe("string");
+    expect(wc.column.length).toBeGreaterThan(0);
+  }
 }
 
 const minimalConfig: TableConfig = {
@@ -339,6 +378,62 @@ describe("makeQuery", () => {
     });
   });
 
+  /*
+    **`FILTERS_BY_FIELD`, the one table from field key to filter list**, which
+    replaced the two key branches when the session registry added two tables
+    (2026-11-08). The three cases below are its whole contract: each key gets its
+    own list and no other, and the archive's clauses arrive on the archive.
+  */
+  it("gives each field key its own filter list, and no other", () => {
+    const config = tables["lfSourceConfigTable"]!;
+    const lists = {
+      homeFilters: [whereClause({ column: "status", defaultValue: ["failed"] })],
+      dataRegistryFilters: [whereClause({ column: "year", defaultValue: ["2026"] })],
+      sessionRegistryFilters: [whereClause({ column: "source_type", defaultValue: ["file"] })],
+    };
+    const columnsFor = (key: string) =>
+      (makeQuery(context(config, { ...lists, formField: { group: 0, key } })).whereClauses ?? []).map(
+        (w) => w.column,
+      );
+    expect(columnsFor("pipelineExecStatusTable")).toEqual(["status"]);
+    expect(columnsFor("pipelineArchiveTable")).toEqual(["status"]);
+    // And the registry's own `NOT IN ('Any')` on client, which is not a filter list.
+    expect(columnsFor("inputRegistryTable")).toEqual(["year", "client"]);
+    expect(columnsFor("sessionRegistryTable")).toEqual(["source_type"]);
+    expect(columnsFor("somethingElse")).toEqual([]);
+    // An inherited property is not a key of the table.
+    expect(columnsFor("toString")).toEqual([]);
+  });
+
+  it("rewrites the home filters' table to the archive, orWith included, and nothing else", () => {
+    const config = tables["lfSourceConfigTable"]!;
+    const homeFilters = [
+      whereClause({ table: "pipeline_execution_status", column: "start_time", ge: "now()" }),
+      whereClause({
+        table: "pipeline_execution_status",
+        column: "status",
+        defaultValue: ["failed"],
+        orWith: whereClause({ table: "pipeline_execution_status", column: "status", defaultValue: ["errors"] }),
+      }),
+      whereClause({ table: "source_period", column: "year", defaultValue: ["2026"] }),
+    ];
+    const msg = makeQuery(
+      context(config, { homeFilters, formField: { group: 0, key: "pipelineArchiveTable" } }),
+    );
+    expect(msg.whereClauses).toEqual([
+      { table: "pipeline_execution_status_archive", column: "start_time", ge: "now()" },
+      {
+        table: "pipeline_execution_status_archive",
+        column: "status",
+        values: ["failed"],
+        orWith: { table: "pipeline_execution_status_archive", column: "status", values: ["errors"] },
+      },
+      { table: "source_period", column: "year", values: ["2026"] },
+    ]);
+    // The shared list itself is untouched: Pipelines Status reads it next.
+    expect(homeFilters[0]!.table).toBe("pipeline_execution_status");
+  });
+
   it("resolves an empty from-clause table name from form state", () => {
     const config: TableConfig = {
       ...tables["lfSourceConfigTable"]!,
@@ -417,6 +512,30 @@ describe("makeQuery", () => {
     expect(makeQuery(context(config)).workspaceName).toBeUndefined();
   });
 
+  it("does not carry a workspace name the table's own selection wrote", () => {
+    // The registry publishes its selected row's workspace_name; reading it back
+    // made a tick change the table's own request, which refetched and cleared
+    // the tick. The route still supplies the name.
+    const config: TableConfig = {
+      ...tables["lfSourceConfigTable"]!,
+      formStateConfig: { keyColumnIdx: 0, otherColumns: [{ stateKey: "workspace_name", columnIdx: 1 }] },
+    };
+    const field = { group: 0, key: "workspaceRegistryTable" };
+    expect(
+      makeQuery(context(config, { formField: field, formState: formState({ workspace_name: "ws1" }) }))
+        .workspaceName,
+    ).toBeUndefined();
+    expect(
+      makeQuery(
+        context(config, {
+          formField: field,
+          formState: formState({ workspace_name: "ws1" }),
+          routeParams: { workspace_name: "ws2" },
+        }),
+      ).workspaceName,
+    ).toBe("ws2");
+  });
+
   it("attaches an orWith clause to its parent", () => {
     const config: TableConfig = {
       ...tables["lfSourceConfigTable"]!,
@@ -447,42 +566,23 @@ describe("the whole corpus", () => {
   it("is the 28 user flow tables still in the fixture, 22 of which query", () => {
     // **37 and 28 until 2026-10-01**, when `client`, `scSourceConfigKey` and
     // `pcPipelineConfigTable` — three query tables — left the fixture to be
-    // maintained by hand (`jetstore_maintenance_02` `AF.1`, `D06`). Their payloads
-    // are no longer built here; their documents are checked by the schema, the
-    // Go save path and the cross-document set test instead. **31 the same day**:
-    // `AF.2`–`AF.4` retired the three static option tables of the add-or-edit
-    // steps `D06` removed. **28 and 22 on 2026-10-15**: Release 4.0.4 retired
+    // maintained by hand. Their payloads are no longer built here; their
+    // documents are checked by the schema, the Go save path and the
+    // cross-document set test instead. **31 the same day**: the three static
+    // option tables of the removed add-or-edit steps were retired. **28 and 22
+    // on 2026-10-15**: Release 4.0.4 retired
     // three query tables with `startPipelineUF`'s merged and historical sources.
     expect(keys).toHaveLength(28);
     expect(querying).toHaveLength(22);
   });
 
   it.each(querying)("builds a well-formed payload for %s", (key) => {
-    const config = tables[key]!;
-    const msg = makeQuery(
-      context(config, { formField: { group: 0, key }, formState: formState({}) }),
-    );
-
-    // Every field the Go struct requires is present and of the right shape.
-    expect(msg.action).toBe("read");
-    expect(Array.isArray(msg.fromClauses)).toBe(true);
-    expect(msg.fromClauses.length).toBe(config.fromClauses.length);
-    expect(Array.isArray(msg.withClauses)).toBe(true);
-    expect(msg.columns).toHaveLength(config.columns.length);
-    expect(typeof msg.offset).toBe("number");
-    expect(typeof msg.limit).toBe("number");
-    expect(typeof msg.sortAscending).toBe("boolean");
-    // No clause may be emitted with an undefined column: that is the shape that
-    // reaches the server as a quoted empty identifier and fails at the database.
-    for (const wc of msg.whereClauses ?? []) {
-      expect(typeof wc.column).toBe("string");
-      expect(wc.column.length).toBeGreaterThan(0);
-    }
+    expectWellFormedPayload(key, tables[key]!);
   });
 
   it("emits no where clauses for a table whose filters all read empty state", () => {
     // With nothing in form state and no route, a table filtered entirely on form
-    // state contributes nothing — the *reason* A.4c has to block the request
+    // state contributes nothing — the *reason* the binding has to block the request
     // rather than send it, since this payload would return every row.
     const config = tables["lfFileKeyStagingTable"]!;
     const msg = makeQuery(
@@ -497,6 +597,60 @@ describe("the whole corpus", () => {
       { table: "", column: "source_type", values: ["file"] },
     ]);
   });
+});
+
+/**
+ * The table documents the fixture no longer carries, read from disk.
+ *
+ * From 2026-10-01 a document this repository edits leaves the emitted set and is
+ * edited by hand (`table.test.ts`, `HAND_MAINTAINED_KEYS`), and with it left
+ * `the whole corpus`'s payload check above, which iterates the fixture. Four
+ * query tables moved out that way (`pipelineExecStatusTable`, `client`,
+ * `scSourceConfigKey`, `pcPipelineConfigTable`), and more followed. **The set is
+ * derived rather than listed**: every query document in either directory whose
+ * key the fixture lacks, translated by `fromDocument` as the runtime does
+ * (`FlowStore`, Home), so the next document to leave the fixture is covered
+ * without an edit here.
+ */
+describe("the documents the fixture no longer carries", () => {
+  const dirs = [
+    fileURLToPath(new URL("../../../jets/workspace_assets/table_configs/", import.meta.url)),
+    fileURLToPath(new URL("./tables/", import.meta.url)),
+  ];
+  const documents = dirs.flatMap((dir) =>
+    readdirSync(dir)
+      .filter((name) => name.endsWith(".tc.json"))
+      .map((name) => {
+        const key = name.slice(0, -".tc.json".length);
+        const text = readFileSync(join(dir, name), "utf8");
+        return { key, doc: TableConfigDocumentSchema.parse(JSON.parse(text)) as TableConfigDocument };
+      }),
+  );
+  const offFixture = documents.filter(({ key, doc }) => !(key in tables) && doc.source === "query");
+
+  it("includes the four query tables taken out of the fixture", () => {
+    // The guard on the payload check below: an empty or misread directory would
+    // pass it vacuously.
+    expect(offFixture.map(({ key }) => key)).toEqual(
+      expect.arrayContaining(["pipelineExecStatusTable", "client", "scSourceConfigKey", "pcPipelineConfigTable"]),
+    );
+  });
+
+  it.each(offFixture.map(({ key, doc }) => [key, doc] as const))(
+    "builds a well-formed payload for %s",
+    (key, doc) => {
+      const config = fromDocument(key, doc);
+      // A clause whose column is read from form state throws on an empty state,
+      // by design (`throws when lookupColumnInFormState finds no string`), so
+      // that state holds a column name. Every other key stays empty.
+      const state = Object.fromEntries(
+        config.whereClauses
+          .filter((wc) => wc.lookupColumnInFormState)
+          .map((wc) => [wc.column, "a_column"] as const),
+      );
+      expectWellFormedPayload(key, config, config.apiAction, state);
+    },
+  );
 });
 
 describe("load_files goldens", () => {

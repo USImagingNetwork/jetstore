@@ -1,12 +1,12 @@
 """The emitted schema and the model, held to each other.
 
 **They are two readers of one contract and they disagreed for six days.**
-Gap 2b (`I-778`) put the `~site` complement branch into `types.csv` and into
+One change put the `~site` complement branch into `types.csv` and into
 the emitted JSON Schema, and left `cpipes_model.py`'s `TransformationSpec`
 alias carrying only the nineteen tagged members. Nothing noticed, because until
 2026-09-19 no authored `.pc.json` in JetStore's own corpus named a site
 operator: the schema said yes, the model said no, and no document asked both.
-`workspaces/jets_ws/pipes_config/healthcare_corpus.pc.json` is the document
+A site-operator `.pc.json` in `workspaces/jets_ws/pipes_config/` is the document
 that asked, and `cpipes_node`'s corpus test is where it was heard.
 
 So the tests here are about *agreement* rather than about either artefact, and
@@ -43,6 +43,7 @@ MEMORY_CHANNEL = {"name": "out", "type": "memory", "channel_spec_name": "out"}
 
 def document(step: dict) -> dict:
     return {
+        "cluster_config": {},
         "channels": [{"name": "in", "columns": ["a"]}, {"name": "out", "columns": ["a"]}],
         "conditional_pipes_config": [
             {
@@ -87,7 +88,7 @@ def test_the_folded_union_is_a_single_discriminated_one_of():
     The alias is `Annotated[Union[<tagged>, <branch>], left_to_right]`, which
     Pydantic writes as a two-member `anyOf`;
     `schema.splice_complement_branches` folds that back into the single
-    discriminated `oneOf` the schema has carried since gap 2b. If the fold
+    discriminated `oneOf` the schema has carried since the site operator. If the fold
     stopped being exact, every consumer of the emitted file would move while
     the model stood still — which is the disagreement this module exists to
     prevent, in the other direction.
@@ -167,6 +168,22 @@ def _schema_errors(doc: dict) -> list[str]:
     return [e.message for e in validator.iter_errors(doc)]
 
 
+def test_both_readers_refuse_a_document_without_cluster_config():
+    """`cluster_config` is required at the root (2026-11-10).
+
+    The sharding start step and the coordinator both refuse a document without
+    it; before the start step did, it decoded one and panicked on the first
+    dereference. The two readers say the same, and name the field.
+    """
+    doc = document({"type": "map_record", "output_channel": MEMORY_CHANNEL})
+    del doc["cluster_config"]
+    errors = _schema_errors(doc)
+    assert errors and all("cluster_config" in e for e in errors)
+    with pytest.raises(ValidationError) as excinfo:
+        model.ComputePipesConfig.model_validate(doc)
+    assert {e["loc"] for e in excinfo.value.errors()} == {("cluster_config",)}
+
+
 def test_both_readers_accept_a_site_operator():
     doc = document(SITE_STEP)
     assert _schema_errors(doc) == []
@@ -198,7 +215,7 @@ def test_both_readers_refuse_the_same_documents(step, why):
 
     Each case is a thing the *engine* refuses, and the point is that the two
     contract artefacts refuse it too and refuse it together. A case the schema
-    caught and the model did not is exactly the state gap 2b left behind, one
+    caught and the model did not is exactly the state an earlier change left behind, one
     direction over.
     """
     doc = document(step)
@@ -316,3 +333,64 @@ def test_both_readers_refuse_a_csv_source_token_the_builder_has_no_arm_for():
     assert _schema_errors(doc)
     with pytest.raises(ValidationError):
         model.ComputePipesConfig.model_validate(doc)
+
+
+# An output table's column types are a closed list, the engine's
+# `schema.PgTypeNames`: the type is written into the table's DDL, so a type the
+# engine passed through as written could carry SQL.
+
+GO_SCHEMA = HERE.parent.parent / "jets" / "schema" / "schema.go"
+
+
+def _with_output_table(rdf_type: str | None, lookup_rdf_type: str = "double") -> dict:
+    column = {"name": "amount"}
+    if rdf_type is not None:
+        column["rdf_type"] = rdf_type
+    doc = _with_lookup({**CSV_FILE_LOOKUP, "columns": [{"name": "authored_rate", "rdf_type": lookup_rdf_type}]})
+    doc["output_tables"] = [
+        {"key": "out", "name": "public.out", "channel_spec_name": "out",
+         "columns": [{"name": "session_id", "rdf_type": "text"}, column]}
+    ]
+    return doc
+
+
+def test_output_table_types_are_the_engines():
+    """The model's list is the keys of `pgTypes` in jets/schema/schema.go."""
+    import re
+
+    source = GO_SCHEMA.read_text()
+    block = source[source.index("var pgTypes = map[string]string{"):]
+    block = block[: block.index("\n}\n")]
+    go_names = set(re.findall(r'^\s*"([^"]+)":', block, re.MULTILINE))
+    assert go_names == set(model.OUTPUT_TABLE_RDF_TYPES)
+
+
+@pytest.mark.parametrize("rdf_type", ["text", "double precision", "datetime", None])
+def test_both_readers_accept_a_known_output_table_type(rdf_type):
+    doc = _with_output_table(rdf_type)
+    assert _schema_errors(doc) == []
+    model.ComputePipesConfig.model_validate(doc)
+
+
+@pytest.mark.parametrize(
+    "rdf_type",
+    [
+        "text); UPDATE jetsapi.users SET user_email = 'x'; CREATE TABLE z (y text",
+        "text[]",
+        "numeric",
+        "TEXT",
+    ],
+)
+def test_both_readers_refuse_an_unknown_output_table_type(rdf_type):
+    doc = _with_output_table(rdf_type)
+    assert _schema_errors(doc)
+    with pytest.raises(ValidationError) as excinfo:
+        model.ComputePipesConfig.model_validate(doc)
+    assert "unknown rdf_type" in str(excinfo.value)
+
+
+def test_a_lookup_table_type_is_not_held_to_the_output_table_list():
+    """Lookup tables share the column type and are never created from it."""
+    doc = _with_output_table("text", lookup_rdf_type="float64")
+    assert _schema_errors(doc) == []
+    model.ComputePipesConfig.model_validate(doc)

@@ -57,12 +57,28 @@ RUN go mod tidy
 RUN go mod download
 
 # Build the C++ library - native rule engine
-WORKDIR ${JETS_BUILD_DIR}
 ENV LD_LIBRARY_PATH=/usr/local/lib64
 
-RUN cmake -DCMAKE_BUILD_TYPE=Release -DJETS_VERSION=$JETS_VERSION ${JETS_SOURCE_DIR}
-RUN make clean 
-RUN make objlib jets_static jets -j8
+# Link-time optimisation of libjets.so (jets/CMakeLists.txt, JETS_LTO; off by
+# default there). Measured on the rules benchmark.
+#
+# **The build runs in its own directory, outside /app, and only libjets.so is
+# copied back to ${JETS_BUILD_DIR}/jets**, where jets/bridge's `-L/app/jets` and
+# every runtime image's `COPY --from=builder` find it. From Go 1.27.4, `go build`
+# walks each cgo `-L` directory recursively and refuses any object or archive
+# carrying LTO sections ("disallowed LTO section ... in #cgo LDFLAGS"). An LTO
+# build in /app leaves such files under /app/jets: CMake's LTO probe object, the
+# objlib objects and libjets_static.a. libjets.so itself is a linked output and
+# carries none. Go 1.27.3 had no such check, which is why 4.1.4 built and 4.1.5
+# did not. The build tree is removed in the same step, and jets_static is not
+# built: no image uses it.
+ENV JETS_CMAKE_DIR=/jets_cmake_build
+WORKDIR ${JETS_CMAKE_DIR}
+RUN cmake -DCMAKE_BUILD_TYPE=Release -DJETS_LTO=ON -DJETS_VERSION=$JETS_VERSION ${JETS_SOURCE_DIR} \
+  && make objlib jets -j8 \
+  && cp ${JETS_CMAKE_DIR}/jets/libjets.so ${JETS_BUILD_DIR}/jets/ \
+  && cd / && rm -rf ${JETS_CMAKE_DIR}
+WORKDIR ${JETS_BUILD_DIR}
 
 # RUN \
 #   echo "$JETS_BUILD_DIR DIRECTORY Contains" \
@@ -87,7 +103,6 @@ WORKDIR ${JETS_SOURCE_DIR}
 
 # Build the Go binaries with CGO enabled
 RUN go build -ldflags="-w -s" -o cbooter              ${JETS_SOURCE_DIR}/jets/cmds/cbooter
-# RUN go build -ldflags="-w -s" -o cpipes_server        ${JETS_SOURCE_DIR}/jets/cmds/cpipes_server
 RUN go build -ldflags="-w -s" -o compile_workspace    ${JETS_SOURCE_DIR}/jets/cmds/compile_workspace
 # Installs the JetStore-owned workspace assets (jets/workspace_assets) into the
 # client workspace; runs in Dockerfile.compile_ws just before compile_workspace.
@@ -95,7 +110,7 @@ RUN go build -ldflags="-w -s" -o install_workspace_assets ${JETS_SOURCE_DIR}/jet
 RUN go build -ldflags="-w -s" -o bootstrap            ${JETS_SOURCE_DIR}/cdk/jetstore_one/lambdas/compute_pipes/cp_node_native
 RUN go build -ldflags="-w -s" -o cpipes_native_server ${JETS_SOURCE_DIR}/jets/cmds/cpipes_native_server
 # The rules unit-test harness: one test per process, launched by the apiserver's
-# pool, linking both rule engines as cpipes_native_server does (cgo, libjets.so).
+# pool, linking the C++ rule engine as cpipes_native_server does (cgo, libjets.so).
 # Dockerfile.ui_service copies it beside the apiserver with libjets.so.
 RUN go build -ldflags="-w -s" -o rules_unit_test      ${JETS_SOURCE_DIR}/jets/cmds/rules_unit_test
 RUN go build -ldflags="-w -s" -o apiserver            ${JETS_SOURCE_DIR}/jets/apiserver
@@ -103,11 +118,11 @@ RUN go build -ldflags="-w -s" -o run_reports          ${JETS_SOURCE_DIR}/jets/ru
 RUN go build -ldflags="-w -s" -o update_db            ${JETS_SOURCE_DIR}/jets/update_db
 # The agentic layer's two detection commands, run by the scheduled detection task
 # (cdk/jetstore_one/stack/build_agentic_detect.go) through cbooter. They read and
-# write jetsapi only. Dockerfile.ui_service copies them; agentic_ai I-861.
+# write jetsapi only. Dockerfile.ui_service copies them.
 RUN go build -ldflags="-w -s" -o anomaly_detect       ${JETS_SOURCE_DIR}/jets/cmds/anomaly_detect
 RUN go build -ldflags="-w -s" -o shadow_triage        ${JETS_SOURCE_DIR}/jets/cmds/shadow_triage
 
-# The workspace document validator -- jetstore_maintenance_02 AG.3 (R12).
+# The workspace document validator.
 #
 # `CompileWorkspace` runs `node jets_validate_workspace.mjs <workspace>` over the
 # workspace's user_flows/ and table_configs/ before compiling, and fails when it
@@ -144,3 +159,9 @@ WORKDIR ${JETS_SOURCE_DIR}
 RUN cp ${JETS_SOURCE_DIR}/jets/jets_schema.json       /usr/local/bin/jets_schema.json
 RUN cp ${JETS_SOURCE_DIR}/jets/workspace_schema.sql   /usr/local/bin/workspace_schema.sql
 RUN cp ${JETS_SOURCE_DIR}/jets/jets_init_db.sql       /usr/local/bin/jets_init_db.sql
+
+# The documentation site and the matrix its reference pages are generated from.
+# Dockerfile.ui_service_ws builds the site. Copied last so that a change to the
+# documentation does not rebuild the layers above.
+COPY docs                          ${JETS_SOURCE_DIR}/docs
+COPY tools/cpipes_contract/matrix  ${JETS_SOURCE_DIR}/tools/cpipes_contract/matrix

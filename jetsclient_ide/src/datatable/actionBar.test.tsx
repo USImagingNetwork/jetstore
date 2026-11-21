@@ -1,7 +1,7 @@
 /**
  * @vitest-environment jsdom
  *
- * Tests for the table action bar (task S.2b).
+ * Tests for the table action bar.
  *
  * **Driven from the corpus, not from examples.** The 25 `ActionConfig`s are in
  * `fixtures/table_configs.json`, generated out of the running Flutter app, so
@@ -26,7 +26,7 @@ afterEach(cleanup);
 
 const tables = (corpus as unknown as { tables: Record<string, TableConfig> }).tables;
 const allActions: ActionConfig[] = Object.values(tables).flatMap((t) => t.actions ?? []);
-/** The bar's share: everything except the two A.5 returned to the widget. */
+/** The bar's share: everything except the two the widget owns. */
 const widgetOwned = new Set(["toggleCheckboxVisible", "refreshTable"]);
 const barActions = allActions.filter((a) => !widgetOwned.has(a.actionType));
 
@@ -46,14 +46,13 @@ function makeContext(overrides: Partial<ActionContext> = {}): ActionContext {
 
 describe("the corpus this task owns", () => {
   it("is 18 of the 22 configurations, the other four being the widget's", () => {
-    // **25 and 21 until D.10**, which added `fmInputSourceMappingUF`'s two
-    // `showScreen` buttons (**I-260**) — the first configuration in this corpus
-    // with no Dart original. The widget's four are unchanged, which is the half
+    // **25 and 21 until `fmInputSourceMappingUF`'s two `showScreen` buttons
+    // were added** — the first configuration in this corpus with no Dart
+    // original. The widget's four are unchanged, which is the half
     // worth asserting: this test is about the split rather than about the size.
     // **27 and 23 until 2026-10-01**, when `client`, `scSourceConfigKey` and
-    // `pcPipelineConfigTable` left this fixture to be maintained by hand
-    // (`jetstore_maintenance_02` `AF.1`, `D06`), taking four bar actions with
-    // them: `deleteClient`, `dropStagingTable`, `deleteSourceConfig` and
+    // `pcPipelineConfigTable` left this fixture to be maintained by hand,
+    // taking four bar actions with them: `deleteClient`, `dropStagingTable`, `deleteSourceConfig` and
     // `deletePipelineConfig`. `lfSourceConfigTable` keeps its own
     // `dropStagingTable`. **22 and 18 since 2026-10-15**, when Release 4.0.4
     // retired `merged_input_registry_keys` and its *Clear Filters* with it.
@@ -77,7 +76,7 @@ describe("the corpus this task owns", () => {
   });
 
   it("dispatches the two filter prompts pipelineExecStatusTable adds", () => {
-    // F.5, and the only non-flow table in `tables/` — so the corpus above cannot
+    // The only non-flow table in `tables/` — so the corpus above cannot
     // see these two and they are written out. Both resolve to a `promptFilter`
     // request rather than being handled here, on the same terms as every other
     // row: what a button asks for is data.
@@ -114,7 +113,7 @@ describe("the corpus this task owns", () => {
     // It is not a crash. The Dart guards on `row != null` (`data_table.dart:589`)
     // and simply omits the parameter, so the dialog opens with those fields
     // empty — which is a worse failure than a disabled button and a better one
-    // than an exception. Reproduced rather than corrected; see I-24.
+    // than an exception. Reproduced rather than corrected.
     const positional = barActions.filter((a) =>
       Object.values(a.navigationParams ?? {}).some((v) => typeof v === "number"),
     );
@@ -136,7 +135,7 @@ describe("the corpus this task owns", () => {
     const withFnc = [...new Set(barActions.filter((a) => a.hasIsEnabledFnc).map((a) => a.key))];
     expect(withFnc).toEqual(["clearFilters"]);
     // `enabledPredicateFor["clearFilters"]` until 2026-10-01; the runtime now
-    // asks the emitter's own mapping (`jetstore_maintenance_02`, `D02`).
+    // asks the emitter's own mapping.
     for (const [key, table] of Object.entries(tables)) {
       for (const action of (table.actions ?? []).filter((a) => a.hasIsEnabledFnc)) {
         expect(isEnabledEscapeFor(key, action.key)).toBe("hasDataRegistryFilters");
@@ -149,7 +148,7 @@ describe("availability", () => {
   const find = (key: string) => barActions.find((a) => a.key === key)!;
 
   // `deleteOrg` rather than `deleteClient` since 2026-10-01: the `client` table
-  // left this fixture (`AF.1`), and `deleteOrg` carries the same three gates.
+  // left this fixture, and `deleteOrg` carries the same three gates.
   it("disables a selection-gated action until a row is selected", () => {
     const action = find("deleteOrg");
     expect(action.isEnabledWhenHavingSelectedRows).toBe(true);
@@ -188,6 +187,26 @@ describe("availability", () => {
     const state = availability(action, makeContext({ predicates: {} }));
     expect(state.enabled).toBe(false);
     expect(state.reason).toBe('Missing predicate "hasDataRegistryFilters"');
+  });
+
+  it("gives a refusing predicate its own reason, not the filter buttons'", () => {
+    // Session Registry's Delete is refused when a selected session already has a
+    // deletion; the reason read "Nothing to clear", which is the filters' reason.
+    const deleteSessions: ActionConfig = { ...find("clearFilters"), key: "deleteSessions" };
+    const tableKey = "sessionRegistryTable";
+    expect(isEnabledEscapeFor(tableKey, "deleteSessions")).toBe("noSessionDeletionRequested");
+    const refused = availability(
+      deleteSessions,
+      makeContext({ tableKey, predicates: { noSessionDeletionRequested: () => false } }),
+    );
+    expect(refused).toEqual({
+      visible: true,
+      enabled: false,
+      reason: "A selected session already has a deletion requested",
+    });
+    // The filter buttons keep theirs.
+    const clear = availability(find("clearFilters"), makeContext({ predicates: { hasDataRegistryFilters: () => false } }));
+    expect(clear.reason).toBe("Nothing to clear");
   });
 
   it("composes gates as an and, not an or", () => {
@@ -321,7 +340,7 @@ describe("the rendered bar", () => {
   });
 
   it("disables an action whose capability the user lacks, without hiding it", () => {
-    // A.2's decision, and I-10's correction: gated sites disable, never hide.
+    // The capability model's rule: gated sites disable, never hide.
     const action = barActions.find((a) => a.capability === "run_pipelines")!;
     renderBar([action], makeContext());
     const button = screen.getByRole("button", { name: action.label });
@@ -346,7 +365,7 @@ describe("the rendered bar", () => {
 });
 
 /**
- * The row gate. Task C.2, and the entry it closes is **I-181**.
+ * The row gate.
  *
  * **Driven from the screen corpus rather than from examples**, for the same
  * reason the file's header gives for the flow corpus — but with a difference
@@ -389,9 +408,9 @@ describe("enableWhen — the selected row's criteria", () => {
     expect(flowGated).toHaveLength(0);
   });
 
-  it("refuses Delete on an active workspace, which is the defect I-181 names", () => {
+  it("refuses Delete on an active workspace, which it once allowed", () => {
     // `deleteWorkspace` requires status to contain neither `active` nor
-    // `in progress`. Before C.2 `availability` did not read the field, so this
+    // `in progress`. Before the row gate `availability` did not read the field, so this
     // button was enabled on every selected row — a destructive action the Flutter
     // app makes impossible.
     const action = gated("deleteWorkspace");
@@ -458,6 +477,37 @@ describe("enableWhen — the selected row's criteria", () => {
     expect(state.enabled).toBe(false);
     expect(state.reason).toContain("active");
     expect(state.reason).toContain("in progress");
+    // Refused values read as refused, not as the row's own.
+    expect(state.reason).toBe("Not for a row that is active or in progress");
+  });
+
+  it("says which value a positive criterion requires", () => {
+    // *Get Run Manifest* is enabled for a completed run only. The reason used to
+    // read "Not available for this row (completed)" on a run with errors, as
+    // though the row were the completed one.
+    const action: ActionConfig = {
+      ...gated("deleteWorkspace"),
+      actionEnableCriterias: [[{ columnPos: 6, criteriaType: "equals", value: "completed" }]],
+    };
+    const state = availability(action, makeContext({ selectedRow: rowWithStatus("errors") }));
+    expect(state).toEqual({
+      visible: true,
+      enabled: false,
+      reason: "Only for a row that is completed",
+    });
+  });
+
+  it("tests every selected row when the bar is given them, not only the first", () => {
+    // On a multi-select table an action the first row allows would run on the
+    // others too, so each must qualify. One row is the single-select case.
+    const action = gated("deleteWorkspace");
+    const rows = [rowWithStatus("removed"), rowWithStatus("active")];
+    const both = availability(action, makeContext({ selectedRow: rows[0]!, selectedRows: rows, selectedRowCount: 2 }));
+    expect(both).toEqual({ visible: true, enabled: false, reason: "Not for a row that is active or in progress" });
+    const first = availability(action, makeContext({ selectedRows: [rows[0]!] }));
+    expect(first.enabled).toBe(true);
+    // No `selectedRows` (the IDE toolbar's one row): `selectedRow` is the row.
+    expect(availability(action, makeContext({ selectedRow: rows[0]! })).enabled).toBe(true);
   });
 
   it("treats a null cell as failing both contains and doesNotContain", () => {

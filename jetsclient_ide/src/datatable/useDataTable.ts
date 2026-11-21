@@ -1,35 +1,38 @@
 /**
  * The data table's state: rows, paging, sorting, selection, and the fetch.
  *
- * Task A.4b. This is `JetsDataTableSource.getModelData`
+ * This is `JetsDataTableSource.getModelData`
  * (`jetsclient/lib/components/data_table_source.dart:683`) and the paging half of
  * `JetsDataTableState`, as a hook.
  *
  * **What it deliberately does not do is the reactive half.** In the Flutter app
  * this object also listens to the enclosing form, blocks the request when a
  * where clause names a form-state key that is empty, and publishes selections
- * back into form state. That is A.4c. Here the caller passes a `QueryContext`
- * and says whether the query is `blocked`; keeping the decision outside means
- * A.4c can be written without reopening this file, and means this hook is
- * usable by a table that has no form at all — which is 9 of the 37
- * configurations plus every screen table Phase 3 will add.
+ * back into form state. That is `useTableBinding`. Here the caller passes a
+ * `QueryContext` and says whether the query is `blocked`; keeping the decision
+ * outside means the binding can be written without reopening this file, and
+ * means this hook is usable by a table that has no form at all — which is 9 of
+ * the 37 configurations plus every screen table.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { isRawStatementTable, makeQuery, makeRawQuery } from "./query";
-// `keepSelectedRows` is deliberately not used here. `showSelectedOnly` (two
-// tables, both in `workspace_pull`) filters the page down to the selected rows
-// *after* the selection has been restored from form state — so it runs at the
-// end of A.4c's restore, not at the end of this fetch. The function is written
-// and tested in `model.ts`, waiting for the caller that owns the ordering.
+// `keepSelectedRows` is not applied at the end of a fetch. `showSelectedOnly`
+// filters the page down to the selected rows *after* the selection has been
+// restored from form state, so the binding's restore applies it, through
+// `restoreSelected`. (Until 2026-11-11 the restore called it and discarded the
+// result, so the filter did nothing.)
 import {
   emptySelection,
+  keepSelectedRows,
   indexOffset,
   lastPageIndex,
   nextSortAscending,
   pageAfterRowsPerPageChange,
   resolveSortColumn,
+  sortAfterColumnDef,
+  sortRowsLocally,
   toggleSelection,
   type Selection,
   type SortState,
@@ -59,19 +62,19 @@ export type DataTableFetcher = (
 
 export interface UseDataTableOptions {
   config: TableConfig;
-  /** Everything A.4a needs beyond the config. Paging and sorting are supplied here. */
+  /** Everything the query builder needs beyond the config. Paging and sorting are supplied here. */
   context: Omit<
     QueryContext,
     "config" | "indexOffset" | "rowsPerPage" | "sortColumnName" | "sortColumnTableName" | "sortAscending"
   >;
   fetcher: DataTableFetcher;
   /**
-   * A.4c sets this when a where clause reads a form-state key that is empty.
+   * The binding sets this when a where clause reads a form-state key that is empty.
    * The Dart calls it `hasBlockingFilter`; blocked means *do not ask the server*,
    * and it is the difference between "no rows yet" and "no rows".
    */
   blocked?: boolean;
-  /** Bumping this refetches — A.4c uses it when a watched form-state key changes. */
+  /** Bumping this refetches — the binding uses it when a watched form-state key changes. */
   refreshToken?: number;
   onSelectionChange?: (args: {
     selection: Selection;
@@ -79,6 +82,11 @@ export interface UseDataTableOptions {
     deselected: number[];
     changedIndex: number;
     selected: boolean;
+    /**
+     * Every row whose state changed, when more than one did: the select-all
+     * box (`setAllSelected`). Absent for a single tick, which is `changedIndex`.
+     */
+    changed?: number[];
   }) => void;
 }
 
@@ -100,7 +108,24 @@ export interface DataTableState {
   setRowsPerPage(n: number): void;
   sortByVisibleColumn(index: number): void;
   setRowSelected(index: number, value: boolean): void;
+  /**
+   * The select-all box: every row of the page selected, or none (2026-11-12).
+   * Refused, as a tick is, on a read-only table, and on a
+   * single-select one, where it has no meaning.
+   */
+  setAllSelected(value: boolean): void;
   clearSelection(): void;
+  /**
+   * The selection restored from form state, applied as it stands. 2026-11-11.
+   *
+   * **Not `setRowSelected`, which is the user's tick**: that refuses on a
+   * read-only table, and the restore went through it, so a read-only table, the
+   * confirmation pages' copy of a choice, never showed the choice ticked. With
+   * `keepOnlySelected` the rows are narrowed to the selected ones, which is
+   * `showSelectedOnly`; it is a no-op once every row is selected, so applying it
+   * again to the narrowed rows changes nothing.
+   */
+  restoreSelected(selection: Selection, keepOnlySelected: boolean): void;
   refresh(): void;
 }
 
@@ -127,13 +152,28 @@ export function useDataTable(options: UseDataTableOptions): DataTableState {
   const { config, context, fetcher, blocked = false, refreshToken = 0 } = options;
 
   const [columns, setColumns] = useState<ColumnConfig[]>(config.columns);
-  const [rows, setRows] = useState<JetsRow[]>([]);
+  // What the server returned. `rows` below is what the table shows, which is the
+  // same array except on a raw-statement table the user has sorted.
+  const [fetchedRows, setRows] = useState<JetsRow[]>([]);
   const [label, setLabel] = useState(config.label);
   const [totalRowCount, setTotalRowCount] = useState(0);
   const [currentDataPage, setCurrentDataPage] = useState(0);
   const [rowsPerPage, setRowsPerPageState] = useState(config.rowsPerPage);
   const [sortAscending, setSortAscending] = useState(config.sortAscending);
-  const [selection, setSelection] = useState<Selection>(emptySelection(0));
+  const [selection, setSelectionState] = useState<Selection>(emptySelection(0));
+  // The selection as last written, ahead of the render that shows it. A tick
+  // computes its next selection from this rather than inside a `setState`
+  // updater, so that it can tell the caller after the write and outside render:
+  // an updater runs while React renders, a caller's publish into form state
+  // updates other components, and React warns about that and, under StrictMode,
+  // runs the updater twice. Every write goes through `setSelection` below, so
+  // two ticks before one render (the restore from form state ticks each restored
+  // row in one effect) still build on each other.
+  const selectionRef = useRef<Selection>(selection);
+  const setSelection = useCallback((next: Selection) => {
+    selectionRef.current = next;
+    setSelectionState(next);
+  }, []);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [tick, setTick] = useState(0);
@@ -141,11 +181,20 @@ export function useDataTable(options: UseDataTableOptions): DataTableState {
   const [sort, setSort] = useState<SortState>(() =>
     resolveSortColumn(config.columns, config.sortColumnName),
   );
+  // Whether a heading has been pressed. A table that declares no columns sends
+  // no sort column until then, so the server orders by its default (the first
+  // column, which is where the arrow goes when the columns arrive) and learning
+  // the columns does not change the request and ask a second time.
+  const [sortChosen, setSortChosen] = useState(false);
+  const learnsColumns = config.columns.length === 0 && !(context.columnNameMaps?.length);
 
   // A table serving rows from its own configuration never queries. Nine of the
   // 37 are like this (`apiPath: ''`), and they are also the only ones that can
   // be rendered in a test without a server.
   const isStatic = config.staticTableModel != null || config.apiPath === "";
+  // A raw statement is not sorted by the server (its request carries no sort
+  // column), so a heading press sorts the rows here instead; see `sortRowsLocally`.
+  const isRaw = isRawStatementTable(config);
 
   const onSelectionChange = options.onSelectionChange;
   // Held in a ref so a caller passing an inline closure does not refetch the
@@ -169,15 +218,15 @@ export function useDataTable(options: UseDataTableOptions): DataTableState {
     config,
     indexOffset: indexOffset(currentDataPage, rowsPerPage),
     rowsPerPage,
-    sortColumnName: sort.sortColumnName,
-    sortColumnTableName: sort.sortColumnTableName,
+    sortColumnName: learnsColumns && !sortChosen ? "" : sort.sortColumnName,
+    sortColumnTableName: learnsColumns && !sortChosen ? "" : sort.sortColumnTableName,
     sortAscending,
   };
   // **The branch is `fetchData`'s, not `_makeQuery`'s**, and it is here for the
   // same reason it is there: a raw-statement table's body carries a statement and
   // none of the structure — no from, no where, no columns, no paging. One
-  // configuration in either corpus takes it (task C.4). See `query.ts`.
-  const queryPayload = isRawStatementTable(config)
+  // configuration in either corpus takes it. See `query.ts`.
+  const queryPayload = isRaw
     ? makeRawQuery(queryContext)
     : makeQuery(queryContext);
   const payloadKey = JSON.stringify(queryPayload);
@@ -219,7 +268,10 @@ export function useDataTable(options: UseDataTableOptions): DataTableState {
         if (data.columnDef && data.columnDef.length > 0) {
           cols = columnsFromResponse(data.columnDef);
           setColumns(cols);
-          setSort(resolveSortColumn(cols, cols[0]?.name ?? "", 0));
+          // Keep the sort the user chose while its column is still there: a
+          // reset to column 0 here undid every heading press on a table whose
+          // reply carries `columnDef`, by asking again sorted on column 0.
+          setSort((previous) => sortAfterColumnDef(previous, cols, isRaw ? "none" : "first"));
         }
         if (data.label != null) setLabel(data.label);
         const shown = rowsFromResponse(data.rows ?? []);
@@ -245,6 +297,11 @@ export function useDataTable(options: UseDataTableOptions): DataTableState {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [payloadKey, staticRowsKey, blocked, isStatic, refreshToken, tick]);
 
+  const rows = useMemo(
+    () => (isRaw ? sortRowsLocally(fetchedRows, columns, sort, sortAscending) : fetchedRows),
+    [isRaw, fetchedRows, columns, sort, sortAscending],
+  );
+
   const setRowsPerPage = useCallback(
     (n: number) => {
       setCurrentDataPage((page) => pageAfterRowsPerPageChange(page, rowsPerPage, n));
@@ -259,37 +316,64 @@ export function useDataTable(options: UseDataTableOptions): DataTableState {
       // `nextSortAscending`.
       setSortAscending((asc) => nextSortAscending(index, sort.sortColumnIndex, asc));
       setSort(resolveSortColumn(columns, config.sortColumnName, index));
+      setSortChosen(true);
       setCurrentDataPage(0);
+      // A server-sorted table refetches, which clears the selection; a raw
+      // statement is re-ordered here, so a selection by position would now name
+      // other rows.
+      if (isRaw) setSelection(emptySelection(selectionRef.current.length));
     },
-    [columns, config.sortColumnName, sort.sortColumnIndex],
+    [columns, config.sortColumnName, sort.sortColumnIndex, isRaw, setSelection],
   );
 
   const setRowSelected = useCallback(
     (index: number, value: boolean) => {
       if (config.isReadOnly) return;
-      setSelection((current) => {
-        const result = toggleSelection(
-          current,
-          index,
-          value,
-          config.isCheckboxSingleSelect,
-        );
-        onSelectionChangeRef.current?.({
-          selection: result.selection,
-          rows,
-          deselected: result.deselected,
-          changedIndex: index,
-          selected: value,
-        });
-        return result.selection;
+      const result = toggleSelection(
+        selectionRef.current,
+        index,
+        value,
+        config.isCheckboxSingleSelect,
+      );
+      setSelection(result.selection);
+      onSelectionChangeRef.current?.({
+        selection: result.selection,
+        rows,
+        deselected: result.deselected,
+        changedIndex: index,
+        selected: value,
       });
     },
-    [config.isCheckboxSingleSelect, config.isReadOnly, rows],
+    [config.isCheckboxSingleSelect, config.isReadOnly, rows, setSelection],
+  );
+
+  const setAllSelected = useCallback(
+    (value: boolean) => {
+      if (config.isReadOnly || config.isCheckboxSingleSelect) return;
+      const current = selectionRef.current;
+      const changed: number[] = [];
+      const next = rows.map((_, i) => {
+        if ((current[i] === true) !== value) changed.push(i);
+        return value;
+      });
+      setSelection(next);
+      if (changed.length > 0) {
+        onSelectionChangeRef.current?.({
+          selection: next,
+          rows,
+          deselected: [],
+          changedIndex: changed[0]!,
+          selected: value,
+          changed,
+        });
+      }
+    },
+    [config.isCheckboxSingleSelect, config.isReadOnly, rows, setSelection],
   );
 
   const clearSelection = useCallback(() => {
-    setSelection((current) => emptySelection(current.length));
-  }, []);
+    setSelection(emptySelection(selectionRef.current.length));
+  }, [setSelection]);
 
   return {
     rows,
@@ -309,7 +393,18 @@ export function useDataTable(options: UseDataTableOptions): DataTableState {
     setRowsPerPage,
     sortByVisibleColumn,
     setRowSelected,
+    setAllSelected,
     clearSelection,
+    restoreSelected: (restored: Selection, keepOnlySelected: boolean) => {
+      if (keepOnlySelected && restored.some((selected) => !selected)) {
+        const kept = keepSelectedRows(rows, restored);
+        setRows(kept.rows);
+        setTotalRowCount(kept.rows.length);
+        setSelection(kept.selection);
+        return;
+      }
+      setSelection(restored.slice());
+    },
     refresh: () => setTick((t) => t + 1),
   };
 }

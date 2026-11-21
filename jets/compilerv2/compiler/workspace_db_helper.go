@@ -6,7 +6,9 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"maps"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/artisoft-io/jetstore/jets/jetrules/rete"
@@ -123,7 +125,7 @@ func (w *WorkspaceDB) SaveJetRules(ctx context.Context, db *sql.DB, jetRuleModel
 	}
 
 	// Insert new rules
-	ruleInsertStmt := "INSERT INTO jet_rules (key, name, optimization, salience, authored_label, normalized_label, label, source_file_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+	ruleInsertStmt := "INSERT INTO jet_rules (key, name, optimization, salience, authored_label, normalized_label, label, source_file_key, authored_file_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
 	rulePropInsertStmt := "INSERT INTO rule_properties (rule_key, name, value) VALUES (?, ?, ?)"
 	ruleTermInsertStmt := "INSERT INTO rule_terms (rule_key, rete_node_key, is_antecedent) VALUES (?, ?, ?)"
 
@@ -137,14 +139,20 @@ func (w *WorkspaceDB) SaveJetRules(ctx context.Context, db *sql.DB, jetRuleModel
 	ruleTermsData := make([][]any, 0)
 	for _, jetRule := range jetRuleModel.Jetrules {
 
-		// JetRule
+		// JetRule: source_file_key is the main rule file, whose network holds
+		// the rule; authored_file_key is the file the rule is written in.
 		maxKey++
+		var authoredFileKey any
+		if jetRule.SourceFileName != "" {
+			authoredFileKey = w.sourceMgr.GetOrAddDbKey(jetRule.SourceFileName)
+		}
 		jetRulesData = append(jetRulesData, []any{maxKey, jetRule.Name, jetRule.Optimization, jetRule.Salience,
-			jetRule.AuthoredLabel, jetRule.NormalizedLabel, jetRule.Label, w.mainFileKey})
+			jetRule.AuthoredLabel, jetRule.NormalizedLabel, jetRule.Label, w.mainFileKey, authoredFileKey})
 
-		// Rule Properties
-		for propName, propValue := range jetRule.Properties {
-			rulePropsData = append(rulePropsData, []any{maxKey, propName, propValue})
+		// Rule Properties, in name order: map order made workspace.db differ
+		// from one compile of the same sources to the next
+		for _, propName := range slices.Sorted(maps.Keys(jetRule.Properties)) {
+			rulePropsData = append(rulePropsData, []any{maxKey, propName, jetRule.Properties[propName]})
 		}
 
 		// Rule Terms
@@ -180,6 +188,33 @@ func (w *WorkspaceDB) SaveJetRules(ctx context.Context, db *sql.DB, jetRuleModel
 		err = DoStatement(ctx, db, ruleTermInsertStmt, ruleTermsData)
 		if err != nil {
 			return fmt.Errorf("failed to insert rule_terms: %w", err)
+		}
+	}
+	return nil
+}
+
+// SaveMainSupportFiles records in main_support_files the files the main rule
+// file includes (SetIncludedFiles), in the order they were read, adding to
+// workspace_control any that nothing else has named.
+func (w *WorkspaceDB) SaveMainSupportFiles(ctx context.Context, db *sql.DB) error {
+	_, err := db.ExecContext(ctx, "DELETE FROM main_support_files WHERE main_file_key = ?", w.mainFileKey)
+	if err != nil {
+		return fmt.Errorf("failed to delete existing main_support_files: %w", err)
+	}
+	insertStmt := "INSERT INTO main_support_files (main_file_key, support_file_key) VALUES (?, ?)"
+	data := make([][]any, 0, len(w.includedFiles))
+	seen := make(map[string]bool, len(w.includedFiles))
+	for _, fileName := range w.includedFiles {
+		if fileName == "" || fileName == w.mainSourceFileName || seen[fileName] {
+			continue
+		}
+		seen[fileName] = true
+		data = append(data, []any{w.mainFileKey, w.sourceMgr.GetOrAddDbKey(fileName)})
+	}
+	if len(data) > 0 {
+		err = DoStatement(ctx, db, insertStmt, data)
+		if err != nil {
+			return fmt.Errorf("failed to insert main_support_files: %w", err)
 		}
 	}
 	return nil
@@ -433,7 +468,19 @@ func (w *WorkspaceDB) SaveLookupTables(ctx context.Context, db *sql.DB, jetRuleM
 	return nil
 }
 
-// Save Rule Sequences into workspace db, using workspace control info
+// ruleSequencesSourceFileName is the file a workspace declares its rule
+// sequences in, relative to the workspace root, as workspace_control records it.
+const ruleSequencesSourceFileName = "workspace_control.json"
+
+// Save Rule Sequences into workspace db, using workspace control info.
+//
+// rule_sequences.source_file_key is the workspace_control key of the file the
+// sequence is declared in, workspace_control.json, which is recorded in
+// workspace_control (is_main = 0) when the workspace has a rule sequence. It
+// was the declaring rule file's key when sequences were declared in rule files.
+// main_rule_sets.ruleset_file_key is the key of each main rule file the
+// sequence runs, which must already be recorded as a main rule file.
+// A sequence already in rule_sequences is skipped.
 func (w *WorkspaceDB) SaveRuleSequences(ctx context.Context, db *sql.DB, workspaceControl *rete.WorkspaceControl) error {
 	if workspaceControl == nil {
 		return fmt.Errorf("workspace control is nil")
@@ -450,13 +497,21 @@ func (w *WorkspaceDB) SaveRuleSequences(ctx context.Context, db *sql.DB, workspa
 	rsData := make([][]any, 0)
 	mrsData := make([][]any, 0)
 	for _, rs := range workspaceControl.RuleSequences {
-		if w.sourceMgr.IsPreExisting(rs.Name) {
+		rsKey, err := getKeyByColumn(ctx, db, "rule_sequences", "name", rs.Name)
+		if err != nil {
+			return fmt.Errorf("failed to query rule_sequences by name: %w", err)
+		}
+		if rsKey != 0 {
 			continue
 		}
-		sourceFileKey := w.sourceMgr.GetOrAddDbKey(rs.Name)
+		sourceFileKey := w.sourceMgr.GetOrAddDbKey(ruleSequencesSourceFileName)
 		maxKey++
 		rsData = append(rsData, []any{maxKey, rs.Name, sourceFileKey})
 		for seq, mainRuleName := range rs.RuleSets {
+			if !w.sourceMgr.IsPreExistingMain(mainRuleName) {
+				return fmt.Errorf("main rule file '%s' of rule sequence '%s' is not a compiled main rule file",
+					mainRuleName, rs.Name)
+			}
 			ruleSetFileKey := w.sourceMgr.GetOrAddDbKey(mainRuleName)
 			mrsData = append(mrsData, []any{maxKey, mainRuleName, ruleSetFileKey, seq})
 		}
@@ -470,6 +525,11 @@ func (w *WorkspaceDB) SaveRuleSequences(ctx context.Context, db *sql.DB, workspa
 		if err != nil {
 			return fmt.Errorf("failed to insert main_rule_sets: %w", err)
 		}
+	}
+	// Record workspace_control.json in workspace_control
+	err = w.sourceMgr.SaveNewSourceFileNames(ctx, db)
+	if err != nil {
+		return fmt.Errorf("failed to save the rule sequences' source file: %w", err)
 	}
 	return nil
 }
@@ -486,8 +546,9 @@ func (w *WorkspaceDB) SaveJetstoreConfig(ctx context.Context, db *sql.DB, jetRul
 	// Insert new config entries
 	insertStmt := "INSERT INTO jetstore_config (source_file_key, config_key, config_value) VALUES (?, ?, ?)"
 	data := make([][]any, 0)
-	for key, value := range jetRuleModel.JetstoreConfig {
-		data = append(data, []any{w.mainFileKey, key, value})
+	// In key order, for the reason rule_properties is
+	for _, key := range slices.Sorted(maps.Keys(jetRuleModel.JetstoreConfig)) {
+		data = append(data, []any{w.mainFileKey, key, jetRuleModel.JetstoreConfig[key]})
 	}
 	if len(data) > 0 {
 		err = DoStatement(ctx, db, insertStmt, data)

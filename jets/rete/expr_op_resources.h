@@ -48,7 +48,7 @@ struct CreateEntityVisitor: public boost::static_visitor<RDFTTYPE>, public NoCal
   RDFTTYPE operator()(rdf::LUInt32 lhs)const{return rdf::NamedResource{ this->create_entity(lhs.data==0 ? "":std::to_string(lhs.data)) };}
   RDFTTYPE operator()(rdf::LInt64  lhs)const{return rdf::NamedResource{ this->create_entity(lhs.data==0 ? "":std::to_string(lhs.data)) };}
   RDFTTYPE operator()(rdf::LUInt64 lhs)const{return rdf::NamedResource{ this->create_entity(lhs.data==0 ? "":std::to_string(lhs.data)) };}
-  RDFTTYPE operator()(rdf::LDouble lhs)const{return rdf::NamedResource{ this->create_entity(lhs.data==0 ? "":std::to_string(lhs.data)) };}
+  RDFTTYPE operator()(rdf::LDouble lhs)const{return rdf::NamedResource{ this->create_entity(lhs.data==0 ? "":rdf::double_to_text(lhs.data)) };}
   RDFTTYPE operator()(rdf::LString lhs)const{return rdf::NamedResource{ this->create_entity(lhs.data) };}
 
   std::string
@@ -93,6 +93,12 @@ struct CreateLiteralVisitor: public boost::static_visitor<RDFTTYPE>, public NoCa
 
 // CreateResourceVisitor
 // --------------------------------------------------------------------------------------
+// The NamedResource it returns is a value: the session's resource manager does not hold
+// it until a consequent asserts a triple with it as a term (F_expr::to_r_index, then
+// RManager::insert_rdfast, alpha_functors.h). Use it as a consequent's term. Given as an
+// operand to another operator in the same expression, the resource exists only if the
+// session already held it, so exist gives false, size_of 0, and an aggregate throws
+// (get_aggregate_operands). Documented rather than changed: no workspace does that.
 struct CreateResourceVisitor: public boost::static_visitor<RDFTTYPE>, public NoCallbackNeeded
 {
   CreateResourceVisitor(ReteSession * rs, BetaRow const* br): rs(rs), br(br) {}
@@ -108,6 +114,9 @@ struct CreateResourceVisitor: public boost::static_visitor<RDFTTYPE>, public NoC
 
 // CreateUUIDResourceVisitor
 // --------------------------------------------------------------------------------------
+// As CreateResourceVisitor: the resource is registered when a consequent asserts it, so
+// as an operand of another operator in the same expression it does not exist yet (a new
+// uuid is never already held): exist gives false, size_of 0, and an aggregate throws.
 struct CreateUUIDResourceVisitor: public boost::static_visitor<RDFTTYPE>, public NoCallbackNeeded, public MintsResource
 {
   CreateUUIDResourceVisitor(ReteSession * rs, BetaRow const* br): rs(rs), br(br) {}
@@ -135,7 +144,7 @@ struct ExistVisitor: public boost::static_visitor<RDFTTYPE>, public ReadsGraph
   RDFTTYPE operator()(rdf::NamedResource lhs, rdf::NamedResource rhs)const
   {
     auto * sess = this->rs->rdf_session();
-    auto pr = get_resources(sess->rmgr(), std::move(lhs.name), std::move(rhs.name));
+    auto pr = get_resources(sess->rmgr(), lhs.name, rhs.name);
     if(not pr.first or not pr.second) return rdf::LInt32(0);
     auto objp = sess->get_object(pr.first, pr.second);
     return rdf::LInt32(objp != nullptr);
@@ -144,10 +153,6 @@ struct ExistVisitor: public boost::static_visitor<RDFTTYPE>, public ReadsGraph
   int
   register_callback(int vertex, ExprBase::ExprDataType && lhs, ExprBase::ExprDataType && rhs)const
   {
-    //TODO revert the ExistVisitor::register SKIPPING callback
-    if (this->rs->get_no_truth_main_on_exist()) {
-      return 0;
-    }
     // VLOG(40)<<"ExistVisitor::register callback for vertex "<<vertex<<" with pattern (*,"<<rhs<<",*)";
     return setup_callback_for_visitors(rs, vertex, std::forward<ExprBase::ExprDataType>(rhs));
   }
@@ -166,7 +171,7 @@ struct ExistNotVisitor: public boost::static_visitor<RDFTTYPE>, public ReadsGrap
   RDFTTYPE operator()(rdf::NamedResource lhs, rdf::NamedResource rhs)const
   {
     auto * sess = this->rs->rdf_session();
-    auto pr = get_resources(sess->rmgr(), std::move(lhs.name), std::move(rhs.name));
+    auto pr = get_resources(sess->rmgr(), lhs.name, rhs.name);
     if(not pr.first or not pr.second) return rdf::LInt32(1);
     auto objp = sess->get_object(pr.first, pr.second);
     return rdf::LInt32(objp == nullptr);
@@ -175,10 +180,6 @@ struct ExistNotVisitor: public boost::static_visitor<RDFTTYPE>, public ReadsGrap
   int
   register_callback(int vertex, ExprBase::ExprDataType && lhs, ExprBase::ExprDataType && rhs)const
   {
-    //TODO revert the ExistVisitor::register SKIPPING callback
-    if (this->rs->get_no_truth_main_on_exist()) {
-      return 0;
-    }
     // VLOG(40)<<"ExistNotVisitor::register callback for vertex "<<vertex<<" with pattern (*,"<<rhs<<",*)";
     return setup_callback_for_visitors(rs, vertex, std::forward<ExprBase::ExprDataType>(rhs));
   }
@@ -197,7 +198,7 @@ struct SizeOfVisitor: public boost::static_visitor<RDFTTYPE>, public ReadsGraph
   RDFTTYPE operator()(rdf::NamedResource lhs, rdf::NamedResource rhs)const
   {
     auto * sess = this->rs->rdf_session();
-    auto pr = get_resources(sess->rmgr(), std::move(lhs.name), std::move(rhs.name));
+    auto pr = get_resources(sess->rmgr(), lhs.name, rhs.name);
     if(not pr.first or not pr.second) return rdf::LInt32(0);
     auto itor = sess->find(pr.first, pr.second, rdf::make_any());
     int size = 0;

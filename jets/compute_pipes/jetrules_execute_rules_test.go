@@ -1,9 +1,12 @@
 package compute_pipes_test
 
-// A characterisation test of JrPoolWorker.executeRules, on the Go engine.
+// A characterisation test of JrPoolWorker.executeRules, on the C++ engine. It ran
+// on the Go engine until that engine's retirement (October 2026), and needs the cgo
+// environment of docs/src/content/docs/developer/testing/go-and-cpp.md; a C++ engine that does not
+// build fails the test.
 //
-// rules_unit_test_harness Phase 1, task AA.1. Nothing tested the rule loop
-// before this file (that project's F77), and AA.2 extracts it into an exported
+// Nothing tested the rule loop before this file, and a following change
+// extracts it into an exported
 // function that pipelines and the rules unit-test harness both call. So this
 // test pins what the loop does **today**, before it is moved, and it must pass
 // unchanged across the extraction: a refactor that edits the test along with the
@@ -14,25 +17,25 @@ package compute_pipes_test
 //   - a loop that completes before its maximum;
 //   - a loop that reaches its maximum, from the rule file's $max_looping and from
 //     the jetrules_config max_looping override;
-//   - I-7, fixed by AA.3: completion, or an ExecuteRules error, on the last
-//     allowed iteration is not reported as MAX LOOP REACHED. AA.1 pinned the
-//     defect; AA.3 changed these cases in the commit that fixed it;
+//   - completion, or an ExecuteRules error, on the last allowed iteration is
+//     not reported as MAX LOOP REACHED. The defect was pinned first, and these
+//     cases were changed in the commit that fixed it;
 //   - an ExecuteRules error, the max vertex visit limit;
 //   - a jets:exception, with and without a saved rete session;
 //   - each on_error policy's effect on output, for each of the three failures;
 //   - max_error_count, which stops the reporting and not the counting;
 //   - a rule sequence reports each jets:exception once, from the rule set that
 //     raised it, though the exception stays in the rdf session and every later
-//     rule set's scan finds it. Until I-8 was fixed it was reported again by
+//     rule set's scan finds it. Until 2026-10-11 it was reported again by
 //     every later rule set; the case was changed in the commit that fixed it;
 //   - two distinct exceptions raised by two rule sets of a sequence are reported
 //     once each, and a later rule set raising the first one again does not
 //     report it a second time;
 //   - the order: the first rule set's rete session is created before the input
-//     is asserted. On the Go engine the order changes no outcome, so it is pinned
-//     by recording the calls; on C++ it is load-bearing, because creating a
-//     resource through the meta graph after the first rdf session opens aborts
-//     the process (rules_unit_test_harness I-15).
+//     is asserted. It is pinned by recording the calls. On C++ it was
+//     load-bearing, because creating a resource through the meta graph after the
+//     first rdf session opened aborted the process until that
+//     was fixed; the Go engine, on which this was written, did not care.
 //
 // # How it runs
 //
@@ -40,7 +43,7 @@ package compute_pipes_test
 // this test binary as a child process with WORKSPACES_HOME and WORKSPACE set.
 // The child compiles the copy in process, then runs the cases. **It has to be a
 // child process**: package rete reads WORKSPACES_HOME and WORKSPACE in its init,
-// and they are unexported there, so nothing in this process can point the Go
+// and they are unexported there, so nothing in this process can point the
 // engine at a scratch workspace after it has started.
 //
 // The rule files are jet_rules/test_looping_main.jr, whose loop completes on
@@ -65,7 +68,6 @@ import (
 	"testing"
 
 	"github.com/artisoft-io/jetstore/jets/compute_pipes"
-	"github.com/artisoft-io/jetstore/jets/compute_pipes/jetrules_go_adaptor"
 	"github.com/artisoft-io/jetstore/jets/workspace"
 )
 
@@ -84,7 +86,14 @@ func TestExecuteRulesCharacterisation(t *testing.T) {
 		runCharacterisation(t, home)
 		return
 	}
+	rerunOverScratchTestWs(t, characterisationHomeEnv)
+}
 
+// rerunOverScratchTestWs copies jets/jetrules/test_ws to a scratch home and runs
+// the calling test again in a child process pointed at it, with homeEnv set to
+// the home; the child sees homeEnv and runs the cases.
+func rerunOverScratchTestWs(t *testing.T, homeEnv string) {
+	t.Helper()
 	wd, err := os.Getwd() // jets/compute_pipes
 	if err != nil {
 		t.Fatal(err)
@@ -96,8 +105,7 @@ func TestExecuteRulesCharacterisation(t *testing.T) {
 		t.Fatalf("copying test_ws: %v\n%s", err, out)
 	}
 	// The compiler builds its paths from workspace_control.json's workspace_name,
-	// which the committed file does not carry; patched in the copy only, as
-	// rerunOverCompiledTestWs in jets/jetrules/rete/retraction_mode_factory_test.go does.
+	// which the committed file does not carry; patched in the copy only.
 	ctlPath := filepath.Join(wsDir, "workspace_control.json")
 	raw, err := os.ReadFile(ctlPath)
 	if err != nil {
@@ -115,16 +123,19 @@ func TestExecuteRulesCharacterisation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cmd := exec.Command(os.Args[0], "-test.run=^TestExecuteRulesCharacterisation$", "-test.count=1", "-test.v")
+	cmd := exec.Command(os.Args[0], "-test.run=^"+t.Name()+"$", "-test.count=1", "-test.v")
 	cmd.Env = append(os.Environ(),
 		"WORKSPACES_HOME="+home,
 		"WORKSPACE=test_ws",
 		"JETS_WORKSPACE_DB_SCHEMA_SCRIPT="+filepath.Join(root, "jets", "workspace_schema.sql"),
-		characterisationHomeEnv+"="+home,
+		homeEnv+"="+home,
 	)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("the characterisation cases failed in the child process: %v\n%s", err, childFailures(out))
+		t.Fatalf("the cases failed in the child process: %v\n%s", err, childFailures(out))
+	}
+	if strings.Contains(string(out), "--- SKIP: "+t.Name()) {
+		t.Skipf("skipped in the child process:\n%s", childFailures(out))
 	}
 	if testing.Verbose() {
 		t.Logf("child process:\n%s", childFailures(out))
@@ -170,7 +181,7 @@ func (r *run) messages() []string {
 	return m
 }
 
-// recordingEngine wraps the Go engine so that the rdf sessions it opens record,
+// recordingEngine wraps the engine so that the rdf sessions it opens record,
 // in order, each rete session created and each triple inserted.
 type recordingEngine struct {
 	compute_pipes.JetRuleEngine
@@ -226,11 +237,7 @@ func newHarness(t *testing.T, process string, config *compute_pipes.JetrulesSpec
 func newHarnessWith(t *testing.T, process string, config *compute_pipes.JetrulesSpec,
 	builder *compute_pipes.BuilderContext, source *compute_pipes.InputChannel) *harness {
 	t.Helper()
-	engine, err := jetrules_go_adaptor.NewJetRulesFactory().NewJetRuleEngine(nil, process, false)
-	if err != nil {
-		t.Fatalf("building the Go engine for %s: %v", process, err)
-	}
-	t.Cleanup(func() { engine.Release() })
+	engine := buildEngine(t, process)
 
 	// What NewJetrulesTransformationPipe defaults before building a worker.
 	if config.OnError == "" {
@@ -344,9 +351,11 @@ func runOnce(t *testing.T, process, mode string, config *compute_pipes.JetrulesS
 	return newHarness(t, process, config).execute(mode)
 }
 
-// The messages executeRules writes, as it writes them.
+// The messages executeRules writes, as it writes them. msgExecuteRulesError is the
+// C++ engine's, naming the vertex that reached the cap and its visits; the Go
+// engine's was "error: max vertex visit reached".
 const (
-	msgExecuteRulesError = "ExecuteRules returned error: error: max vertex visit reached"
+	msgExecuteRulesError = `ExecuteRules returned error: {"error":"Maximum vertex visits reached","data":{"15": [10000,0]}}: error during execute rules in c: -10`
 	msgException         = "jets:exception caught: xr exception raised"
 	msgSecondException   = "jets:exception caught: xr second exception raised"
 	msgOnErrorFail       = "jetrules: record bundle failed rule execution (on_error: fail)"
@@ -412,9 +421,9 @@ func runCharacterisation(t *testing.T, home string) {
 		}
 	})
 
-	// I-7, fixed by AA.3. The loop completes on loop 3, the last one max_looping 3
-	// allows, and is not reported as reaching its maximum. Until AA.3 it was.
-	t.Run("I7_completion_on_last_allowed_loop_not_max_loop", func(t *testing.T) {
+	// The loop completes on loop 3, the last one max_looping 3
+	// allows, and is not reported as reaching its maximum. Until the fix it was.
+	t.Run("completion_on_last_allowed_loop_not_max_loop", func(t *testing.T) {
 		r := runOnce(t, loopingRuleFile, "ok", &compute_pipes.JetrulesSpec{MaxLooping: 3})
 		assertBundleKept(t, r)
 		assertMessages(t, r)
@@ -439,9 +448,9 @@ func runCharacterisation(t *testing.T, home string) {
 		assertMessages(t, r, msgMaxLoop("2"))
 	})
 
-	// I-7's second shape: an ExecuteRules error on loop 2, the last one the rule
-	// file allows, is the error alone. Until AA.3 it was also MAX LOOP REACHED.
-	t.Run("I7_execute_rules_error_on_last_allowed_loop_not_max_loop", func(t *testing.T) {
+	// The same defect's second shape: an ExecuteRules error on loop 2, the last one the rule
+	// file allows, is the error alone. Until the fix it was also MAX LOOP REACHED.
+	t.Run("execute_rules_error_on_last_allowed_loop_not_max_loop", func(t *testing.T) {
 		r := runOnce(t, executeRulesRuleFile, "late_runaway", &compute_pipes.JetrulesSpec{})
 		assertBundleKept(t, r)
 		assertMessages(t, r, msgExecuteRulesError)
@@ -587,7 +596,7 @@ func runCharacterisation(t *testing.T, home string) {
 
 	// A rule sequence: the exception asserted by test_execute_rules_main.jr stays in
 	// the rdf session and is found again by test_looping_main.jr's scan, but it is
-	// reported once, by the rule set that raised it (I-8, fixed 2026-10-11). Until
+	// reported once, by the rule set that raised it (fixed 2026-10-11). Until
 	// then it was reported once per rule set from the raiser to the last, and each
 	// report counted toward max_error_count and could save a rete session. Each
 	// rule set reads its own $max_looping: 2, then 5.

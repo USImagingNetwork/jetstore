@@ -1,7 +1,7 @@
 """Checks on the template model. `python -m pytest tests_template.py` or run directly.
 
 The negative cases matter more than the positive one: every finding `check` claims to
-make is a rule that will be leaned on by F.4's expander, and a rule nothing tests is a
+make is a rule that will be leaned on by the expander, and a rule nothing tests is a
 comment.
 """
 
@@ -32,7 +32,7 @@ class Pending(_PendingBase):
     **And pytest did not, until 2026-09-19.** This module's own header offers
     both runners and only `__main__` knew about `Pending`; under pytest it was
     an ordinary error. That was invisible while `pytest` in this directory
-    collected nothing at all (P9-I128). Derived from pytest's own skip
+    collected nothing at all. Derived from pytest's own skip
     exception when pytest is importable, so the reason is printed by `-rs` and
     the epsilon the raise site forbids widening is untouched.
     """
@@ -61,6 +61,26 @@ def _superproject() -> Path:
 
 
 SUPERPROJECT = _superproject()
+
+
+def _corpus_config(recorded: str) -> dict:
+    """A corpus configuration named as this package records it, read under those names.
+
+    `recorded` names its workspace by the neutral name; `aliases` resolves it to the
+    directory on disk and replaces the real names in what it reads, so a comparison
+    against an expansion compares like with like. Without the alias file the
+    workspace cannot be found, and the check is pending rather than failed.
+    """
+    from cpipes_contract import aliases
+
+    names = aliases.load()
+    path = names.path(SUPERPROJECT, recorded)
+    if not path.is_file():
+        raise Pending(
+            f"{recorded} is not in this checkout"
+            + ("" if names else f"; set {aliases.ENV} to the alias file naming its workspace")
+        )
+    return names.anonymise_json(json.loads(path.read_text()))
 SCHEMA = json.loads((HERE / "cpipes_schema.json").read_text())
 BASE = json.loads((HERE / "templates" / "qc_metrics.template.json").read_text())
 
@@ -118,7 +138,7 @@ def test_a_repeating_hole_must_sit_in_a_list():
 
 
 def test_nested_holes_are_found_through_a_body():
-    """The §5.3.9 case: the inner hole is inside the outer hole's `$body`."""
+    """The nested case: the inner hole is inside the outer hole's `$body`."""
     tpl = Template.model_validate(copy.deepcopy(BASE))
     paths = dict(tpl.markers())
     assert "$body" in paths["metric_columns"], paths
@@ -132,7 +152,7 @@ def test_nested_holes_are_found_through_a_body():
 
 
 
-# --- F.4: expansion -------------------------------------------------------------
+# --- Expansion -------------------------------------------------------------------
 
 from cpipes_contract.expand import ExpansionError, expand, from_library  # noqa: E402
 
@@ -174,7 +194,7 @@ def test_the_output_carries_no_marker_of_being_generated():
 
 
 def test_both_levels_repeat_independently():
-    """The §5.3.9 case: outer over metrics, inner over columns, neither inferred."""
+    """The nested case: outer over metrics, inner over columns, neither inferred."""
     cfg, _ = expanded()
     ops = cfg["conditional_pipes_config"][0]["pipes_config"][0]["apply"]
     assert len(ops) == len(CTX["metrics"])
@@ -214,13 +234,11 @@ def test_a_bad_fragment_is_reported_and_still_spliced():
 
 
 
-# --- F.5: criterion 21 ----------------------------------------------------------
+# --- Placement from the target -------------------------------------------------
 
 from cpipes_contract.expand import from_target  # noqa: E402
 
-TARGET_PATH = (
-    SUPERPROJECT / "workspaces" / "walrus_ws" / "pipes_config" / "map_claim.pc.json"
-)
+TARGET_PATH = "workspaces/org3_ws/pipes_config/map_claim.pc.json"
 
 
 def _round_trip():
@@ -229,7 +247,7 @@ def _round_trip():
         json.loads((HERE / "templates" / "map_claim_load_stages.template.json").read_text())
     )
     ctx = json.loads((HERE / "templates" / "map_claim_load_stages.bindings.json").read_text())
-    target = json.loads(TARGET_PATH.read_text())
+    target = _corpus_config(TARGET_PATH)
     cfg, findings = expand(tpl, ctx, from_target(target, key="step_name"), SCHEMA)
     return tpl, target, cfg, findings
 
@@ -268,12 +286,12 @@ def test_criterion_21_the_expansion_regenerates_its_target_exactly():
 
 
 # ---------------------------------------------------------------------------
-# Q-15: the prompt is the constraint, not the schema
+# The prompt is the constraint, not the schema
 # ---------------------------------------------------------------------------
 
 
 def test_the_fit_check_measures_the_prompt_not_the_schema():
-    """`ConditionalPipeSpec` is the case that settled Q-15.
+    """`ConditionalPipeSpec` is the case that settled what the fit check measures.
 
     Its JSON Schema is ~49,008 tokens and its prompt ~11,800, against a 24,576 budget.
     The old check sized the schema and refused the hole as unauthorable; the schema
@@ -324,7 +342,7 @@ def test_the_examples_are_counted_because_they_are_sent():
 def test_every_bundle_is_authorable():
     """The bundle layer's promise, restated against what actually occupies the window.
 
-    F.8 sized the bundles by JSON Schema and reported the worst at 15,513 of 24,576.
+    The bundles were first sized by JSON Schema, with the worst at 15,513 of 24,576.
     Measured as prompts with their examples, the worst is `AnalyzePipe` at ~11,818 - so
     the promise holds under the corrected measure as well, which was not guaranteed:
     the examples could have eaten the headroom the TypeScript freed.
@@ -351,11 +369,11 @@ def test_every_bundle_is_authorable():
     assert over == [], f"over budget: {over}"
 
 
-# --- F.7: criterion 23 ----------------------------------------------------------
+# --- Bindings read off the live qc_* configs ------------------------------------
 
-from cpipes_contract.qc_bindings import derive  # noqa: E402
+from cpipes_contract.qc_bindings import QcShapeError, derive, status_column  # noqa: E402
 
-QC = SUPERPROJECT / "workspaces" / "cedargate_ws" / "pipes_config"
+QC = "workspaces/org1_ws/pipes_config"
 QC_TEMPLATE = Template.model_validate(
     json.loads((HERE / "templates" / "qc_report.template.json").read_text())
 )
@@ -364,7 +382,7 @@ QC_NOT_EXACT = ("qc_biometric", "qc_pharmacyclaim", "qc_medicalclaim")
 
 
 def _qc(name):
-    target = json.loads((QC / f"{name}.pc.json").read_text())
+    target = _corpus_config(f"{QC}/{name}.pc.json")
     cfg, bad = expand(QC_TEMPLATE, derive(target), lambda h, c: {"$UNFILLED": h.name}, SCHEMA)
     return target, cfg, bad
 
@@ -374,21 +392,57 @@ def test_the_qc_template_is_clean():
     assert findings == []
 
 
-def test_criterion_23_two_of_the_five_non_exact_reproduce_exactly():
-    """§5.3.9 left five `qc_*` configs short of byte-for-byte. Two of them now are.
+def test_a_parameter_the_body_never_reads_is_a_finding():
+    """A declared parameter is a field whose value must land somewhere in the config.
 
-    Criterion 23 asks for one. `qc_participation` (14 diffs in Phase 0) and
+    `qc_report` declares the two notification context keys; dropping the body's read of
+    one leaves a declaration with nothing behind it, and a second declaration of the same
+    name is a duplicate. A read inside a hole's `$body` does not count: there `$item` is
+    the repetition's item, not the top-level record a parameter presents.
+    """
+    assert {p.name for p in QC_TEMPLATE.parameters} == {"file_type_key", "notification_type_key"}
+    assert {"file_type_key", "notification_type_key"} <= QC_TEMPLATE.item_reads()
+
+    raw = json.loads((HERE / "templates" / "qc_report.template.json").read_text())
+    raw["body"]["context"][3]["key"] = "$LITERAL"
+    raw["parameters"].append(dict(raw["parameters"][0]))
+    findings, _ = check(Template.model_validate(raw), SCHEMA, None, HERE / "matrix")
+    assert any("'notification_type_key' is declared but the body never reads" in f
+               for f in findings), findings
+    assert any("'file_type_key' is declared more than once" in f for f in findings), findings
+
+
+def test_the_reproduction_binds_the_notification_keys_from_the_config():
+    """The two context keys are parameters, so each config's own keys come back.
+
+    The projected flow offers neutral defaults; a reproduction must not inherit them.
+    `derive` reads the keys off the config, and the expansion carries them where the
+    config has them.
+    """
+    target = _corpus_config(f"{QC}/qc_participation.pc.json")
+    bindings = derive(target)["$item"]
+    assert bindings["file_type_key"] == target["context"][2]["key"]
+    assert bindings["notification_type_key"] == target["context"][3]["key"]
+    cfg, bad = expand(QC_TEMPLATE, derive(target), lambda h, c: {"$UNFILLED": h.name}, SCHEMA)
+    assert bad == [], bad
+    assert [c["key"] for c in cfg["context"]] == [c["key"] for c in target["context"]]
+
+
+def test_criterion_23_two_of_the_five_non_exact_reproduce_exactly():
+    """An earlier experiment left five `qc_*` configs short of byte-for-byte. Two now are.
+
+    The test asks for one. `qc_participation` (14 diffs at first) and
     `qc_eligibility` (54) both reproduce exactly from `qc_TEMPLATE` plus the hole set,
-    and the three Phase 0 already had stay exact - which is the check that matters, since
+    and the three that were already exact stay exact - which is the check that matters, since
     a hole added for one config can easily break another.
 
-    **This proves placement, not authoring** - §5.3.9's third qualification, unchanged.
+    **This proves placement, not authoring** - unchanged.
     `derive` reads the target.
 
     **`qc_eligibility` is the arm that carries the status filters (2026-09-17).** Of the
     five, it is the only one whose `case_expr` is eight legs rather than four, so it is
     what says the `status_filter_clauses` hole reproduces a filter *and* that the other
-    four reproduce when it repeats zero times - the two halves of `AH.6`, in one
+    four reproduce when it repeats zero times - the two halves of the status-filter hole, in one
     assertion each way round.
     """
     for name in QC_EXACT:
@@ -400,12 +454,12 @@ def test_criterion_23_two_of_the_five_non_exact_reproduce_exactly():
 def test_no_fragment_comes_from_a_model_or_the_library():
     """Every hole is filled by its own `$body`; the `fill` seam is never reached.
 
-    That is stronger than F.5's round trip, which recovered whole operators with
+    That is stronger than the placement round trip, which recovered whole operators with
     `from_target`. Here the skeleton supplies the shape and the bindings supply only
     values, so a `fill` callable that returns nonsense changes nothing.
     """
     calls = []
-    target = json.loads((QC / "qc_participation.pc.json").read_text())
+    target = _corpus_config(f"{QC}/qc_participation.pc.json")
     cfg, _ = expand(
         QC_TEMPLATE, derive(target),
         lambda h, c: (calls.append(h.name), {"$UNFILLED": h.name})[1], SCHEMA,
@@ -415,7 +469,7 @@ def test_no_fragment_comes_from_a_model_or_the_library():
 
 
 def test_the_three_that_do_not_reproduce_are_recorded_as_bounded():
-    """The honest half of criterion 23: what is left, and that it is not the mechanism.
+    """The honest half of the reproduction test: what is left, and that it is not the mechanism.
 
     Nine, ten and thirty-three leaves respectively, in four categories that are all
     per-config payload the template does not yet name - `format`/`compression` on an
@@ -424,14 +478,14 @@ def test_the_three_that_do_not_reproduce_are_recorded_as_bounded():
     anything the hole model cannot express. The test pins the *size* of what is left so
     that it cannot quietly grow.
 
-    **Re-measured 2026-09-17 against `workspaces/cedargate_ws` at `cgt_ai` `7c26793`: 9,
+    **Re-measured 2026-09-17 against the workspace the `qc_*` configs live in: 9,
     33 and 10, unchanged.** The figures are dated because they are measured from a
     repository this one does not control, and that afternoon they moved and came back.
-    `cgt_test_harness_filters`' `AG.1` added four status filters to three of the eight
+    A change request added four status filters to three of the eight
     `qc_*` configs, taking `qc_pharmacyclaim` to 128, `qc_medicalclaim` to 105 and
     `qc_eligibility` out of the exact set at 95 - the filters being a skeleton that
     varies per config, which is the one thing this budget was written to say was absent.
-    `AH.6` made them one repeating hole over `(env_key, substring)` pairs and all four
+    A second change made them one repeating hole over `(env_key, substring)` pairs and all four
     figures returned to what they had been, so what this test asserts survived a change
     to its corpus rather than being refitted to it. **`qc_biometric`'s 9 is the arm to
     read as independent**: it carries no filter, so it is what says the repair moved
@@ -447,7 +501,8 @@ def test_the_three_that_do_not_reproduce_are_recorded_as_bounded():
         else:
             yield p, o
 
-    budget = {"qc_biometric": 9, "qc_pharmacyclaim": 33, "qc_medicalclaim": 10}
+    # qc_pharmacyclaim was 33 until 2026-11-19, when a change in the workspace it lives in took it to 37.
+    budget = {"qc_biometric": 9, "qc_pharmacyclaim": 37, "qc_medicalclaim": 10}
     for name in QC_NOT_EXACT:
         target, cfg, bad = _qc(name)
         assert bad == [], f"{name}: {bad}"
@@ -456,19 +511,59 @@ def test_the_three_that_do_not_reproduce_are_recorded_as_bounded():
         assert n <= budget[name], f"{name}: {n} differing leaves, was {budget[name]}"
 
 
+def _report_columns(cfg):
+    return cfg["reducing_pipes_config"][3][1]["apply"][0]["columns"]
+
+
 def _status_case(cfg):
-    return cfg["reducing_pipes_config"][3][1]["apply"][0]["columns"][9]["case_expr"]
+    return status_column(_report_columns(cfg))["case_expr"]
+
+
+def test_derive_finds_the_status_column_by_what_it_writes_not_where_it_sits():
+    """The status column is located by name, so moving it moves nothing.
+
+    `derive` read `columns[9]` until 2026-11-08. Here the status column of a config
+    that carries filters is moved to the front of the report pipe's columns; the
+    filters recovered must be the same four. At the index, column 9 is then an
+    ordinary `value` column and the read was a `KeyError`.
+    """
+    target = _corpus_config(f"{QC}/qc_eligibility.pc.json")
+    want = derive(target)["status_filters"]
+    assert len(want) == 4, want
+    moved = copy.deepcopy(target)
+    columns = _report_columns(moved)
+    status = status_column(columns)
+    columns.remove(status)
+    columns.insert(0, status)
+    assert derive(moved)["status_filters"] == want
+
+
+def test_a_report_pipe_without_one_status_column_is_refused_by_name():
+    """None, or two, is a `QcShapeError` saying so, not an `IndexError` or a mis-slice."""
+    target = _corpus_config(f"{QC}/qc_participation.pc.json")
+    for label, edit in (
+        ("none", lambda cols: cols.remove(status_column(cols))),
+        ("two", lambda cols: cols.append(copy.deepcopy(status_column(cols)))),
+    ):
+        broken = copy.deepcopy(target)
+        edit(_report_columns(broken))
+        try:
+            derive(broken)
+        except QcShapeError as e:
+            assert "status" in str(e), (label, str(e))
+        else:
+            raise AssertionError(f"{label}: expected QcShapeError")
 
 
 def test_a_repeating_hole_bound_to_no_items_leaves_its_list_as_written():
-    """Q-19, tested rather than argued: a hole can repeat zero times.
+    """Tested rather than argued: a hole can repeat zero times.
 
-    `AH.6` turned the status filters into one repeating hole, and five of the eight
+    The status filters became one repeating hole, and five of the eight
     reports carry no filter — so the whole repair rests on an empty binding splicing
     away and leaving the surrounding list untouched rather than, say, leaving a null in
     it. **Bound to `[]`, not omitted**: an omitted name raises, which
     `test_an_unbound_repeat_over_raises` holds for the other template. The two
-    together are the answer to Q-19 in both directions.
+    together are the answer in both directions.
     """
     target, cfg, bad = _qc("qc_participation")
     assert bad == []
@@ -479,7 +574,7 @@ def test_a_repeating_hole_bound_to_no_items_leaves_its_list_as_written():
 
 
 def test_the_status_filter_carries_its_substring_rather_than_deriving_it():
-    """F21's trap, pinned against a hand-written binding rather than against the corpus.
+    """The shared-substring trap, pinned against a hand-written binding rather than against the corpus.
 
     Two of the four filters test `contains 'HCC'` from *different* environment
     variables, because `${calculateCMSHCC}` and `${calculateHHSHCC}` are two
@@ -492,7 +587,7 @@ def test_the_status_filter_carries_its_substring_rather_than_deriving_it():
     control; `test_criterion_23_two_of_the_five_non_exact_reproduce_exactly` is where the
     live configs have their say.
     """
-    target = json.loads((QC / "qc_participation.pc.json").read_text())
+    target = _corpus_config(f"{QC}/qc_participation.pc.json")
     context = derive(target)
     context["status_filters"] = [
         {"env_key": "${calculateCMSHCC}", "substring": "'HCC'"},
@@ -513,7 +608,7 @@ def test_the_status_filter_carries_its_substring_rather_than_deriving_it():
     assert legs[2:] == _status_case(target)
 
 
-# --- F.2b: A§6.1 source 2, measured -----------------------------------------------
+# --- The test fixtures as a library source, measured -----------------------------
 
 from cpipes_contract.fixtures import coverage, load, validate as validate_fixtures  # noqa: E402
 
@@ -526,12 +621,12 @@ LIBRARY = [
 
 
 def test_the_resolver_reaches_the_tail_i35_said_it_could_not():
-    """I-35's point was that a static parse misses exactly the types worth having.
+    """A static parse misses exactly the types worth having.
 
     `GroupBySpec` was 0 of 5 self-contained and `MergeSpec` 0 of 4, because their
     fixtures read locals like `mergeColumn := []string{"key1"}`. Resolving the enclosing
-    function's literal bindings gets them, which is why F.2b is a resolver rather than
-    the test-time capture I-35 left open as the alternative.
+    function's literal bindings gets them, which is why the harvester is a resolver rather than
+    the test-time capture left open as the alternative.
     """
     got = {}
     for fixture in load(FIXTURES):
@@ -541,9 +636,9 @@ def test_the_resolver_reaches_the_tail_i35_said_it_could_not():
 
 
 def test_a_harvested_fixture_is_not_the_same_as_a_valid_fragment():
-    """The finding that decides what source 2 is worth (I-45).
+    """The finding that decides what source 2 is worth.
 
-    A§6.1 calls the fixtures "correct by construction". They are correct *for their
+    The proposal calls the fixtures "correct by construction". They are correct *for their
     test*: partial where the test only needs part, deliberately wrong where the test is
     negative, and sentinel-valued where the test only round-trips a field. Fewer than
     half validate, and the gap is the point rather than a defect in the harvester.
@@ -561,29 +656,29 @@ def test_a_harvested_fixture_is_not_the_same_as_a_valid_fragment():
 def test_the_fixtures_fill_two_of_the_twenty_five_empty_types():
     """The measure source 2's argument actually rests on.
 
-    A§6.1's case is that the fixtures concentrate where the corpus is thin, so a count of
+    The proposal's case is that the fixtures concentrate where the corpus is thin, so a count of
     fixtures is the wrong number and a count of types the corpus cannot illustrate is the
     right one. Twenty-five contract types have no library part; the fixtures supply two.
     """
     good, _ = validate_fixtures(load(FIXTURES), SCHEMA)
     cov = coverage(good, LIBRARY, HERE / "matrix")
-    # **25 when F.2b pinned it, 27 on 2026-08-31, 36 on 2026-09-11.** The contract
+    # **25 when first pinned, 27 on 2026-08-31, 36 on 2026-09-11.** The contract
     # gained types the library cannot illustrate; the fixtures still fill exactly the
     # same two. Re-pinned rather than loosened, because the number is the population
-    # and the claim is the pair: what A§6.1 rests on is that the fixtures concentrate
+    # and the claim is the pair: what the proposal rests on is that the fixtures concentrate
     # where the corpus is thin, and a growing `empty` makes that claim *stronger*
     # rather than stale. The reason this went unnoticed for eleven days is the runner —
     # see the note at the foot of this file.
     #
-    # **Of the nine added since 2026-08-31, five are BB.1's and four were already
-    # here when it arrived** — `ElementParagraph`, `ElementGroup`, `RenderSpec`,
+    # **Of the nine added since 2026-08-31, five are the render operator's and four
+    # were already here when it arrived** — `ElementParagraph`, `ElementGroup`, `RenderSpec`,
     # `TextTemplateSpec` and `TransformationSpecRender` are the render operator's,
     # and the assertion was already failing at 31 against a pin of 27 before this
     # task touched the matrix. Recorded rather than absorbed silently: re-pinning is
     # what this comment asks for, and it is also how a number drifts four types at a
     # time with nobody named.
     #
-    # **38 on 2026-09-13**, the two being gap 2b's `TransformationSpecSite` and
+    # **38 on 2026-09-13**, the two being the site operator's `TransformationSpecSite` and
     # `SiteOperatorSpec`. Neither can ever have a library part, and that is a
     # property of the type rather than a gap in the library: a site operator's
     # shape belongs to whichever deployment wrote it, so there is no exemplar
@@ -593,8 +688,20 @@ def test_the_fixtures_fill_two_of_the_twenty_five_empty_types():
     # **39 on 2026-10-18**, the one being jetstore#2296's `StageFileKey`: the
     # reducing starter writes it into the runtime config for the worker nodes, so
     # no authored document carries one and the library can never hold a part for it.
-    assert len(cov["empty"]) == 39
-    assert cov["filled_by_fixtures"] == ["DomainKeysSpec", "OllamaServerSpec"]
+    #
+    # **31 on 2026-11-19**, when the library was regenerated for the first time since
+    # those additions: every count above was taken against a library extracted before
+    # the types it counted had corpus instances. Ten left `empty` - the render
+    # operator's five and the infer operator's three, from the patient_profile pair,
+    # and the site operator's two. **The paragraph above saying a site operator can
+    # never have a library part was wrong**: its *shape* belongs to the deployment, but
+    # a corpus can still hold one, and jets_ws's healthcare_corpus pipeline does. Two
+    # joined: `OllamaSpec` and `TransformationSpecOllama`, whose one instance became an
+    # infer step when patient_profile stated its briefing step once for either backend.
+    # The fixtures hold an `OllamaSpec`, so they now fill three: the claim the pin
+    # protects - that the fixtures concentrate where the corpus is thin - gains one.
+    assert len(cov["empty"]) == 31
+    assert cov["filled_by_fixtures"] == ["DomainKeysSpec", "OllamaServerSpec", "OllamaSpec"]
 
 
 def test_nothing_here_writes_into_the_library():
@@ -608,13 +715,13 @@ def test_nothing_here_writes_into_the_library():
     assert ".write_text(" not in source and "open(" not in source.replace("open(matrix", "")
 
 
-# --- I-42: the estimate, and what it was wrong about --------------------------------
+# --- The estimate, and what it was wrong about ------------------------------------
 
 from cpipes_contract.authoring import (  # noqa: E402
     CHARS_PER_TOKEN, estimate_tokens, fits, instruction_for, segments,
 )
 
-# Measured against granite4.1:3b's prompt_eval_count, 2026-08-20 (Q-15).
+# Measured against granite4.1:3b's prompt_eval_count, 2026-08-20.
 MEASURED = {"ColumnAggregation": 1824, "ConditionalPipeSpec": 10291, "AnalyzePipe": 13501}
 CURATED = [
     json.loads(line)
@@ -639,7 +746,7 @@ def test_the_estimate_is_within_five_per_cent_of_the_server():
     """
     # **`ConditionalPipeSpec` drifted to +6.9% by 2026-08-31 and this test is not
     # the place to absorb that.** MEASURED holds `prompt_eval_count` from
-    # granite4.1:3b at I-42; the prompt has grown since (W.1 moved matrix rows, so
+    # granite4.1:3b at the time; the prompt has grown since (matrix rows moved, so
     # the examples and the token list changed) while the constants did not. Two
     # repairs are available and both are wrong here: loosening the tolerance hides
     # the drift the test exists to show, and re-measuring against the only model on
@@ -657,7 +764,7 @@ def test_the_estimate_is_within_five_per_cent_of_the_server():
     if over:
         raise Pending(
             "the estimator has drifted past 5% against measurements taken on "
-            f"granite4.1:3b at I-42, which is not on this machine: {over}. "
+            f"granite4.1:3b, which is not on this machine: {over}. "
             "Re-measure prompt_eval_count on that model; do not widen the epsilon."
         )
 
@@ -685,7 +792,7 @@ def test_json_tokenises_finer_than_typescript():
 
 
 def test_a_prompt_near_the_budget_is_unclear_rather_than_rounded():
-    """Three answers, because there are three (I-42)."""
+    """Three answers, because there are three."""
     budget = 24576
     assert fits(1000, budget) == "fits"
     assert fits(budget - 1, budget) == "unclear"
@@ -699,7 +806,7 @@ def test_segments_reads_the_prompts_own_shape():
     assert {"typescript", "json", "prose"} <= kinds
 
 
-# --- T.3: the three candidate-selection arms ------------------------------------
+# --- The three candidate-selection arms -----------------------------------------
 
 from cpipes_contract import retrieval as R  # noqa: E402
 from cpipes_contract.authoring import examples_for  # noqa: E402
@@ -715,7 +822,7 @@ def _picks(method, schema_ref="ColumnAggregation", query="", limit=4):
 def test_cited_is_what_examples_for_always_did():
     """The baseline arm must be the shipped behaviour, or the comparison has no zero.
 
-    `examples_for` was refactored at T.3 onto a pluggable ranker; if `cited` had
+    `examples_for` was refactored onto a pluggable ranker; if `cited` had
     drifted while doing it, every arm would be measured against a method nothing
     ships and the run would answer a question nobody asked.
     """
@@ -733,7 +840,7 @@ def test_cited_is_what_examples_for_always_did():
 
 
 def test_every_arm_keeps_the_shape_diversity_rule():
-    """I-96's stated caution: the swap is *within* a member type.
+    """The stated caution: the swap is *within* a member type.
 
     `examples_for` picks one part per member type before any second of a type,
     because three `select` examples teach less than one each of select, value and
@@ -786,7 +893,7 @@ def test_a_semantic_arm_without_an_embedder_refuses():
 
 
 def test_the_selection_method_is_the_only_thing_that_changes_in_the_prompt():
-    """T.3 attributes a difference in compile-pass to the examples. That is only
+    """The run attributes a difference in compile-pass to the examples. That is only
     sound if the rest of the instruction is byte-identical across arms."""
     from cpipes_contract.template import Hole
 
@@ -806,7 +913,7 @@ def test_the_selection_method_is_the_only_thing_that_changes_in_the_prompt():
 # **It sat at line 221 with 420 lines of tests after it, so 22 of this file's 39
 # tests had never run under `python tests_template.py`** - Python defines a module
 # top to bottom, so `sorted(globals().items())` at line 221 sees only what is above
-# it. Found 2026-08-31 at T.3, by appending tests and watching them not appear.
+# it. Found 2026-08-31, by appending tests and watching them not appear.
 #
 # They were reachable under pytest, which is why nothing was obviously broken; the
 # sibling `tests_project.py` records that no pytest is installed against this

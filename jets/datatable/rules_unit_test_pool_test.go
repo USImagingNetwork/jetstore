@@ -1,9 +1,9 @@
 package datatable
 
-// The executor pool (AC.3) and the recording of a run (AC.4), against fake
+// The executor pool and the recording of a run, against fake
 // harnesses: shell scripts named through JETS_RULES_UNIT_TEST_HARNESS that write
 // a result, exit without one, overrun the deadline, or allocate past the memory
-// ceiling. So the pool is tested without the C++ engine (plan §5). Needs
+// ceiling. So the pool is tested without the C++ engine. Needs
 // JETS_TEST_DSN like rules_unit_test_runs_test.go, whose fixture it uses; the
 // memory tests need python3.
 
@@ -213,7 +213,7 @@ print("allocated")'`
 		// alone costs.
 		{"overruns its deadline", `echo "looping"; sleep 30 & wait`, time.Second,
 			[]string{"timed out", "1s deadline"}, "looping", 4},
-		// The harness applies -rlimit_data_mb to itself first, as AB.9 will.
+		// The harness applies -rlimit_data_mb to itself first.
 		{"past its ceiling, self-limited", `ulimit -d $(( $4 * 1024 )); ` + alloc, 0,
 			[]string{"memory limit, inferred from the log", `"out of memory"`, "64 MiB", "exit status 2"}, "fatal error: out of memory", 10},
 		// The harness ignores the flag; the apiserver's prlimit holds it anyway.
@@ -397,7 +397,7 @@ func TestHarnessEnvironment(t *testing.T) {
 		"jets_encryption_key=k", "AWS_REGION=us-east-1", "AWS_PROFILE=dev", "AWS_ACCESS_KEY_ID=id",
 		"WORKSPACE=stale", "JETS_VERSION=1", "GLOG_v=3",
 	}, "/home", "ws")
-	want := "PATH=/bin OLDPWD=/tmp AWS_REGION=us-east-1 JETS_VERSION=1 GLOG_v=3 WORKSPACES_HOME=/home WORKSPACE=ws"
+	want := "PATH=/bin OLDPWD=/tmp AWS_REGION=us-east-1 JETS_VERSION=1 GLOG_v=3 WORKSPACES_HOME=/home WORKSPACE=ws JETS_SECRETS_WITHHELD=1"
 	if strings.Join(got, " ") != want {
 		t.Errorf("got  %s\nwant %s", strings.Join(got, " "), want)
 	}

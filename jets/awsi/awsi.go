@@ -310,8 +310,10 @@ func NewS3Client() (*s3.Client, error) {
 
 // GetObjectSize gets the size of the object in bytes
 // Does up to 4 attempts in case of failure
+// An empty bucket or the jetstore_bucket sentinel means the deployment's own
+// bucket, as for every other reader in this package.
 func GetObjectSize(s3Client *s3.Client, s3bucket string, key string) (int64, error) {
-	if len(s3bucket) == 0 {
+	if IsJetStoreBucket(s3bucket) {
 		s3bucket = jetstoreOwnBucket
 	}
 	params := &s3.GetObjectAttributesInput{
@@ -353,7 +355,7 @@ func ListS3Objects(externalBucket string, prefix *string) ([]*S3Object, error) {
 // ListObjects lists the objects in a bucket with prefix if not nil.
 // Read from externalBucket if not empty, otherwise read from jetstore default bucket
 func ListS3ObjectsV2(s3Client *s3.Client, externalBucket string, prefix *string) ([]*S3Object, error) {
-	if externalBucket == "" || externalBucket == "jetstore_bucket" {
+	if IsJetStoreBucket(externalBucket) {
 		externalBucket = jetstoreOwnBucket
 	}
 
@@ -410,7 +412,7 @@ type CountS3ObjectsResult struct {
 // and skips any objects with size 0. If externalBucket is empty, it uses the JetStore default bucket.
 
 func CountS3ObjectsWithPrefix(s3Client *s3.Client, externalBucket, prefix string) (*CountS3ObjectsResult, error) {
-	if externalBucket == "" || externalBucket == "jetstore_bucket" {
+	if IsJetStoreBucket(externalBucket) {
 		externalBucket = jetstoreOwnBucket
 	}
 
@@ -537,41 +539,44 @@ func DownloadFromS3v2(downloader *transfermanager.Client, bucket, objKey string,
 //
 // Example:
 //
-//	// pre-allocate in memory buffer, where n is the object size
-//	buf := make([]byte, n)
-//	// wrap with aws.WriteAtBuffer
-//	w := manager.NewWriteAtBuffer(buf)
+//	// pre-allocate in memory buffer, where n is the expected object size
+//	w := manager.NewWriteAtBuffer(make([]byte, 0, n))
+//	// read the body from w.Bytes(), which grows to what was downloaded:
+//	// the buffer passed in is not the body when the object is larger than n
 func DownloadFromS3WithRetry(downloader *transfermanager.Client, bucket, objKey string, byteRange *string, w io.WriterAt) (int64, error) {
+	return DownloadVersionFromS3WithRetry(downloader, bucket, objKey, "", byteRange, w)
+}
+
+// DownloadVersionFromS3WithRetry is DownloadFromS3WithRetry for one version of
+// the object. An empty versionId downloads the current version.
+func DownloadVersionFromS3WithRetry(downloader *transfermanager.Client, bucket, objKey, versionId string,
+	byteRange *string, w io.WriterAt) (int64, error) {
 	var (
 		n   int64
 		err error
 	)
+	input := &transfermanager.DownloadObjectInput{
+		Bucket:   &bucket,
+		Key:      &objKey,
+		Range:    byteRange,
+		WriterAt: w,
+	}
+	if versionId != "" {
+		input.VersionID = &versionId
+	}
+	getObjectType := types.GetObjectParts
+	if byteRange != nil {
+		getObjectType = types.GetObjectRanges
+	}
 	retry := 0
 do_retry:
 	// Download the object
 	var doo *transfermanager.DownloadObjectOutput
-	if byteRange != nil {
-		doo, err = downloader.DownloadObject(context.TODO(), &transfermanager.DownloadObjectInput{
-			Bucket:   &bucket,
-			Key:      &objKey,
-			Range:    byteRange,
-			WriterAt: w,
-		}, func(o *transfermanager.Options) {
-			o.PartSizeBytes = 10 * 1024 * 1024 // 10 MB
-			o.Concurrency = 10
-			o.GetObjectType = types.GetObjectRanges
-		})
-	} else {
-		doo, err = downloader.DownloadObject(context.TODO(), &transfermanager.DownloadObjectInput{
-			Bucket:   &bucket,
-			Key:      &objKey,
-			WriterAt: w,
-		}, func(o *transfermanager.Options) {
-			o.PartSizeBytes = 10 * 1024 * 1024 // 10 MB
-			o.Concurrency = 10
-			o.GetObjectType = types.GetObjectParts
-		})
-	}
+	doo, err = downloader.DownloadObject(context.TODO(), input, func(o *transfermanager.Options) {
+		o.PartSizeBytes = 10 * 1024 * 1024 // 10 MB
+		o.Concurrency = 10
+		o.GetObjectType = getObjectType
+	})
 	if err != nil {
 		if retry < 6 {
 			retry++
@@ -596,7 +601,7 @@ func UploadToS3FromReader(externalBucket, objKey string, reader io.Reader) error
 	}
 
 	// check if we write to an external bucket
-	if externalBucket == "" || externalBucket == "jetstore_bucket" {
+	if IsJetStoreBucket(externalBucket) {
 		externalBucket = jetstoreOwnBucket
 	}
 
@@ -638,8 +643,7 @@ func UploadBufToS3(bucket, objKey string, buf []byte) error {
 
 // download buf from S3, returning the obj
 //
-// **A missing object is answered at once and recognisably** (jetstore_maintenance_02
-// I-23, 2026-10-01). This retried every failure six times, sleeping 0.5 s to 3 s,
+// **A missing object is answered at once and recognisably** (2026-10-01). This retried every failure six times, sleeping 0.5 s to 3 s,
 // so a key that does not exist took about 10.5 s to report, and it flattened the
 // SDK's typed error with %v, so nothing upstream could tell "no such object" from
 // "the read failed" except by matching text. A missing key is not transient --

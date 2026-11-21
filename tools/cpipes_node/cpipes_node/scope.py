@@ -11,8 +11,8 @@ everything downstream.
 `Operator` subclass under `cpipes_node/operators/`, and `declared_scope()`
 walks the registry those subclasses put themselves into. There is no tuple of
 strings anywhere for an edit to widen, because a list of what to check is the
-wrong shape for the question — omission and completion produce the same output
-(healthcare_corpus P3-I20). Adding a token means adding a class; forgetting to
+wrong shape for the question — omission and completion produce the same output.
+Adding a token means adding a class; forgetting to
 declare a class means the token is out of scope and the node aborts on it,
 which is the loud direction.
 
@@ -23,7 +23,7 @@ cannot disagree.
 
 **Three refusals, and they are three because three different people repair
 them.** A token no kind of scope knows is the author's; a token JetStore has
-and this node has not taken on is a scope decision (P9-I04, D-206); a declared
+and this node has not taken on is a scope decision; a declared
 token with no `build` is a task in this package. `ScopeReport` keeps them
 apart and `coordinate` raises them in that order.
 
@@ -98,7 +98,7 @@ class Operator:
         """Build the runtime object for one authored step.
 
         The base raises, which is what an unimplemented declaration is. The
-        signature is deliberately loose while the channel graph (P9-T04) has
+        signature is deliberately loose while the channel graph has
         not fixed what an `env` is; narrowing it is that task's, and this
         docstring is the seam.
         """
@@ -250,7 +250,7 @@ def render_scope() -> str:
     """The scope, as the abort message prints it.
 
     The message names the scope searched and not only the token, because
-    "unknown operator: cgt_scrub" leaves the author unable to tell a typo from
+    "unknown operator: org1_scrub" leaves the author unable to tell a typo from
     a built-in this node has not taken on, and those have different repairs.
     """
     lines = ["  the scope searched:\n"]
@@ -278,7 +278,7 @@ def classify(
 
     `contract_tokens` is what JetStore's own model knows for this kind, and it
     is here only to make the message better: a token JetStore has and this node
-    has not taken on is a *scope* question (P9-I04) and a token nobody has is a
+    has not taken on is a *scope* question and a token nobody has is a
     typo, and telling the author which one they have is most of the value of
     the abort.
     """
@@ -301,7 +301,7 @@ def classify(
     if token in contract_tokens:
         reason = (
             "a JetStore built-in this node does not implement "
-            "(whether the subset is permanent is D-206 / P9-I04)"
+            "(this node implements a subset of the built-ins by design)"
         )
     elif kind is TokenKind.TRANSFORMATION:
         reason = "neither a declared built-in nor a registered site operator"

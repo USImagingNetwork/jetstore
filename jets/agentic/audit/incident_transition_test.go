@@ -1,7 +1,7 @@
-// AB.2's half of I-276, tested against a real Postgres: an incident's
+// Incident transitions, tested against a real Postgres: an incident's
 // classification transitions carry an actor, an actor *kind* and a timestamp,
 // the prior classification is read from the row rather than accepted from the
-// caller, and the two CHECK constraints AB.2 adds refuse what the appendix
+// caller, and the two CHECK constraints on the event table refuse what the design
 // says they must.
 //
 // Needs JETS_TEST_DSN, like the rest of this package; skipped otherwise.
@@ -19,18 +19,18 @@ import (
 
 // seedIncident writes one incident in `status` with `classification` ("" for
 // none) and returns its id. It is deliberately a raw INSERT: nothing in
-// JetStore writes jetsapi.incident yet — AC.1's is the first writer — so a
+// JetStore writes jetsapi.incident yet — triage is the first writer — so a
 // helper that pretended otherwise would be a fixture agreeing with itself.
 //
 // **It names no run**, which is the ordinary case out of a deterministic triage
-// step and is therefore the right default for a fixture (AB.4). Tests about the
+// step and is therefore the right default for a fixture. Tests about the
 // run reference use seedIncidentRaisedBy.
 func seedIncident(t *testing.T, pool *pgxpool.Pool, status, classification string) string {
 	t.Helper()
 	return seedIncidentRaisedBy(t, pool, status, classification, "")
 }
 
-// seedIncidentRaisedBy is seedIncident with an incident_run_ref (AB.4, Q-32).
+// seedIncidentRaisedBy is seedIncident with an incident_run_ref.
 func seedIncidentRaisedBy(t *testing.T, pool *pgxpool.Pool, status, classification, runRef string) string {
 	t.Helper()
 	id := fmt.Sprintf("inc_%d", time.Now().UnixNano())
@@ -69,7 +69,7 @@ func startTestRun(t *testing.T, pool *pgxpool.Pool, prefix string) string {
 	return runId
 }
 
-// The whole of I-276 in one test: a human corrects a classification, and the
+// The whole requirement in one test: a human corrects a classification, and the
 // record afterwards says who, when, from what and to what — none of which the
 // mutable status column could say.
 func TestRecordIncidentTransitionCarriesActorKindAndTimestamp(t *testing.T) {
@@ -82,7 +82,7 @@ func TestRecordIncidentTransitionCarriesActorKindAndTimestamp(t *testing.T) {
 		IncidentRef:         id,
 		FromStatus:          IncidentTriaged,
 		ToStatus:            IncidentReclassified,
-		Actor:               "michel@artisoft.io",
+		Actor:               "user@example.com",
 		ActorKind:           ActorHuman,
 		ClassificationAfter: "source_content_change",
 		Rationale:           "the upstream feed changed its header row",
@@ -108,7 +108,7 @@ func TestRecordIncidentTransitionCarriesActorKindAndTimestamp(t *testing.T) {
 		t.Fatalf("read back %d transitions, want 1", len(got))
 	}
 	g := got[0]
-	if g.Actor != "michel@artisoft.io" || g.ActorKind != ActorHuman {
+	if g.Actor != "user@example.com" || g.ActorKind != ActorHuman {
 		t.Errorf("actor/kind read back as %q/%q", g.Actor, g.ActorKind)
 	}
 	if g.ClassificationBefore != "transformation_defect" || g.ClassificationAfter != "source_content_change" {
@@ -134,7 +134,7 @@ func TestRecordIncidentTransitionCarriesActorKindAndTimestamp(t *testing.T) {
 	}
 }
 
-// The pairing §11.3.1 scores is (what the system said, what the person said).
+// The pairing a label is scored on is (what the system said, what the person said).
 // The incident row cannot hold it, because a second correction overwrites the
 // first — which is why the classifications travel on the event.
 func TestASecondCorrectionDoesNotEraseTheFirst(t *testing.T) {
@@ -154,7 +154,7 @@ func TestASecondCorrectionDoesNotEraseTheFirst(t *testing.T) {
 			IncidentRef:         id,
 			FromStatus:          s.from,
 			ToStatus:            s.to,
-			Actor:               "michel@artisoft.io",
+			Actor:               "user@example.com",
 			ActorKind:           ActorHuman,
 			ClassificationAfter: s.after,
 			Rationale:           s.why,
@@ -198,7 +198,7 @@ func TestIncidentTransitionGuardsTheFromStatus(t *testing.T) {
 	first := &IncidentTransition{
 		IncidentEventId: "ie_a_" + id, IncidentRef: id,
 		FromStatus: IncidentTriaged, ToStatus: IncidentSuppressedAsBenign,
-		Actor: "michel@artisoft.io", ActorKind: ActorHuman,
+		Actor: "user@example.com", ActorKind: ActorHuman,
 	}
 	if _, err := RecordIncidentTransition(ctx, pool, first); err != nil {
 		t.Fatal(err)
@@ -241,15 +241,15 @@ func TestUnknownIncidentIsNotAConflict(t *testing.T) {
 	}
 }
 
-// The chain event is conditional, and **AB.4 changed what it is conditional
+// The chain event is conditional, and **a later change moved what it is conditional
 // on** — this test's name says "the transition names a run" and that is now the
 // *first* of two ways one is found. It is kept under its original name because
 // the branch it exercises is unchanged: a caller that names a run gets a chain
-// event, and one on an incident that names neither gets none. What AB.4 added is
+// event, and one on an incident that names neither gets none. What that change added is
 // the middle case, which is TestATransitionInheritsTheIncidentsRun below.
 //
 // A test that only ever passed a run would leave the *other* branch — the one
-// every human transition takes — unexercised, which is why R-34's residue is
+// every human transition takes — unexercised, which is why the remaining gap is
 // still asserted rather than assumed gone.
 func TestTheChainEventIsAppendedOnlyWhenTheTransitionNamesARun(t *testing.T) {
 	pool := testPool(t)
@@ -259,7 +259,7 @@ func TestTheChainEventIsAppendedOnlyWhenTheTransitionNamesARun(t *testing.T) {
 	seq, err := RecordIncidentTransition(ctx, pool, &IncidentTransition{
 		IncidentEventId: "ie_norun_" + withoutRun, IncidentRef: withoutRun,
 		FromStatus: IncidentTriaged, ToStatus: IncidentDiagnosed,
-		Actor: "michel@artisoft.io", ActorKind: ActorHuman,
+		Actor: "user@example.com", ActorKind: ActorHuman,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -297,7 +297,7 @@ func TestTheChainEventIsAppendedOnlyWhenTheTransitionNamesARun(t *testing.T) {
 	}
 }
 
-// A.5: "reclassified returns to triaged with a new classification and a
+// "reclassified returns to triaged with a new classification and a
 // recorded reason." The CHECK is where that sentence is enforced, so both
 // halves of it are exercised here rather than trusted.
 func TestReclassifiedRequiresAClassificationAndAReason(t *testing.T) {
@@ -317,7 +317,7 @@ func TestReclassifiedRequiresAClassificationAndAReason(t *testing.T) {
 			_, err := RecordIncidentTransition(ctx, pool, &IncidentTransition{
 				IncidentEventId: "ie_rc_" + id, IncidentRef: id,
 				FromStatus: IncidentTriaged, ToStatus: IncidentReclassified,
-				Actor: "michel@artisoft.io", ActorKind: ActorHuman,
+				Actor: "user@example.com", ActorKind: ActorHuman,
 				ClassificationAfter: tc.after, Rationale: tc.why,
 			})
 			if err == nil || !strings.Contains(err.Error(), "incident_event_reclassified_ck") {
@@ -365,8 +365,8 @@ func TestIncidentEventVocabulariesMatchTheGeneratedChecks(t *testing.T) {
 	}
 	err := insert(fmt.Sprintf("ie_bad_status_%d", stamp), "escalated", IncidentDiagnosed, ActorAgent)
 	if err == nil || !strings.Contains(err.Error(), "incident_event_from_status_ck") {
-		// `escalated` is a state A.5's *Remediation* machine draws and no
-		// vocabulary here carries — F252's divergence, arriving as a value.
+		// `escalated` is a state the design's *Remediation* machine draws and no
+		// vocabulary here carries — a known divergence, arriving as a value.
 		t.Errorf("an out-of-vocabulary status must fail the CHECK; got %v", err)
 	}
 	err = insert(fmt.Sprintf("ie_bad_kind_%d", stamp), IncidentTriaged, IncidentDiagnosed, "detector")
@@ -396,9 +396,9 @@ func TestATransitionWithoutAnActorKindIsRefused(t *testing.T) {
 }
 
 // An illegal edge is refused by the primitive, not only by a handler — because
-// for Incident there is no handler, and A.5's "an agent may propose a
+// for Incident there is no handler, and the lifecycle's "an agent may propose a
 // transition; it cannot effect an illegal one" would otherwise be enforced by
-// nothing (I-299).
+// nothing.
 func TestAnIllegalEdgeIsRefusedByThePrimitive(t *testing.T) {
 	err := (&IncidentTransition{
 		IncidentEventId: "ie_y", IncidentRef: "inc_y",
@@ -406,12 +406,12 @@ func TestAnIllegalEdgeIsRefusedByThePrimitive(t *testing.T) {
 		Actor: "someone", ActorKind: ActorAgent,
 	}).validate()
 	if err == nil || !strings.Contains(err.Error(), "not a permitted transition") {
-		t.Fatalf("A.5's own illegal example must be refused; got %v", err)
+		t.Fatalf("the design's own illegal example must be refused; got %v", err)
 	}
 }
 
-// §A.2.9: "reversibility: irreversible is rejected at schema level. No
-// irreversible remediation may be persisted at any tier (Section 4.3)." The
+// "reversibility: irreversible is rejected at schema level. No
+// irreversible remediation may be persisted at any tier." The
 // vocabulary carries the value; the table refuses it.
 func TestRemediationRefusesAnIrreversibleAction(t *testing.T) {
 	pool := testPool(t)
@@ -432,7 +432,7 @@ func TestRemediationRefusesAnIrreversibleAction(t *testing.T) {
 	}
 	err := insert(fmt.Sprintf("rem_irr_%d", stamp), "irreversible")
 	if err == nil || !strings.Contains(err.Error(), "remediation_reversibility_ck") {
-		t.Fatalf("A.2.9's validator rule must refuse an irreversible remediation; got %v", err)
+		t.Fatalf("the remediation validator rule must refuse an irreversible remediation; got %v", err)
 	}
 	// And the tier CHECK, since autonomy_tier_required having a home is half of
 	// what this table is for.
@@ -468,7 +468,7 @@ func TestHumanVerdictsReadsAdjudicationsAndNotProgress(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	// An agent reclassifying its own incident is the case I-276 exists for: an
+	// An agent reclassifying its own incident is the case this exists for: an
 	// adjudication the measured system made, which must not be counted.
 	selfCorrection := seedIncident(t, pool, IncidentTriaged, "parse_failure")
 	if _, err := RecordIncidentTransition(ctx, pool, &IncidentTransition{
@@ -484,7 +484,7 @@ func TestHumanVerdictsReadsAdjudicationsAndNotProgress(t *testing.T) {
 	if _, err := RecordIncidentTransition(ctx, pool, &IncidentTransition{
 		IncidentEventId: "ie_hv_human_" + humanSide, IncidentRef: humanSide,
 		FromStatus: IncidentTriaged, ToStatus: IncidentSuppressedAsBenign,
-		Actor: "michel@artisoft.io", ActorKind: ActorHuman,
+		Actor: "user@example.com", ActorKind: ActorHuman,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -502,13 +502,13 @@ func TestHumanVerdictsReadsAdjudicationsAndNotProgress(t *testing.T) {
 	}
 }
 
-// AB.4, Q-32 — the case the change exists for.
+// The case the incident's run reference exists for.
 //
 // **A person at a supervision screen has no run of their own**, so before this
 // their correction of a classification was written to jetsapi.incident_event and
 // nowhere else: durable, attributable, and not tamper-evident, while the agent's
-// own reclassification of the same incident was chained. That inversion is R-34
-// and it is what this asserts is gone — the human transition names no run, and
+// own reclassification of the same incident was chained. That inversion
+// is what this asserts is gone — the human transition names no run, and
 // the chain event is appended to the run that raised the incident.
 func TestATransitionInheritsTheIncidentsRun(t *testing.T) {
 	pool := testPool(t)
@@ -519,7 +519,7 @@ func TestATransitionInheritsTheIncidentsRun(t *testing.T) {
 	tr := &IncidentTransition{
 		IncidentEventId: "ie_inherit_" + id, IncidentRef: id,
 		FromStatus: IncidentTriaged, ToStatus: IncidentReclassified,
-		Actor: "michel@artisoft.io", ActorKind: ActorHuman,
+		Actor: "user@example.com", ActorKind: ActorHuman,
 		ClassificationAfter: "source_content_change",
 		Rationale:           "the upstream feed changed its header row",
 		// RunRef deliberately unset: this is the shape a screen writes.
@@ -552,7 +552,7 @@ func TestATransitionInheritsTheIncidentsRun(t *testing.T) {
 		runId, seq).Scan(&actor, &eventType); err != nil {
 		t.Fatal(err)
 	}
-	if actor != "michel@artisoft.io" || eventType != EventDecision {
+	if actor != "user@example.com" || eventType != EventDecision {
 		t.Errorf("the chain event is %s by %q", eventType, actor)
 	}
 }
@@ -593,7 +593,7 @@ func TestACallersRunWinsOverTheIncidentsRun(t *testing.T) {
 	}
 }
 
-// **R-44: the residue, asserted rather than assumed.** An incident nothing
+// **The residue, asserted rather than assumed.** An incident nothing
 // agentic raised chains nothing, and that is now true for every actor alike
 // rather than for humans alone — which is the property a governance record
 // needs and is a weaker claim than "every transition is tamper-evident". A test

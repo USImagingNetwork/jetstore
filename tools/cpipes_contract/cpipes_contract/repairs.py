@@ -4,12 +4,12 @@
 *mutation* case (``eval.Case``) is a working config with a hole cut in it and the
 removed instance as ground truth; a *synthetic runtime* case is an input file and
 the failure it should produce. A **repair** case is a config that was wrong in
-production and the commit that fixed it. I-115 and I-136 settled that the three
-stay apart, and P.1 made ``eval.Case`` more firmly the mutation type still, since
+production and the commit that fixed it. It was settled that the three
+stay apart, and the compile-pass work made ``eval.Case`` more firmly the mutation type still, since
 ``Hole`` and ``Fill`` are mutation-specific. Hence ``provenance``, mandatory on
 every record here.
 
-**What the library is for, which is not what P.2 set out to build.** Measuring the
+**What the library is for, which is not what it set out to be.** Measuring the
 whole corpus found that **77% of real repairs change nothing the schema can see**:
 the config was valid before the fix and valid after it, and the defect shipped
 because every automated layer passed it. ``negative_suite.json`` already covers
@@ -20,7 +20,7 @@ its classification is the deliverable rather than any pass rate.
 **Classification is by error-set delta, not by absolute validity, and the
 difference is not a detail.** Judging a 2024 config against the 2026 schema puts
 48 of 75 pairs in "invalid both before and after", because the contract itself
-moved: W.1 added ``required`` fields in August 2026. That measures contract drift
+moved: ``required`` fields were added in August 2026. That measures contract drift
 and says nothing about the repair. Comparing the *set* of schema errors before
 against after is robust to it — an unrelated pre-existing error appears on both
 sides and cancels.
@@ -42,6 +42,8 @@ from pathlib import Path
 from typing import Any, Iterator
 
 import jsonschema
+
+from . import aliases
 
 # The four classes a repair falls into, by what the contract could see of it.
 CONTRACT_BLIND = "contract-blind"
@@ -211,15 +213,17 @@ def check(cases: list[Case], schema: dict, corpus_root: Path) -> list[Finding]:
     should look at rather than something to re-derive silently on every run.
     """
     findings: list[Finding] = []
+    names = aliases.load()
     for case in cases:
         if case.provenance != PROVENANCE:
             findings.append(Finding(case.name, f"provenance is {case.provenance!r}, not {PROVENANCE!r}"))
         if case.cls not in CLASSES:
             findings.append(Finding(case.name, f"unknown class {case.cls!r}"))
             continue
-        ws_root = corpus_root / "workspaces" / case.workspace
+        ws_root = names.path(corpus_root / "workspaces", case.workspace)
         if not ws_root.exists():
-            findings.append(Finding(case.name, f"workspace not checked out: {ws_root}"))
+            hint = "" if names else f" (or {aliases.ENV} does not name its alias file)"
+            findings.append(Finding(case.name, f"workspace not checked out: {ws_root}{hint}"))
             continue
         # **Aggregated over the case's files exactly as the extractor aggregates
         # them**, because a case is a commit. Checking per file against a class
@@ -228,7 +232,9 @@ def check(cases: list[Case], schema: dict, corpus_root: Path) -> list[Finding]:
         # file is not.
         classes = set()
         for path in case.files:
-            before, after = blob(ws_root, case.sha + "^", path), blob(ws_root, case.sha, path)
+            on_disk = names.resolve(path)
+            before = blob(ws_root, case.sha + "^", on_disk)
+            after = blob(ws_root, case.sha, on_disk)
             if before is None or after is None:
                 findings.append(Finding(case.name, f"{path}: revision unavailable at {case.sha[:8]}"))
                 continue
@@ -266,13 +272,16 @@ def _looks_like_repair(subject: str) -> bool:
 def candidates(corpus_root: Path, workspace: str, schema: dict) -> Iterator[Case]:
     """Every commit in one workspace that modifies a live config and claims a fix.
 
-    **An extractor, not a scraper**, and the distinction is R-17's *curation
+    **An extractor, not a scraper**, and the distinction is the library's *curation
     rather than extraction* with a fifth reason behind it: the ground truth of a
     repair is the diagnosis, the diagnosis is prose in the commit body, and no
     parser recovers it. What comes out of here is a candidate for a human to
     name, judge and keep or drop.
     """
-    ws_root = corpus_root / "workspaces" / workspace
+    # `workspace` is the neutral name, and so is everything the case records:
+    # its name, its files, its diagnosis and the values at its sites.
+    names = aliases.load()
+    ws_root = names.path(corpus_root / "workspaces", workspace)
     log = _git(ws_root, "log", "--diff-filter=M", "--format=%H\t%s",
                "--", "pipes_config/*.pc.json").stdout.decode()
     for line in log.strip().splitlines():
@@ -296,18 +305,18 @@ def candidates(corpus_root: Path, workspace: str, schema: dict) -> Iterator[Case
             before, after = blob(ws_root, sha + "^", path), blob(ws_root, sha, path)
             if before is None or after is None:
                 continue
-            kept.append(path)
+            kept.append(names.anonymise(path))
             classes.add(classify(before, after, schema))
-            sites += list(diff_sites(before, after))
+            sites += list(diff_sites(names.anonymise_json(before), names.anonymise_json(after)))
         if not kept:
             continue
         yield Case(
-            name=f"{workspace}-{sha[:7]}",
+            name=names.anonymise(f"{workspace}-{sha[:7]}"),
             workspace=workspace,
             sha=sha,
             files=kept,
             cls=classes.pop() if len(classes) == 1 else MIXED,
-            diagnosis=body,
+            diagnosis=names.anonymise(body),
             sites=sites,
         )
 

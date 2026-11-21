@@ -1,7 +1,8 @@
 /**
  * @vitest-environment jsdom
  *
- * C.11 and C.12 — the two viewer screens, which are C.7's component again.
+ * The two viewer screens, domain table and file preview, which are
+ * `TableScreen` again.
  *
  * **A separate file from `TableScreen.test.tsx` because the property is
  * different, not because the component is.** That file asserts what a screen
@@ -9,24 +10,27 @@
  * is what a screen *receives* — the `columnDef` the server supplies in place of a
  * configured column list.
  *
- * F81 records that four of the non-flow 25 declare none and that
- * `columnsFromResponse` has consumed the reply since A.4b, so the schema
- * relaxation C.4 made was the whole gap. **That is a claim about a code path no
- * screen had ever taken**, which is exactly I-104's shape — a half of a contract
- * tested from the end that cannot fail — so it is taken here rather than trusted.
+ * Four of the 25 non-flow configurations declare none, and
+ * `columnsFromResponse` has consumed the reply since the data table was first
+ * built, so relaxing the schema to allow an empty column list was the whole gap.
+ * **That is a claim about a code path no screen had ever taken** — a half of a
+ * contract tested from the end that cannot fail — so it is taken here rather
+ * than trusted.
  *
- * C.12 also names `preview_file`, the one `apiAction` in either corpus that no
+ * The file preview also names `preview_file`, the one `apiAction` in either corpus that no
  * other configuration uses, and the stub answers on the arm name.
  */
 
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { useEffect } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useNavigate } from "react-router-dom";
 
 import { ApiClient } from "../api/client";
 import inputFileViewerTable from "../datatable/tables/inputFileViewerTable.tc.json";
 import inputTable from "../datatable/tables/inputTable.tc.json";
 import type { TableConfigDocument } from "../datatable/table";
+import { reactScreenPath } from "./routes";
 import { TableScreen } from "./TableScreen";
 
 afterEach(cleanup);
@@ -50,16 +54,16 @@ function stubServer() {
       return new Response(
         JSON.stringify({
           token: "t0",
-          name: "Michel",
-          user_email: "michel@artisoft.io",
+          name: "Test User",
+          user_email: "user@example.com",
           is_admin: false,
           capabilities: [],
         }),
         { status: 200 },
       );
     }
-    // **The arm name is an assertion.** `read` for C.11 and `preview_file` for
-    // C.12; a document that lost its `apiAction` would arrive here as `read` and
+    // **The arm name is an assertion.** `read` for the domain table viewer and
+    // `preview_file` for the file preview; a document that lost its `apiAction` would arrive here as `read` and
     // the preview case would see the wrong rows rather than an error, so the two
     // answer different data.
     if (body["action"] === "read") {
@@ -88,7 +92,7 @@ function stubServer() {
 async function mount(which: "domain" | "preview") {
   const { fetchImpl, posts } = stubServer();
   const api = new ApiClient("", fetchImpl);
-  await api.login("michel@artisoft.io", "pw");
+  await api.login("user@example.com", "pw");
 
   const config =
     which === "domain"
@@ -129,12 +133,12 @@ async function mount(which: "domain" | "preview") {
 
 const reads = (posts: Posted[]) => posts.map((p) => p.body).filter((b) => b["action"] !== undefined);
 
-describe("C.11 — the domain and staging table viewer", () => {
+describe("the domain and staging table viewer", () => {
   it("takes both the table name and the session from the url", async () => {
     // **The `from` clause is empty in the document** — `{schema: "public"}` with
     // no table — and `makeQuery` fills it from `table_name`. So this screen puts
     // a route parameter into the FROM as well as into the WHERE, which is one
-    // more than C.7's does and is the reason it is the viewer.
+    // more than the execution status screen's does and is the reason it is the viewer.
     const { posts } = await mount("domain");
     await screen.findByText("c-1");
     const read = reads(posts).find((b) => b["action"] === "read")!;
@@ -156,7 +160,7 @@ describe("C.11 — the domain and staging table viewer", () => {
     expect(screen.getByRole("columnheader", { name: /Paid Amount/ })).toBeTruthy();
   });
 
-  it("shows its title, which C.7's and C.8's screens do not have", async () => {
+  it("shows its title, which the other viewer screens do not have", async () => {
     // `ScreenKeys.fileRegistryTable` declares `title:` where
     // `ScreenKeys.execStatusDetailsTable` has it commented out — so this is
     // `TableScreen`'s optional prop getting its first consumer.
@@ -165,7 +169,7 @@ describe("C.11 — the domain and staging table viewer", () => {
   });
 });
 
-describe("C.12 — the input file preview", () => {
+describe("the input file preview", () => {
   it("asks the preview_file arm, with the file key from the url", async () => {
     const { posts } = await mount("preview");
     await screen.findByText("a,b,c");
@@ -211,7 +215,7 @@ describe("what both screens do not do", () => {
   it("sends no implicit client filter, because neither table has a client column", async () => {
     // The column list is empty in the document, so `hasClientColumn` is false
     // whatever the shell's picker holds — asserted rather than assumed, because
-    // C.6 made the picker exist and these two screens sit under the same shell.
+    // the picker exists and these two screens sit under the same shell.
     const { posts } = await mount("domain");
     await screen.findByText("c-1");
     const where = reads(posts).find((b) => b["action"] === "read")!["whereClauses"] as Record<
@@ -231,5 +235,76 @@ describe("what both screens do not do", () => {
     await waitFor(() =>
       expect(reads(posts).filter((b) => b["action"] === "read")).toHaveLength(1),
     );
+  });
+});
+
+describe("a file key holding / reaches the preview", () => {
+  it("navigates to the preview with the key in one segment, and the screen reads it back", async () => {
+    // A file key is an object path. `fillPath` inserted it raw, so its slashes
+    // made extra segments, `/filePreviewPath/:file_key` did not match, and the
+    // preview was a Page not found. The key also carries the characters a path
+    // or a query reads specially, to show they round-trip too.
+    const key = "in/client=acme/year=2026/claims #1?.csv";
+    const { fetchImpl, posts } = stubServer();
+    const api = new ApiClient("", fetchImpl);
+    await api.login("user@example.com", "pw");
+    function Launch() {
+      const navigate = useNavigate();
+      useEffect(() => {
+        void navigate(reactScreenPath("/filePreviewPath/:file_key", { file_key: key })!);
+      }, [navigate]);
+      return null;
+    }
+    render(
+      <MemoryRouter initialEntries={["/launch"]}>
+        <Routes>
+          <Route path="/launch" element={<Launch />} />
+          <Route
+            path="/filePreviewPath/:file_key"
+            element={
+              <TableScreen
+                api={api}
+                tableKey="inputFileViewerTable"
+                document={inputFileViewerTable as TableConfigDocument}
+                title="Input File Preview"
+              />
+            }
+          />
+          <Route path="*" element={<p>Page not found</p>} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    await screen.findByText("a,b,c");
+    expect(screen.queryByText("Page not found")).toBeNull();
+    // Decoded once, by the router: the server gets the key as written.
+    const read = reads(posts).find((b) => b["action"] === "preview_file")!;
+    expect(read["whereClauses"]).toEqual([{ table: "", column: "file_key", values: [key] }]);
+  });
+});
+
+describe("sorting a table whose columns come from the reply", () => {
+  it("sends the pressed heading and keeps it when the reply describes the columns again", async () => {
+    // The domain table view declares no columns. A heading press used to be
+    // undone by the next reply: its `columnDef` reset the sort to column 0, and
+    // the request never named a sort column, so the server ordered by its first
+    // column whatever was pressed.
+    const { posts } = await mount("domain");
+    await screen.findByText("c-1");
+    const before = reads(posts).length;
+    fireEvent.click(screen.getByRole("button", { name: /Paid Amount/ }));
+    await waitFor(() => expect(reads(posts).length).toBe(before + 1));
+    const read = reads(posts).at(-1)!;
+    expect(read["sortColumn"]).toBe("paid_amount");
+    expect(read["sortAscending"]).toBe(true);
+    // The reply carried `columnDef` again; the arrow stays on Paid Amount and no
+    // further request goes out sorted on column 0.
+    await waitFor(() =>
+      expect(screen.getByRole("columnheader", { name: /Paid Amount/ }).getAttribute("aria-sort")).toBe(
+        "ascending",
+      ),
+    );
+    expect(screen.getByRole("columnheader", { name: /Claim Number/ }).getAttribute("aria-sort")).toBe("none");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(reads(posts).length).toBe(before + 1);
   });
 });
